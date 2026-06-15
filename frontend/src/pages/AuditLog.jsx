@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { Activity, Filter, User, Calendar, RefreshCw } from "lucide-react";
+import { Activity, Calendar, RefreshCw, Eye, ExternalLink } from "lucide-react";
 import api, { formatDateTime } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { useNavigate } from "react-router-dom";
 
 const ACTION_COLOR = {
   create: "bg-emerald-100 text-emerald-700",
@@ -13,10 +15,13 @@ const ACTION_COLOR = {
 };
 
 export default function AuditLog() {
+  const nav = useNavigate();
   const [logs, setLogs] = useState([]);
   const [entityFilter, setEntityFilter] = useState("all");
   const [actionFilter, setActionFilter] = useState("all");
   const [loading, setLoading] = useState(false);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -28,6 +33,27 @@ export default function AuditLog() {
     setLoading(false);
   };
   useEffect(() => { load(); }, [entityFilter, actionFilter]);
+
+  const openDetail = async (log) => {
+    setDetailLoading(true);
+    try {
+      const { data } = await api.get(`/audit-logs/${log.id}/detail`);
+      setDetail(data);
+    } catch (err) {
+      setDetail({ log, related: null, shortcut: null, error: err?.response?.data?.detail || "Gagal memuat detail" });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const goShortcut = () => {
+    if (detail?.shortcut?.path) {
+      const p = detail.shortcut.path;
+      setDetail(null);
+      nav(p);
+    }
+  };
+
 
   const entityTypes = Array.from(new Set(logs.map((l) => l.entity_type))).filter(Boolean);
   const actions = Array.from(new Set(logs.map((l) => l.action))).filter(Boolean);
@@ -77,14 +103,15 @@ export default function AuditLog() {
                   {l.user_name?.charAt(0)?.toUpperCase() || "?"}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 text-sm">
+                  <div className="flex items-center gap-2 text-sm flex-wrap">
                     <span className="font-semibold">{l.user_name || "—"}</span>
                     <Badge className={ACTION_COLOR[l.action] || "bg-gray-100"}>{l.action}</Badge>
                     <span className="text-gray-500">{l.entity_type}</span>
+                    {l.entity_id && <span className="text-[11px] text-gray-400 font-mono">#{String(l.entity_id).slice(0, 8)}</span>}
                   </div>
                   {l.payload && Object.keys(l.payload).length > 0 && (
                     <div className="text-xs text-gray-600 mt-1 font-mono">
-                      {Object.entries(l.payload).slice(0, 3).map(([k, v]) => `${k}: ${v}`).join(" · ")}
+                      {Object.entries(l.payload).slice(0, 3).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`).join(" · ")}
                     </div>
                   )}
                   <div className="text-xs text-gray-400 mt-0.5 flex items-center gap-1">
@@ -92,11 +119,47 @@ export default function AuditLog() {
                     {l.user_role && <span>· {l.user_role}</span>}
                   </div>
                 </div>
+                <Button size="sm" variant="outline" onClick={() => openDetail(l)} disabled={detailLoading} data-testid={`audit-detail-${l.id}`}>
+                  <Eye className="w-3.5 h-3.5 mr-1" /> Detail
+                </Button>
               </div>
             ))}
           </div>
         )}
       </div>
+
+      <Dialog open={!!detail} onOpenChange={(v) => !v && setDetail(null)}>
+        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>Detail Audit Log</DialogTitle></DialogHeader>
+          {detail && (
+            <div className="space-y-3 text-sm">
+              {detail.error && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-700">{detail.error}</div>}
+              <div className="grid sm:grid-cols-2 gap-2">
+                <InfoBox label="User" value={`${detail.log?.user_name || "—"} (${detail.log?.user_role || "—"})`} />
+                <InfoBox label="Waktu" value={formatDateTime(detail.log?.timestamp)} />
+                <InfoBox label="Aksi" value={detail.log?.action} />
+                <InfoBox label="Entity" value={`${detail.log?.entity_type || "—"} · ${detail.log?.entity_id || "—"}`} />
+              </div>
+              <div>
+                <div className="font-semibold mb-1">Payload Audit</div>
+                <pre className="bg-gray-950 text-gray-100 rounded-lg p-3 text-xs overflow-x-auto whitespace-pre-wrap">{JSON.stringify(detail.log?.payload || {}, null, 2)}</pre>
+              </div>
+              <div>
+                <div className="font-semibold mb-1">Data Terkait Saat Ini</div>
+                {detail.related ? <pre className="bg-gray-50 border rounded-lg p-3 text-xs overflow-x-auto whitespace-pre-wrap">{JSON.stringify(detail.related, null, 2)}</pre> : <div className="text-xs text-gray-500 bg-gray-50 border rounded-lg p-3">Data terkait tidak ditemukan atau sudah dihapus. Payload audit tetap bisa dipakai untuk melacak.</div>}
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            {detail?.shortcut && <Button variant="outline" onClick={goShortcut}><ExternalLink className="w-4 h-4 mr-1" />{detail.shortcut.label}</Button>}
+            <Button onClick={() => setDetail(null)}>Tutup</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
+}
+
+function InfoBox({ label, value }) {
+  return <div className="bg-gray-50 rounded-lg border p-2"><div className="text-[11px] uppercase tracking-wide text-gray-500 font-semibold">{label}</div><div className="font-medium break-all">{value || "—"}</div></div>;
 }

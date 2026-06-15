@@ -2,7 +2,6 @@ import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus, ArrowUpRight, ArrowDownRight, Wallet, Trash2 } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -24,17 +23,28 @@ export default function Keuangan() {
   const [bizUnits, setBizUnits] = useState([]);
   const [show, setShow] = useState(false);
   const [showInc, setShowInc] = useState(false);
+  const [finance, setFinance] = useState(null);
   const [form, setForm] = useState({ amount: 0, category: CATEGORIES[0], unit: "warung", notes: "", payment_method: "cash" });
   const [incForm, setIncForm] = useState({ amount: 0, category: INCOME_CATEGORIES[0], unit: "umum", source: "", notes: "", payment_method: "cash" });
 
   const load = async () => {
-    const [e, i, d, t] = await Promise.all([
-      api.get("/expenses"),
-      api.get("/incomes"),
-      api.get("/customer-debts"),
-      api.get("/transactions"),
-    ]);
-    setExpenses(e.data); setIncomes(i.data); setDebts(d.data); setTrx(t.data);
+    try {
+      const { data } = await api.get("/finance/summary");
+      setFinance(data);
+      setExpenses(data.expenses || []);
+      setIncomes(data.incomes || []);
+      setDebts(data.debts || []);
+      setTrx(data.pos_transactions || []);
+    } catch (err) {
+      // Fallback untuk backend lama saat deploy belum selesai.
+      const [e, i, d, t] = await Promise.all([
+        api.get("/expenses"),
+        api.get("/incomes"),
+        api.get("/customer-debts"),
+        api.get("/transactions"),
+      ]);
+      setExpenses(e.data); setIncomes(i.data); setDebts(d.data); setTrx(t.data);
+    }
   };
   const loadBizUnits = async () => {
     try {
@@ -104,18 +114,17 @@ export default function Keuangan() {
     if (!t) return false;
     if (t.financial_exclude || t.receipt_kind === "DEBT_SETTLEMENT" || t.settled_from_debt) return false;
     if (t.cancelled) return false;
-    return (t.transaction_type || "SALE") === "SALE";
+    return String(t.transaction_type || "SALE").toUpperCase() === "SALE";
   };
   const cashCollected = (t) => {
-    const total = Number(t.total || 0);
-    const paidRaw = t.paid_amount ?? t.cash_received ?? t.total ?? 0;
+    const total = Number(t.transaction_total ?? t.total ?? 0);
+    const paidRaw = t.cash_collected ?? t.paid_amount ?? t.cash_received ?? t.total ?? 0;
     const paid = Number(paidRaw || 0);
     return total > 0 ? Math.max(0, Math.min(total, paid)) : Math.max(0, paid);
   };
-  const validTrx = trx.filter(isFinancialSale);
-  // Cash-basis: DP bon + pelunasan bon harus tergabung di transaksi asal.
-  // Contoh total 21.000, DP 10.000, bayar bon 11.000 => setelah lunas menjadi 21.000, bukan 11.000.
-  const totalKasir = validTrx.reduce((s, t) => s + cashCollected(t), 0);
+  const validTrx = (finance?.pos_transactions || trx).filter(isFinancialSale);
+  // Sumber kebenaran dari backend /finance/summary agar Keuangan, Dashboard, dan Laporan tidak beda rumus.
+  const totalKasir = finance?.total_pos_income ?? validTrx.reduce((s, t) => s + cashCollected(t), 0);
   const totalNet = totalKasir + totalIncome - totalExpense;
 
   return (
@@ -126,7 +135,6 @@ export default function Keuangan() {
           <p className="text-sm text-gray-500 mt-0.5">Pemasukan, Pengeluaran & Piutang</p>
         </div>
         <div className="flex gap-2">
-          <ResetModuleButton module="keuangan" label="Keuangan" />
           <Button data-testid="add-income-btn" onClick={() => setShowInc(true)} className="bg-emerald-600 hover:bg-emerald-700">
             <ArrowUpRight className="w-4 h-4 mr-1.5" /> Pemasukan
           </Button>

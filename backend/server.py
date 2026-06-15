@@ -2415,6 +2415,63 @@ async def cash_balance(user: dict = Depends(get_current_user)):
     }
 
 
+
+
+@api.get("/finance/summary")
+async def finance_summary(user: dict = Depends(get_current_user), limit: int = 500):
+    """Ringkasan keuangan kanonis untuk halaman Keuangan.
+
+    Endpoint ini menjadi sumber kebenaran yang sama untuk Keuangan, Dashboard,
+    dan Laporan: transaksi pelunasan bon tidak dihitung sebagai penjualan baru;
+    transaksi asli tetap ditampilkan dengan cash_collected yang sudah termasuk DP
+    awal + cicilan/pelunasan bon.
+    """
+    debt_ctx = await _load_debt_financial_context()
+    transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    pos_transactions = []
+    for t in transactions:
+        if not _is_financial_sale_transaction(t):
+            continue
+        row = _enrich_transaction_financial_fields(t, debt_ctx)
+        # transaction_total = nilai struk asli; cash_collected = uang yang benar-benar sudah masuk
+        row["transaction_total"] = _money(row.get("total"))
+        row["cash_collected"] = _canonical_cash_collected(row, debt_ctx)
+        row["open_receivable"] = max(0, row["transaction_total"] - row["cash_collected"])
+        pos_transactions.append(row)
+
+    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    debts = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+
+    total_pos_income = sum(_money(t.get("cash_collected")) for t in pos_transactions)
+    total_pos_sales_value = sum(_money(t.get("transaction_total")) for t in pos_transactions)
+    total_other_income = sum(_money(i.get("amount")) for i in incomes)
+    total_expense = sum(_money(e.get("amount")) for e in expenses)
+    total_debt = sum(max(0, _money(d.get("amount")) - _money(d.get("paid"))) for d in debts if d.get("status") != "paid")
+
+    by_unit = {}
+    by_method = {}
+    for t in pos_transactions:
+        u = t.get("unit") or "warung"
+        m = _normalize_pm(t.get("payment_method"))
+        by_unit[u] = by_unit.get(u, 0) + _money(t.get("cash_collected"))
+        by_method[m] = by_method.get(m, 0) + _money(t.get("cash_collected"))
+
+    return {
+        "total_pos_income": total_pos_income,
+        "total_pos_sales_value": total_pos_sales_value,
+        "total_other_income": total_other_income,
+        "total_expense": total_expense,
+        "total_debt": total_debt,
+        "net_cash": total_pos_income + total_other_income - total_expense,
+        "by_unit": by_unit,
+        "by_method": by_method,
+        "pos_transactions": pos_transactions[: max(1, min(int(limit or 500), 2000))],
+        "incomes": incomes,
+        "expenses": expenses,
+        "debts": [_normalize_debt_for_response(d) for d in debts],
+    }
+
 @api.get("/dashboard/summary")
 async def dashboard_summary(user: dict = Depends(get_current_user)):
     today = datetime.now(timezone.utc).date().isoformat()
@@ -3943,35 +4000,65 @@ class BankImportIn(BaseModel):
     rows: List[BankRowIn]
 
 
+async def _bank_reconcile_candidates_for_amount(amount: int, date_prefix: str = "") -> list:
+    """Cari kandidat rekonsiliasi ringan.
+
+    Untuk bon, bank bisa berisi DP awal dan pelunasan terpisah. Karena itu
+    pencocokan tidak lagi hanya t.total, tetapi juga cash_collected / debt_payment.
+    """
+    candidates = []
+    debt_ctx = await _load_debt_financial_context()
+    trxs = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    exps = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+    debt_payments = await db.debt_payments.find({}, {"_id": 0}).sort("paid_at", -1).to_list(5000)
+
+    if amount > 0:
+        for t in trxs:
+            if not _is_financial_sale_transaction(t):
+                continue
+            row = _enrich_transaction_financial_fields(t, debt_ctx)
+            collected = _money(row.get("cash_collected"))
+            initial = _money(row.get("initial_paid"), _money(t.get("paid_amount")))
+            created = t.get("created_at") or ""
+            if (not date_prefix or created.startswith(date_prefix)) and collected == amount:
+                candidates.append({"match_type": "transaction", "match_id": t.get("id"), "amount": collected, "date": created, "title": t.get("trx_no"), "description": "Penjualan kasir terkumpul"})
+            elif initial and (not date_prefix or created.startswith(date_prefix)) and initial == amount:
+                candidates.append({"match_type": "transaction_initial", "match_id": t.get("id"), "amount": initial, "date": created, "title": t.get("trx_no"), "description": "DP awal transaksi bon"})
+        for p in debt_payments:
+            paid_date = p.get("paid_at") or p.get("created_at") or ""
+            if (not date_prefix or paid_date.startswith(date_prefix)) and _money(p.get("amount")) == amount:
+                candidates.append({"match_type": "debt_payment", "match_id": p.get("id"), "amount": amount, "date": paid_date, "title": p.get("customer_name") or p.get("debt_id"), "description": "Pelunasan/cicilan bon"})
+        for i in incomes:
+            d = i.get("date") or i.get("created_at") or ""
+            if (not date_prefix or d.startswith(date_prefix)) and _money(i.get("amount")) == amount:
+                candidates.append({"match_type": "income", "match_id": i.get("id"), "amount": amount, "date": d, "title": i.get("category"), "description": i.get("source") or "Pemasukan non-kasir"})
+    else:
+        target = abs(amount)
+        for e in exps:
+            d = e.get("date") or e.get("created_at") or ""
+            if (not date_prefix or d.startswith(date_prefix)) and _money(e.get("amount")) == target:
+                candidates.append({"match_type": "expense", "match_id": e.get("id"), "amount": -target, "date": d, "title": e.get("category"), "description": e.get("notes") or "Pengeluaran"})
+
+    # Hindari list terlalu panjang; kandidat amount+tanggal paling relevan dulu.
+    return candidates[:20]
+
+
 @api.post("/bank/import")
 async def import_bank(body: BankImportIn, user: dict = Depends(get_current_user)):
-    # Get all transactions and expenses for matching
-    trxs = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    exps = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     imported = []
     for r in body.rows:
         amt = r.amount
-        # Match: same absolute amount, same date (YYYY-MM-DD)
         date_prefix = r.date[:10]
-        match_id = None
-        match_type = None
-        if amt > 0:
-            for t in trxs:
-                if t.get("total") == amt and (t.get("created_at") or "").startswith(date_prefix):
-                    match_id = t["id"]
-                    match_type = "transaction"
-                    break
-        else:
-            for e in exps:
-                if e.get("amount") == -amt and (e.get("date") or "").startswith(date_prefix):
-                    match_id = e["id"]
-                    match_type = "expense"
-                    break
+        cands = await _bank_reconcile_candidates_for_amount(amt, date_prefix)
+        match_id = cands[0]["match_id"] if cands else None
+        match_type = cands[0]["match_type"] if cands else None
         doc = {
             "id": gen_id(), "account_name": body.account_name,
             "date": r.date, "description": r.description, "amount": amt,
             "reference": r.reference, "matched": bool(match_id),
             "match_id": match_id, "match_type": match_type,
+            "candidate_count": len(cands),
             "imported_at": now_iso(),
         }
         await db.bank_transactions.insert_one(doc)
@@ -3984,6 +4071,16 @@ async def import_bank(body: BankImportIn, user: dict = Depends(get_current_user)
 @api.get("/bank/transactions")
 async def list_bank_tx(user: dict = Depends(get_current_user)):
     return await db.bank_transactions.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+
+
+
+
+@api.get("/bank/transactions/{bid}/candidates")
+async def bank_candidates(bid: str, user: dict = Depends(get_current_user)):
+    b = await db.bank_transactions.find_one({"id": bid}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Mutasi bank tidak ditemukan")
+    return await _bank_reconcile_candidates_for_amount(_money(b.get("amount")), (b.get("date") or "")[:10])
 
 
 class BankReconcileIn(BaseModel):
@@ -4814,6 +4911,47 @@ async def list_audit(user: dict = Depends(get_current_user), limit: int = 200, e
         q["user_id"] = user_id
     logs = await db.audit_logs.find(q, {"_id": 0}).sort("timestamp", -1).to_list(limit)
     return logs
+
+
+@api.get("/audit-logs/{log_id}/detail")
+async def audit_log_detail(log_id: str, user: dict = Depends(get_current_user)):
+    log = await db.audit_logs.find_one({"id": log_id}, {"_id": 0})
+    if not log:
+        raise HTTPException(404, "Audit log tidak ditemukan")
+    entity_type = log.get("entity_type")
+    entity_id = log.get("entity_id")
+    related = None
+    shortcut = None
+    collections = {
+        "transaction": "transactions",
+        "customer_debt": "customer_debts",
+        "inventory": "inventory_items",
+        "expense": "expenses",
+        "income": "incomes",
+        "supplier": "suppliers",
+        "purchase_order": "purchase_orders",
+        "online_order": "online_orders",
+        "vineyard_harvest": "vineyard_harvests",
+        "vineyard_activity": "vineyard_activities",
+        "vineyard_input_usage": "vineyard_input_usages",
+        "table": "tables",
+        "user": "users",
+    }
+    coll = collections.get(entity_type)
+    if coll and entity_id:
+        related = await db[coll].find_one({"id": entity_id}, {"_id": 0, "password_hash": 0})
+    # Fallback untuk audit pembatalan transaksi: payload sering menyimpan trx_no saja.
+    if not related and entity_type == "transaction" and log.get("payload", {}).get("trx_no"):
+        related = await db.transactions.find_one({"trx_no": log["payload"]["trx_no"]}, {"_id": 0})
+    if entity_type == "transaction":
+        shortcut = {"label": "Buka Riwayat Kasir", "path": f"/kasir?trx={entity_id}"}
+    elif entity_type == "customer_debt":
+        shortcut = {"label": "Buka Bon di Kasir", "path": f"/kasir?bon={entity_id}"}
+    elif entity_type in ("purchase_order", "online_order"):
+        shortcut = {"label": "Buka Pembelian", "path": "/pembelian"}
+    elif entity_type and entity_type.startswith("vineyard"):
+        shortcut = {"label": "Buka Kebun Anggur", "path": "/anggur"}
+    return {"log": log, "related": related, "shortcut": shortcut}
 
 
 # ---------- Loyalty / Member ----------
