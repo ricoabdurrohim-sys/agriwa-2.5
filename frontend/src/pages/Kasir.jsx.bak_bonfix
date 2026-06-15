@@ -145,8 +145,6 @@ export default function Kasir() {
           })));
         }
         setIsBon(false);
-        const remaining = Math.max(0, (data.amount || 0) - (data.paid || 0));
-        if (remaining > 0) setCashReceived(String(remaining));
       }).catch((e) => {
         toast.error(e?.response?.data?.detail || "Bon tidak ditemukan");
       });
@@ -211,27 +209,24 @@ export default function Kasir() {
   const buildReceiptText = (trx) => {
     const cfg = getReceiptConfig(trx);
     const trxType = (trx.transaction_type || "SALE").toUpperCase();
-    const isDebtSettlement = trx.receipt_kind === "DEBT_SETTLEMENT";
     const lines = [
       `*${String(cfg.business_name).toUpperCase()}*`,
       cfg.address,
       cfg.phone ? `Telp: ${cfg.phone}` : "",
       "------------------------------",
       `No: ${trx.trx_no}`,
-      isDebtSettlement && trx.original_trx_no ? `Pelunasan: ${trx.original_trx_no}` : "",
       new Date(trx.created_at).toLocaleString("id-ID"),
       trx.cashier_name ? `Kasir: ${trx.cashier_name}` : "",
       trx.customer_name ? `Pelanggan: ${trx.customer_name}` : "",
-      isDebtSettlement ? "Jenis: PELUNASAN BON" : (trxType !== "SALE" ? `Jenis: ${trxType === "SELF_USE" ? "PEMAKAIAN SENDIRI" : trxType}` : ""),
+      trxType !== "SALE" ? `Jenis: ${trxType === "SELF_USE" ? "PEMAKAIAN SENDIRI" : trxType}` : "",
       "------------------------------",
       ...(trx.items || []).flatMap((i) => [i.name, `${i.quantity} x ${formatRupiah(i.unit_price)} = ${formatRupiah(i.unit_price * i.quantity)}`]),
       "------------------------------",
-      trx.subtotal ? `${isDebtSettlement ? "Total Belanja" : "Subtotal"}: ${formatRupiah(trx.subtotal)}` : "",
-      trx.discount && !isDebtSettlement ? `Diskon: -${formatRupiah(trx.discount)}` : "",
-      isDebtSettlement ? `Sudah Dibayar: ${formatRupiah(trx.previous_paid || 0)}` : "",
-      isDebtSettlement ? `Bayar Bon: ${formatRupiah(trx.payment_amount || 0)}` : (trxType === "SALE" ? `Total: ${formatRupiah(trx.total)}` : `Nilai HPP: ${formatRupiah(trx.cost_total || 0)}`),
+      trx.subtotal ? `Subtotal: ${formatRupiah(trx.subtotal)}` : "",
+      trx.discount ? `Diskon: -${formatRupiah(trx.discount)}` : "",
+      trxType === "SALE" ? `Total: ${formatRupiah(trx.total)}` : `Nilai HPP: ${formatRupiah(trx.cost_total || 0)}`,
       trxType === "SALE" ? `Metode: ${String(trx.payment_method || "-").toUpperCase()}` : "Pendapatan: Rp 0",
-      trx.payment_method === "cash" ? `Uang Diterima: ${formatRupiah(trx.cash_received)}` : "",
+      trx.payment_method === "cash" ? `Bayar: ${formatRupiah(trx.cash_received)}` : "",
       trx.payment_method === "cash" ? `Kembali: ${formatRupiah(trx.change)}` : "",
       trx.debt_amount > 0 ? `Hutang: ${formatRupiah(trx.debt_amount)}` : "",
       cfg.note ? "------------------------------" : "",
@@ -266,10 +261,8 @@ export default function Kasir() {
 
   const subtotal = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const total = Math.max(0, subtotal - discount - redeemDiscount);
-  const bonRemaining = bonInfo ? Math.max(0, (bonInfo.amount || 0) - (bonInfo.paid || 0)) : 0;
-  const paymentDue = bonInfo ? bonRemaining : total;
   const cashReceivedNum = parseInt(cashReceived) || 0;
-  const change = payment === "cash" ? (cashReceivedNum - paymentDue) : 0;
+  const change = payment === "cash" ? (cashReceivedNum - total) : 0;
   const isUnderpaid = change < 0;
 
   const checkout = async () => {
@@ -279,8 +272,8 @@ export default function Kasir() {
     try {
       let data;
       if (bonInfo) {
-        // Settle bon: bayar hanya sisa bon, tidak membuat penjualan baru dan tidak mengurangi stok lagi.
-        const remaining = bonRemaining;
+        // Settle bon via dedicated endpoint — replaces old trx, creates new with payment
+        const remaining = bonInfo.amount - (bonInfo.paid || 0);
         if (payment === "cash" && cashReceivedNum < remaining) {
           return toast.error(`Uang tunai kurang. Minimal ${formatRupiah(remaining)}`);
         }
@@ -289,7 +282,7 @@ export default function Kasir() {
           cash_received: cashReceivedNum || remaining,
         });
         data = resp.data;
-        toast.success("Bon berhasil dilunasi — revenue dan piutang diperbarui");
+        toast.success("Bon berhasil dilunasi — nota diperbarui");
       } else {
         const resp = await api.post("/transactions", {
           items: cart, discount: discount + redeemDiscount, payment_method: payment,
@@ -372,7 +365,7 @@ export default function Kasir() {
             <div className="flex-1 min-w-0">
               <div className="text-sm font-semibold text-amber-900">Mode Pelunasan Bon</div>
               <div className="text-xs text-amber-800">
-                {bonInfo.customer_name} · Sisa tagihan <b className="font-mono">{formatRupiah(bonRemaining)}</b>
+                {bonInfo.customer_name} · Sisa tagihan <b className="font-mono">{formatRupiah(bonInfo.amount - (bonInfo.paid || 0))}</b>
               </div>
             </div>
             <button data-testid="cancel-bon-mode-btn" onClick={() => { setBonInfo(null); setCart([]); setCustomerName(""); setCustomerPhone(""); window.history.replaceState({}, "", "/kasir"); }}
@@ -505,16 +498,9 @@ export default function Kasir() {
             </div>
           )}
 
-          {bonInfo && (
-            <div className="text-xs bg-amber-50 border border-amber-200 rounded-lg p-2 space-y-1">
-              <div className="flex justify-between"><span>Total belanja awal</span><span className="font-mono">{formatRupiah(bonInfo.original_total || total)}</span></div>
-              {bonInfo.initial_paid > 0 && <div className="flex justify-between"><span>Uang/DP sebelumnya</span><span className="font-mono">{formatRupiah(bonInfo.initial_paid)}</span></div>}
-              <div className="flex justify-between font-semibold text-amber-800"><span>Sisa bon yang dibayar</span><span className="font-mono">{formatRupiah(bonRemaining)}</span></div>
-            </div>
-          )}
           <div className="flex justify-between text-base font-semibold pt-2 border-t border-gray-100">
-            <span>{bonInfo ? "Nominal Dibayar" : "Total"}</span>
-            <span className="font-mono text-[#1a6b3c]" data-testid="cart-total">{formatRupiah(paymentDue)}</span>
+            <span>Total</span>
+            <span className="font-mono text-[#1a6b3c]" data-testid="cart-total">{formatRupiah(total)}</span>
           </div>
 
           {/* Transaction Type */}
@@ -701,8 +687,6 @@ export default function Kasir() {
               {cfg.phone && <div className="text-center text-xs mb-2">Telp: {cfg.phone}</div>}
               <div className="border-t border-dashed border-gray-400 my-2" />
               <div className="text-xs">No: {showReceipt.trx_no}</div>
-              {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && showReceipt.original_trx_no && <div className="text-xs">Pelunasan: {showReceipt.original_trx_no}</div>}
-              {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && <div className="text-xs font-semibold">Jenis: PELUNASAN BON</div>}
               <div className="text-xs">{new Date(showReceipt.created_at).toLocaleString("id-ID")}</div>
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.items.map((it, i) => (
@@ -712,29 +696,16 @@ export default function Kasir() {
                 </div>
               ))}
               <div className="border-t border-dashed border-gray-400 my-2" />
-              {showReceipt.receipt_kind === "DEBT_SETTLEMENT" ? (
+              <div className="flex justify-between text-xs"><span>Subtotal</span><span>{formatRupiah(showReceipt.subtotal)}</span></div>
+              {showReceipt.discount > 0 && <div className="flex justify-between text-xs"><span>Diskon</span><span>-{formatRupiah(showReceipt.discount)}</span></div>}
+              <div className="flex justify-between font-semibold"><span>Total</span><span>{formatRupiah(showReceipt.total)}</span></div>
+              {showReceipt.payment_method === "cash" && (
                 <>
-                  <div className="flex justify-between text-xs"><span>Total Belanja</span><span>{formatRupiah(showReceipt.total)}</span></div>
-                  <div className="flex justify-between text-xs"><span>Sudah Dibayar</span><span>{formatRupiah(showReceipt.previous_paid || 0)}</span></div>
-                  <div className="flex justify-between font-semibold"><span>Bayar Bon</span><span>{formatRupiah(showReceipt.payment_amount || 0)}</span></div>
-                  {showReceipt.payment_method === "cash" && <div className="flex justify-between text-xs"><span>Uang Diterima</span><span>{formatRupiah(showReceipt.cash_received)}</span></div>}
-                  {showReceipt.payment_method === "cash" && <div className="flex justify-between text-xs"><span>Kembali</span><span>{formatRupiah(showReceipt.change)}</span></div>}
-                  <div className="flex justify-between text-xs"><span>Sisa Hutang</span><span>{formatRupiah(showReceipt.debt_amount || 0)}</span></div>
-                </>
-              ) : (
-                <>
-                  <div className="flex justify-between text-xs"><span>Subtotal</span><span>{formatRupiah(showReceipt.subtotal)}</span></div>
-                  {showReceipt.discount > 0 && <div className="flex justify-between text-xs"><span>Diskon</span><span>-{formatRupiah(showReceipt.discount)}</span></div>}
-                  <div className="flex justify-between font-semibold"><span>Total</span><span>{formatRupiah(showReceipt.total)}</span></div>
-                  {showReceipt.payment_method === "cash" && (
-                    <>
-                      <div className="flex justify-between text-xs"><span>Bayar</span><span>{formatRupiah(showReceipt.cash_received)}</span></div>
-                      <div className="flex justify-between text-xs"><span>Kembali</span><span>{formatRupiah(showReceipt.change)}</span></div>
-                    </>
-                  )}
-                  {showReceipt.debt_amount > 0 && <div className="flex justify-between text-xs text-red-700"><span>Hutang</span><span>{formatRupiah(showReceipt.debt_amount)}</span></div>}
+                  <div className="flex justify-between text-xs"><span>Bayar</span><span>{formatRupiah(showReceipt.cash_received)}</span></div>
+                  <div className="flex justify-between text-xs"><span>Kembali</span><span>{formatRupiah(showReceipt.change)}</span></div>
                 </>
               )}
+              {showReceipt.debt_amount > 0 && <div className="flex justify-between text-xs text-red-700"><span>Hutang</span><span>{formatRupiah(showReceipt.debt_amount)}</span></div>}
               {showReceipt.transaction_type && showReceipt.transaction_type !== "SALE" && <div className="flex justify-between text-xs"><span>HPP</span><span>{formatRupiah(showReceipt.cost_total || 0)}</span></div>}
               {showReceipt.payment_status && <div className="flex justify-between text-xs"><span>Status</span><span>{showReceipt.payment_status}</span></div>}
               <div className="border-t border-dashed border-gray-400 my-2" />

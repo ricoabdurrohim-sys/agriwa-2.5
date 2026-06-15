@@ -1005,17 +1005,13 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
 
     # Customer bon/hutang otomatis jika uang kurang.
     if effective_is_bon and debt_amount > 0:
-        # amount di customer_debts harus berarti SISA BON, bukan total belanja.
-        # Contoh: total 21.000, DP 10.000 -> amount 11.000, paid 0.
         await db.customer_debts.insert_one({
             "id": gen_id(),
             "customer_name": body.customer_name or "Pelanggan",
             "customer_phone": body.customer_phone or "",
-            "amount": debt_amount,
-            "paid": 0,
-            "status": "unpaid",
-            "original_total": sale_total,
-            "initial_paid": paid_amount,
+            "amount": sale_total,
+            "paid": paid_amount,
+            "status": "partial" if paid_amount > 0 else "unpaid",
             "transaction_id": doc["id"],
             "created_at": now_iso(),
         })
@@ -1109,46 +1105,9 @@ async def send_transaction_receipt_wa(trx_id: str, body: SendReceiptWaIn, user: 
 
 
 # ---------- Customer Debts (Bon) ----------
-def _normalize_debt_for_response(d: dict) -> dict:
-    """Return customer debt as outstanding-balance based response.
-
-    Schema baru: amount = sisa bon saat dibuat, paid = pembayaran atas bon.
-    Schema lama (kompatibilitas): amount = total transaksi, paid = DP/uang awal.
-    Untuk UI, bon harus tampil sebagai sisa tagihan, bukan total transaksi.
-    """
-    if not d:
-        return d
-    out = dict(d)
-    out.pop("_id", None)
-    raw_amount = int(out.get("amount") or 0)
-    raw_paid = int(out.get("paid") or 0)
-
-    if out.get("original_total") is not None:
-        out["remaining"] = max(0, raw_amount - raw_paid)
-        out["original_total"] = int(out.get("original_total") or raw_amount)
-        out["initial_paid"] = int(out.get("initial_paid") or 0)
-        return out
-
-    # Legacy docs made before the fix: amount was original sale total and paid was customer DP.
-    if out.get("transaction_id") and raw_paid > 0:
-        remaining = max(0, raw_amount - raw_paid)
-        out["original_total"] = raw_amount
-        out["initial_paid"] = raw_paid
-        out["amount"] = remaining
-        out["paid"] = 0 if out.get("status") != "paid" else remaining
-        out["remaining"] = 0 if out.get("status") == "paid" else remaining
-        return out
-
-    out["original_total"] = int(out.get("original_total") or raw_amount)
-    out["initial_paid"] = int(out.get("initial_paid") or 0)
-    out["remaining"] = max(0, raw_amount - raw_paid)
-    return out
-
-
 @api.get("/customer-debts")
 async def list_debts(user: dict = Depends(get_current_user)):
-    debts = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return [_normalize_debt_for_response(d) for d in debts]
+    return await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
 class PayDebtIn(BaseModel):
@@ -1160,50 +1119,34 @@ async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_curre
     debt = await db.customer_debts.find_one({"id": debt_id})
     if not debt:
         raise HTTPException(404, "Bon tidak ditemukan")
-    amount = max(0, int(body.amount or 0))
-    if amount <= 0:
-        raise HTTPException(400, "Nominal pelunasan harus lebih dari 0")
-    remaining_before = max(0, int(debt.get("amount", 0)) - int(debt.get("paid", 0)))
-    pay_amount = min(amount, remaining_before)
-    new_paid = int(debt.get("paid", 0)) + pay_amount
-    status = "paid" if new_paid >= int(debt.get("amount", 0)) else "partial"
+    new_paid = debt.get("paid", 0) + body.amount
+    status = "paid" if new_paid >= debt["amount"] else "partial"
     await db.customer_debts.update_one(
         {"id": debt_id},
         {"$set": {"paid": new_paid, "status": status, "last_paid_at": now_iso()}},
     )
-    # Tambahkan penerimaan kas/bank tanpa membuat revenue baru dobel.
+    # Record cash receipt in journal: Debit Kas / Credit Piutang Bon
     await db.journal_entries.insert_one({
         "id": gen_id(),
         "date": now_iso(),
         "description": f"Pelunasan bon {debt['customer_name']} (sebagian)" if status == "partial" else f"Pelunasan bon {debt['customer_name']}",
         "lines": [
-            {"account": "Kas", "debit": pay_amount, "credit": 0},
-            {"account": "Piutang Bon", "debit": 0, "credit": pay_amount},
+            {"account": "Kas", "debit": body.amount, "credit": 0},
+            {"account": "Piutang Bon", "debit": 0, "credit": body.amount},
         ],
         "reference": "debt_payment",
         "reference_id": debt_id,
-        "unit": debt.get("unit", "warung"),
+        "unit": "warung",
         "created_at": now_iso(),
     })
-    # Update transaksi asli: paid_amount naik, debt_amount turun. Jangan cancel transaksi asli.
-    if debt.get("transaction_id"):
-        trx = await db.transactions.find_one({"id": debt["transaction_id"]})
-        if trx:
-            trx_total = int(trx.get("total") or debt.get("original_total") or 0)
-            trx_paid = min(trx_total, int(trx.get("paid_amount") or 0) + pay_amount)
-            trx_debt = max(0, trx_total - trx_paid)
-            await db.transactions.update_one(
-                {"id": trx["id"]},
-                {"$set": {
-                    "paid_amount": trx_paid,
-                    "debt_amount": trx_debt,
-                    "payment_status": "PAID" if trx_debt == 0 else "PARTIAL",
-                    "is_bon": trx_debt > 0,
-                    "settled_at": now_iso() if trx_debt == 0 else trx.get("settled_at"),
-                }}
-            )
-    await write_audit(user, "update", "customer_debt", debt_id, {"amount": pay_amount, "status": status})
-    return {"ok": True, "status": status, "paid": new_paid, "remaining": max(0, int(debt.get("amount", 0)) - new_paid)}
+    # If fully paid via partial payments, also clear bon flag on original trx
+    if status == "paid" and debt.get("transaction_id"):
+        await db.transactions.update_one(
+            {"id": debt["transaction_id"]},
+            {"$set": {"is_bon": False, "payment_method": "bon_paid", "settled_at": now_iso()}},
+        )
+    await write_audit(user, "update", "customer_debt", debt_id, {"amount": body.amount, "status": status})
+    return {"ok": True, "status": status, "paid": new_paid}
 
 
 @api.post("/customer-debts/{debt_id}/mark-paid")
@@ -1233,41 +1176,27 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
             "unit": "warung",
             "created_at": now_iso(),
         })
-    # Update related transaction: paid_amount naik sebesar sisa bon. Jangan cancel transaksi asli.
+    # Update related transaction so it no longer appears as bon in Kasir history
     if debt.get("transaction_id"):
-        trx = await db.transactions.find_one({"id": debt["transaction_id"]})
-        if trx:
-            trx_total = int(trx.get("total") or debt.get("original_total") or 0)
-            trx_paid = min(trx_total, int(trx.get("paid_amount") or 0) + remaining)
-            trx_debt = max(0, trx_total - trx_paid)
-            await db.transactions.update_one(
-                {"id": trx["id"]},
-                {"$set": {
-                    "paid_amount": trx_paid,
-                    "debt_amount": trx_debt,
-                    "payment_status": "PAID" if trx_debt == 0 else "PARTIAL",
-                    "is_bon": trx_debt > 0,
-                    "settled_at": now_iso() if trx_debt == 0 else trx.get("settled_at"),
-                }}
-            )
+        await db.transactions.update_one(
+            {"id": debt["transaction_id"]},
+            {"$set": {"is_bon": False, "payment_method": "bon_paid", "settled_at": now_iso()}},
+        )
     await write_audit(user, "update", "customer_debt", debt_id, {"status": "paid", "full": True})
     return {"ok": True}
 
 
 @api.get("/customer-debts/{debt_id}")
 async def get_debt(debt_id: str, user: dict = Depends(get_current_user)):
-    debt_raw = await db.customer_debts.find_one({"id": debt_id}, {"_id": 0})
-    if not debt_raw:
+    debt = await db.customer_debts.find_one({"id": debt_id}, {"_id": 0})
+    if not debt:
         raise HTTPException(404, "Bon tidak ditemukan")
-    debt = _normalize_debt_for_response(debt_raw)
     # Include original transaction items if available
-    if debt_raw.get("transaction_id"):
-        trx = await db.transactions.find_one({"id": debt_raw["transaction_id"]}, {"_id": 0})
+    if debt.get("transaction_id"):
+        trx = await db.transactions.find_one({"id": debt["transaction_id"]}, {"_id": 0})
         if trx:
             debt["original_items"] = trx.get("items", [])
             debt["customer_phone"] = trx.get("customer_phone") or ""
-            debt["original_trx_no"] = trx.get("trx_no")
-            debt["unit"] = trx.get("unit", debt.get("unit", "warung"))
     return debt
 
 
@@ -1278,138 +1207,99 @@ class SettleBonIn(BaseModel):
 
 @api.post("/customer-debts/{debt_id}/settle-via-kasir")
 async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends(get_current_user)):
-    """Pelunasan bon dari Kasir.
-
-    Fix penting:
-    - Jangan membatalkan transaksi awal.
-    - Jangan membuat transaksi penjualan baru senilai sisa bon.
-    - Pelunasan hanya menambah paid_amount transaksi awal dan mengurangi Piutang Bon.
-
-    Dengan begitu contoh total 21.000 + DP 10.000 + pelunasan 11.000
-    akan tampil sebagai revenue terkumpul 21.000, bukan hanya 11.000.
-    """
+    """Pelunasan bon dari Kasir: cancel transaksi lama bon, buat transaksi baru cash, record nota."""
     debt = await db.customer_debts.find_one({"id": debt_id})
     if not debt:
         raise HTTPException(404, "Bon tidak ditemukan")
     if debt.get("status") == "paid":
         raise HTTPException(400, "Bon sudah lunas")
-
-    remaining = max(0, int(debt.get("amount", 0)) - int(debt.get("paid", 0)))
-    if remaining <= 0:
-        await db.customer_debts.update_one({"id": debt_id}, {"$set": {"status": "paid", "last_paid_at": now_iso()}})
-        raise HTTPException(400, "Bon sudah tidak memiliki sisa tagihan")
-
-    payment_method = (body.payment_method or "cash").lower()
-    cash_received = max(0, int(body.cash_received or 0))
-    if payment_method == "cash" and cash_received < remaining:
+    remaining = debt["amount"] - debt.get("paid", 0)
+    if body.payment_method == "cash" and body.cash_received < remaining:
         raise HTTPException(400, "Uang tunai kurang")
-    payment_amount = remaining
-    change = (cash_received - remaining) if payment_method == "cash" else 0
 
+    # Get original transaction items
     original_trx = None
+    items = []
     if debt.get("transaction_id"):
         original_trx = await db.transactions.find_one({"id": debt["transaction_id"]})
+        if original_trx:
+            items = original_trx.get("items", [])
 
-    previous_paid = int(debt.get("initial_paid") or 0) + int(debt.get("paid") or 0)
-    original_total = int(debt.get("original_total") or debt.get("amount") or 0)
+    # Soft-cancel old transaction (it gets replaced)
     if original_trx:
-        previous_paid = int(original_trx.get("paid_amount") or previous_paid)
-        original_total = int(original_trx.get("total") or original_total)
-
-    # Mark debt paid. amount di schema baru = sisa bon; paid menjadi sisa bon yang sudah dilunasi.
-    await db.customer_debts.update_one(
-        {"id": debt_id},
-        {"$set": {
-            "paid": int(debt.get("amount", 0)),
-            "status": "paid",
-            "last_paid_at": now_iso(),
-            "settlement_method": payment_method,
-            "settlement_amount": payment_amount,
-        }},
-    )
-
-    # Update transaksi awal agar laporan revenue berbasis kas menjadi benar.
-    if original_trx:
-        new_paid = min(original_total, previous_paid + payment_amount)
-        new_debt = max(0, original_total - new_paid)
-        inc_cash = cash_received if payment_method == "cash" else 0
         await db.transactions.update_one(
             {"id": original_trx["id"]},
             {"$set": {
-                "paid_amount": new_paid,
-                "debt_amount": new_debt,
-                "payment_status": "PAID" if new_debt == 0 else "PARTIAL",
-                "is_bon": new_debt > 0,
-                "settled_at": now_iso() if new_debt == 0 else original_trx.get("settled_at"),
-                "last_debt_payment_at": now_iso(),
-                "last_debt_payment_amount": payment_amount,
-                "last_debt_payment_method": payment_method,
-                "cash_received": int(original_trx.get("cash_received") or 0) + inc_cash,
-            }}
+                "cancelled": True,
+                "cancelled_at": now_iso(),
+                "cancelled_by": user["id"],
+                "cancel_reason": "replaced_by_payment",
+                "replaced_by": None,  # filled below
+            }},
         )
 
-    payment_id = gen_id()
-    await db.debt_payments.insert_one({
-        "id": payment_id,
-        "debt_id": debt_id,
-        "transaction_id": original_trx.get("id") if original_trx else None,
-        "customer_name": debt.get("customer_name", "Pelanggan"),
-        "amount": payment_amount,
-        "cash_received": cash_received if payment_method == "cash" else payment_amount,
+    # Create new transaction (payment in cash/transfer)
+    trx_no = f"TRX-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    new_total = remaining
+    change = (body.cash_received - remaining) if body.payment_method == "cash" else 0
+    new_doc = {
+        "id": gen_id(),
+        "trx_no": trx_no,
+        "items": items,
+        "subtotal": new_total,
+        "discount": 0,
+        "tax": 0,
+        "total": new_total,
+        "payment_method": body.payment_method,
+        "cash_received": body.cash_received if body.payment_method == "cash" else new_total,
         "change": change,
-        "payment_method": payment_method,
-        "created_at": now_iso(),
+        "customer_name": debt["customer_name"],
+        "customer_phone": original_trx.get("customer_phone", "") if original_trx else "",
+        "is_bon": False,
+        "unit": "warung",
+        "branch_id": original_trx.get("branch_id") if original_trx else None,
         "cashier_id": user["id"],
         "cashier_name": user.get("name", user.get("email")),
-    })
+        "settled_from_debt": debt_id,
+        "settled_from_trx": original_trx["id"] if original_trx else None,
+        "created_at": now_iso(),
+    }
+    await db.transactions.insert_one(new_doc)
+    new_doc.pop("_id", None)
 
+    # Link replaced_by on the old transaction
+    if original_trx:
+        await db.transactions.update_one({"id": original_trx["id"]}, {"$set": {"replaced_by": new_doc["id"]}})
+
+    # Mark debt paid
+    await db.customer_debts.update_one(
+        {"id": debt_id},
+        {"$set": {
+            "paid": debt["amount"],
+            "status": "paid",
+            "last_paid_at": now_iso(),
+            "settled_trx_id": new_doc["id"],
+        }},
+    )
+
+    # Journal: Debit Kas / Credit Piutang Bon
     await db.journal_entries.insert_one({
         "id": gen_id(),
         "date": now_iso(),
-        "description": f"Pelunasan bon {debt.get('customer_name', 'Pelanggan')}",
+        "description": f"Pelunasan bon {debt['customer_name']} via Kasir ({trx_no})",
         "lines": [
-            {"account": payment_account(payment_method), "debit": payment_amount, "credit": 0},
-            {"account": "Piutang Bon", "debit": 0, "credit": payment_amount},
+            {"account": "Kas", "debit": remaining, "credit": 0},
+            {"account": "Piutang Bon", "debit": 0, "credit": remaining},
         ],
-        "reference": "debt_payment",
-        "reference_id": payment_id,
-        "unit": (original_trx or {}).get("unit", debt.get("unit", "warung")),
+        "reference": "transaction",
+        "reference_id": new_doc["id"],
+        "unit": "warung",
         "created_at": now_iso(),
     })
 
-    # Return receipt-ready transaction snapshot. Ini bukan penjualan baru dan tidak mengurangi stok lagi.
-    receipt_doc = dict(original_trx or {})
-    receipt_doc.pop("_id", None)
-    receipt_doc.update({
-        "id": payment_id,
-        "trx_no": f"PAY-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}",
-        "receipt_kind": "DEBT_SETTLEMENT",
-        "settled_from_debt": debt_id,
-        "settled_from_trx": original_trx.get("id") if original_trx else None,
-        "original_trx_no": original_trx.get("trx_no") if original_trx else debt.get("transaction_id"),
-        "items": (original_trx or {}).get("items", []),
-        "subtotal": original_total,
-        "total": original_total,
-        "previous_paid": previous_paid,
-        "payment_amount": payment_amount,
-        "paid_amount": min(original_total, previous_paid + payment_amount),
-        "debt_amount": 0,
-        "payment_method": payment_method,
-        "cash_received": cash_received if payment_method == "cash" else payment_amount,
-        "change": change,
-        "customer_name": debt.get("customer_name", "Pelanggan"),
-        "customer_phone": debt.get("customer_phone") or (original_trx or {}).get("customer_phone", ""),
-        "is_bon": False,
-        "payment_status": "PAID",
-        "transaction_type": "SALE",
-        "created_at": now_iso(),
-        "cashier_id": user["id"],
-        "cashier_name": user.get("name", user.get("email")),
-    })
-
-    await write_audit(user, "update", "customer_debt", debt_id, {"paid": payment_amount, "via": "kasir"})
-    await broadcast_event("transaction_updated", {"id": original_trx.get("id") if original_trx else debt_id, "debt_paid": True})
-    return receipt_doc
+    await write_audit(user, "create", "transaction", new_doc["id"], {"trx_no": trx_no, "settled_bon": debt_id})
+    await broadcast_event("transaction_created", {"id": new_doc["id"]})
+    return new_doc
 
 
 # Update PO/online order statuses manually
@@ -1843,7 +1733,7 @@ async def profit_loss(user: dict = Depends(get_current_user)):
         if (t.get("transaction_type") or "SALE") != "SALE":
             continue
         u = t.get("unit", "warung")
-        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + t.get("paid_amount", t.get("total", 0))
+        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + t.get("total", 0)
     # Include non-POS incomes (cashback, tax refund, etc.) as "other_income"
     other_income_by_cat = {}
     for inc in incomes:

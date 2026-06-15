@@ -100,9 +100,8 @@ export default function Keuangan() {
   const totalDebt = debts.filter(d => d.status !== "paid").reduce((s, d) => s + (d.amount - (d.paid || 0)), 0);
   const totalExpense = expenses.reduce((s, e) => s + e.amount, 0);
   const totalIncome = incomes.reduce((s, i) => s + i.amount, 0);
-  const validTrx = trx.filter((t) => !t.cancelled && (t.transaction_type || "SALE") === "SALE");
-  // Cash-basis: bon parsial tetap menghitung uang yang benar-benar diterima (paid_amount).
-  const totalKasir = validTrx.reduce((s, t) => s + (t.paid_amount ?? t.total ?? 0), 0);
+  const validTrx = trx.filter((t) => !t.cancelled && !t.is_bon);
+  const totalKasir = validTrx.reduce((s, t) => s + (t.total || 0), 0);
   const totalNet = totalKasir + totalIncome - totalExpense;
 
   return (
@@ -239,10 +238,8 @@ export default function Keuangan() {
                       <div className="text-xs text-gray-500 flex items-center gap-1.5 flex-wrap mt-0.5">
                         <span>{formatDate(d.created_at)}</span>
                         <span>·</span>
-                        <span>Sisa bon {formatRupiah(remaining)}</span>
-                        {d.original_total && <><span>·</span><span>Total belanja {formatRupiah(d.original_total)}</span></>}
-                        {d.initial_paid > 0 && <><span>·</span><span>DP {formatRupiah(d.initial_paid)}</span></>}
-                        {d.paid > 0 && <><span>·</span><span>Pelunasan {formatRupiah(d.paid)}</span></>}
+                        <span>Total {formatRupiah(d.amount)}</span>
+                        {d.paid > 0 && <><span>·</span><span>Dibayar {formatRupiah(d.paid)}</span></>}
                         <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold border ${statusColor}`}>{statusLabel}</span>
                       </div>
                     </div>
