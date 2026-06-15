@@ -1,0 +1,4304 @@
+"""AgriWarung Manager - FastAPI Backend"""
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+import os
+import asyncio
+import uuid
+import logging
+import bcrypt
+import jwt
+from datetime import datetime, timezone, timedelta
+import secrets
+import hmac
+import hashlib
+from urllib.parse import quote
+from typing import List, Optional, Literal
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+
+
+# ---------- Setup ----------
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+JWT_SECRET = os.environ.get('JWT_SECRET', 'change-me')
+JWT_ALG = 'HS256'
+
+app = FastAPI(title="AgriWarung Manager API")
+api = APIRouter(prefix="/api")
+
+
+# ---------- Helpers ----------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def gen_id() -> str:
+    return str(uuid.uuid4())
+
+
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, email: str, role: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(days=7),
+        "type": "access",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Tidak terautentikasi")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+        if not user:
+            raise HTTPException(status_code=401, detail="User tidak ditemukan")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token kedaluwarsa")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token tidak valid")
+
+
+def require_roles(*roles):
+    async def checker(user: dict = Depends(get_current_user)):
+        if user.get("role") not in roles and user.get("role") != "super_admin":
+            raise HTTPException(status_code=403, detail="Akses ditolak")
+        return user
+    return checker
+
+
+def clean_doc(doc):
+    if not doc:
+        return doc
+    doc.pop("_id", None)
+    doc.pop("password_hash", None)
+    return doc
+
+
+def normalize_phone(phone: str = "") -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits.startswith("0"):
+        return "62" + digits[1:]
+    if digits and not digits.startswith("62"):
+        return "62" + digits
+    return digits
+
+
+def format_rp_short(amount: int | float | None) -> str:
+    try:
+        n = int(round(float(amount or 0)))
+    except Exception:
+        n = 0
+    sign = "-" if n < 0 else ""
+    return f"{sign}Rp {abs(n):,}".replace(",", ".")
+
+
+def payment_account(payment_method: str) -> str:
+    m = (payment_method or "cash").lower()
+    if m in ("transfer", "bank"):
+        return "Bank"
+    if m in ("qris", "qr", "ewallet", "e-wallet", "gopay", "ovo", "dana", "shopeepay"):
+        return "QRIS/E-Wallet"
+    return "Kas"
+
+
+async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
+    settings = await db.settings.find_one({}, {"_id": 0}) or {}
+    unit = await db.business_units.find_one({"code": unit_code}, {"_id": 0}) or {}
+    name = (unit.get("receipt_name") or unit.get("name") or settings.get("business_name") or "AgriWarung").strip()
+    return {
+        "unit": unit_code,
+        "business_name": name,
+        "address": unit.get("receipt_address") or settings.get("address", ""),
+        "phone": unit.get("receipt_phone") or settings.get("phone", ""),
+        "footer": unit.get("receipt_footer") or settings.get("receipt_footer") or "Terima kasih! 🙏",
+        "note": unit.get("receipt_note") or "",
+        "logo_url": unit.get("receipt_logo") or settings.get("receipt_logo", ""),
+    }
+
+
+async def build_receipt_snapshot(unit_code: str = "warung") -> dict:
+    cfg = await get_unit_receipt_config(unit_code)
+    cfg["snapshot_at"] = now_iso()
+    return cfg
+
+
+def receipt_cfg_from_trx(trx: dict) -> dict:
+    snap = trx.get("receipt_snapshot") or {}
+    return {
+        "business_name": snap.get("business_name") or snap.get("name") or "AgriWarung",
+        "address": snap.get("address", ""),
+        "phone": snap.get("phone", ""),
+        "footer": snap.get("footer") or "Terima kasih! 🙏",
+        "note": snap.get("note", ""),
+    }
+
+
+def generate_receipt_text(trx: dict) -> str:
+    cfg = receipt_cfg_from_trx(trx)
+    lines = []
+    lines.append(str(cfg["business_name"]).upper())
+    if cfg.get("address"):
+        lines.append(str(cfg["address"]))
+    if cfg.get("phone"):
+        lines.append(f"Telp: {cfg['phone']}")
+    lines += ["-" * 32, f"No: {trx.get('trx_no', '-')}", f"Tanggal: {trx.get('created_at', '-')}"]
+    if trx.get("cashier_name"):
+        lines.append(f"Kasir: {trx.get('cashier_name')}")
+    if trx.get("customer_name"):
+        lines.append(f"Pelanggan: {trx.get('customer_name')}")
+    trx_type = (trx.get("transaction_type") or "SALE").upper()
+    if trx_type != "SALE":
+        label = {"SELF_USE": "PEMAKAIAN SENDIRI", "WASTE": "BARANG RUSAK", "ADJUSTMENT": "PENYESUAIAN"}.get(trx_type, trx_type)
+        lines.append(f"Jenis: {label}")
+    lines.append("-" * 32)
+    for it in trx.get("items", []):
+        qty = it.get("quantity", 0)
+        price = it.get("unit_price", 0)
+        lines.append(str(it.get("name", "Item")))
+        lines.append(f"  {qty} x {format_rp_short(price)} = {format_rp_short(qty * price)}")
+    lines.append("-" * 32)
+    if trx.get("subtotal", 0):
+        lines.append(f"Subtotal : {format_rp_short(trx.get('subtotal'))}")
+    if trx.get("discount", 0):
+        lines.append(f"Diskon   : -{format_rp_short(trx.get('discount'))}")
+    if trx_type == "SALE":
+        lines.append(f"TOTAL    : {format_rp_short(trx.get('total'))}")
+        lines.append(f"Metode   : {str(trx.get('payment_method', '-')).upper()}")
+        if trx.get("payment_method") == "cash":
+            lines.append(f"Bayar    : {format_rp_short(trx.get('cash_received'))}")
+            lines.append(f"Kembali  : {format_rp_short(trx.get('change'))}")
+        if trx.get("debt_amount", 0) > 0:
+            lines.append(f"Hutang   : {format_rp_short(trx.get('debt_amount'))}")
+        if trx.get("payment_status"):
+            lines.append(f"Status   : {trx.get('payment_status')}")
+    else:
+        lines.append(f"Nilai HPP: {format_rp_short(trx.get('cost_total'))}")
+        lines.append("Pendapatan: Rp 0")
+    if cfg.get("note"):
+        lines += ["-" * 32, str(cfg["note"])]
+    lines += ["-" * 32, str(cfg.get("footer") or "Terima kasih! 🙏")]
+    return "\n".join(lines)
+
+
+async def write_notification(notif_type: str, title: str, message: str, *, business_id: str = "", ref_type: str = "", ref_id: str = "", priority: str = "normal") -> dict:
+    doc = {
+        "id": gen_id(),
+        "type": notif_type,
+        "title": title,
+        "message": message,
+        "business_id": business_id or "",
+        "ref_type": ref_type or "",
+        "ref_id": ref_id or "",
+        "priority": priority,
+        "is_read": False,
+        "created_at": now_iso(),
+    }
+    try:
+        await db.notifications.insert_one(doc)
+        doc.pop("_id", None)
+        await broadcast_event("notification", doc)
+    except Exception:
+        pass
+    return doc
+
+
+async def check_low_stock_and_notify(item_id: str):
+    try:
+        item = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
+        if not item:
+            return
+        min_stock = float(item.get("min_stock") or item.get("minimum_stock") or 0)
+        current = float(item.get("current_stock") or 0)
+        if min_stock > 0 and current <= min_stock:
+            await write_notification(
+                "LOW_STOCK",
+                f"Stok menipis: {item.get('name')}",
+                f"Stok {item.get('name')} tinggal {current:g} {item.get('unit', '')}. Minimum {min_stock:g}.",
+                business_id=item.get("business_unit", ""),
+                ref_type="inventory",
+                ref_id=item_id,
+                priority="high",
+            )
+    except Exception:
+        pass
+
+
+async def send_whatsapp_message(phone: str, text: str) -> dict:
+    normalized = normalize_phone(phone)
+    if not normalized:
+        raise HTTPException(400, "Nomor WhatsApp belum diisi")
+    url = os.environ.get("WHATSAPP_API_URL", "").strip()
+    token = os.environ.get("WHATSAPP_API_KEY", "").strip()
+    if not url or not token:
+        return {
+            "sent": False,
+            "manual": True,
+            "phone": normalized,
+            "wa_url": f"https://wa.me/{normalized}?text={quote(text)}",
+            "message": "WHATSAPP_API_URL/WHATSAPP_API_KEY belum diatur. Gunakan wa_url untuk kirim manual.",
+        }
+    try:
+        import httpx
+        headers = {"Authorization": token, "Content-Type": "application/json"}
+        payload = {"target": normalized, "phone": normalized, "message": text}
+        async with httpx.AsyncClient(timeout=15) as http:
+            res = await http.post(url, json=payload, headers=headers)
+        return {"sent": 200 <= res.status_code < 300, "status_code": res.status_code, "response": res.text[:500], "phone": normalized}
+    except Exception as e:
+        return {"sent": False, "phone": normalized, "error": str(e)}
+
+
+# ---------- Models ----------
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: str = "kasir"
+    phone: Optional[str] = ""
+
+
+# ---------- Auth ----------
+@api.post("/auth/login")
+async def login(body: LoginIn, response: Response):
+    email = body.email.lower().strip()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email atau password salah")
+    token = create_access_token(user["id"], user["email"], user["role"])
+    response.set_cookie(
+        key="access_token", value=token, httponly=True,
+        secure=False, samesite="lax", max_age=604800, path="/",
+    )
+    return {"token": token, "user": clean_doc(user)}
+
+
+@api.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("session_token", path="/")
+    return {"ok": True}
+
+
+# ---------- Google OAuth (Emergent-managed) ----------
+class GoogleSessionIn(BaseModel):
+    session_id: str
+
+
+@api.post("/auth/google-session")
+async def google_session(body: GoogleSessionIn, response: Response):
+    """Validate session_id from Emergent Auth → create/update user → return JWT."""
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+                headers={"X-Session-ID": body.session_id},
+            )
+        if r.status_code != 200:
+            raise HTTPException(401, "Sesi Google tidak valid")
+        data = r.json()
+    except _httpx.HTTPError as e:
+        raise HTTPException(502, f"Tidak bisa menghubungi server Auth: {e}")
+
+    email = (data.get("email") or "").lower().strip()
+    name = data.get("name") or email.split("@")[0]
+    picture = data.get("picture") or ""
+    session_token = data.get("session_token") or ""
+    if not email or not session_token:
+        raise HTTPException(401, "Data sesi tidak lengkap")
+
+    # Upsert user — preserve existing role if user exists
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        await db.users.update_one(
+            {"id": existing["id"]},
+            {"$set": {"name": name, "picture": picture, "google_linked": True}},
+        )
+        user_id = existing["id"]
+        role = existing.get("role", "kasir")
+    else:
+        user_id = gen_id()
+        await db.users.insert_one({
+            "id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "role": "kasir",  # least privilege; super_admin must promote via UI
+            "password_hash": "",
+            "source": "google",
+            "google_linked": True,
+            "active": True,
+            "created_at": now_iso(),
+        })
+        role = "kasir"
+
+    # Store session token (7 days) — for cookie-based auth path
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    await db.user_sessions.update_one(
+        {"session_token": session_token},
+        {"$set": {
+            "user_id": user_id, "email": email, "session_token": session_token,
+            "expires_at": expires_at, "created_at": now_iso(),
+        }},
+        upsert=True,
+    )
+
+    # Issue compatibility JWT (frontend uses Bearer token for some calls)
+    token = create_access_token(user_id, email, role)
+    response.set_cookie(
+        key="access_token", value=token, httponly=True,
+        secure=False, samesite="lax", max_age=604800, path="/",
+    )
+    response.set_cookie(
+        key="session_token", value=session_token, httponly=True,
+        secure=False, samesite="lax", max_age=604800, path="/",
+    )
+    user_doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    return {"token": token, "user": user_doc}
+
+
+# ---------- Password Reset: WhatsApp OTP + Super Admin Reset ----------
+# Token reset lama sengaja dimatikan: tidak boleh lagi mengembalikan token ke browser.
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+@api.post("/auth/forgot-password")
+async def forgot_password_disabled(body: ForgotPasswordIn):
+    raise HTTPException(410, "Reset password token sudah dinonaktifkan. Gunakan reset via WhatsApp OTP.")
+
+
+class ResetPasswordTokenIn(BaseModel):
+    email: str
+    token: str
+    new_password: str
+
+
+@api.post("/auth/reset-password-with-token")
+async def reset_password_with_token_disabled(body: ResetPasswordTokenIn):
+    raise HTTPException(410, "Reset password token sudah dinonaktifkan. Gunakan reset via WhatsApp OTP.")
+
+
+class RequestWaOtpIn(BaseModel):
+    phone: str
+
+
+class ResetPasswordWaIn(BaseModel):
+    phone: str
+    otp: str
+    new_password: str
+
+
+@api.post("/auth/request-wa-otp")
+async def request_wa_otp(body: RequestWaOtpIn):
+    phone = normalize_phone(body.phone)
+    if not phone:
+        raise HTTPException(400, "Nomor WhatsApp wajib diisi")
+    user = await db.users.find_one({"$or": [{"phone": phone}, {"phone": body.phone}, {"whatsapp": phone}]})
+    # Generic response agar nomor terdaftar/tidak tidak bocor.
+    generic = {"ok": True, "message": "Jika nomor terdaftar, OTP reset password dikirim ke WhatsApp."}
+    if not user:
+        return generic
+
+    # Rate limit sederhana: max 3 OTP aktif dalam 15 menit per user.
+    since = datetime.now(timezone.utc) - timedelta(minutes=15)
+    recent = await db.otp_codes.count_documents({"user_id": user["id"], "created_at_dt": {"$gte": since}, "used": False})
+    if recent >= 3:
+        raise HTTPException(429, "Terlalu banyak permintaan OTP. Coba lagi nanti.")
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    await db.otp_codes.insert_one({
+        "id": gen_id(),
+        "user_id": user["id"],
+        "phone": phone,
+        "otp_hash": hash_password(otp),
+        "purpose": "password_reset",
+        "used": False,
+        "expires_at": expires_at,
+        "created_at_dt": datetime.now(timezone.utc),
+        "created_at": now_iso(),
+    })
+    text = f"Kode OTP reset password AgriWarung Anda: {otp}\nBerlaku 10 menit. Jangan berikan kode ini kepada siapa pun."
+    wa_result = await send_whatsapp_message(phone, text)
+    result = {**generic, "expires_in_minutes": 10, "wa": {k: v for k, v in wa_result.items() if k not in ("response",)}}
+    # Untuk mode development lokal/HF tanpa WA API, token TIDAK ditampilkan. wa_url membantu buka WA manual dari perangkat admin bila phone valid.
+    return result
+
+
+@api.post("/auth/reset-password-wa")
+async def reset_password_wa(body: ResetPasswordWaIn):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password baru minimal 6 karakter")
+    phone = normalize_phone(body.phone)
+    otp = (body.otp or "").strip()
+    if not phone or not otp:
+        raise HTTPException(400, "Nomor WhatsApp dan OTP wajib")
+    user = await db.users.find_one({"$or": [{"phone": phone}, {"phone": body.phone}, {"whatsapp": phone}]})
+    if not user:
+        raise HTTPException(400, "OTP tidak valid atau sudah kedaluwarsa")
+    recs = await db.otp_codes.find({
+        "user_id": user["id"], "phone": phone, "purpose": "password_reset", "used": False
+    }, {"_id": 0}).sort("created_at", -1).to_list(5)
+    now_dt = datetime.now(timezone.utc)
+    match = None
+    for rec in recs:
+        exp = rec.get("expires_at")
+        if isinstance(exp, str):
+            exp = datetime.fromisoformat(exp)
+        if exp and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp and exp < now_dt:
+            continue
+        if verify_password(otp, rec.get("otp_hash", "")):
+            match = rec
+            break
+    if not match:
+        raise HTTPException(400, "OTP tidak valid atau sudah kedaluwarsa")
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(body.new_password), "phone": phone, "phone_verified": True}})
+    await db.otp_codes.update_one({"id": match["id"]}, {"$set": {"used": True, "used_at": now_iso()}})
+    await write_notification("SECURITY", "Password direset via WhatsApp OTP", f"Password akun {user.get('email')} berhasil direset via OTP.", ref_type="user", ref_id=user["id"], priority="high")
+    return {"ok": True, "message": "Password berhasil di-reset. Silakan login dengan password baru."}
+
+
+@api.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return user
+
+
+@api.get("/users")
+async def list_users(user: dict = Depends(get_current_user)):
+    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(1000)
+    return users
+
+
+@api.post("/users")
+async def create_user(body: UserCreate, user: dict = Depends(require_roles("super_admin"))):
+    if await db.users.find_one({"email": body.email.lower()}):
+        raise HTTPException(status_code=400, detail="Email sudah terdaftar")
+    doc = {
+        "id": gen_id(),
+        "email": body.email.lower(),
+        "password_hash": hash_password(body.password),
+        "name": body.name,
+        "role": body.role,
+        "phone": normalize_phone(body.phone),
+        "phone_verified": bool(body.phone),
+        "active": True,
+        "created_at": now_iso(),
+    }
+    await db.users.insert_one(doc)
+    return clean_doc(doc)
+
+
+# ---------- Generic CRUD utility ----------
+async def list_collection(coll: str, query: dict = None):
+    return await db[coll].find(query or {}, {"_id": 0}).to_list(5000)
+
+
+async def insert_doc(coll: str, data: dict):
+    if "id" not in data:
+        data["id"] = gen_id()
+    data["created_at"] = data.get("created_at", now_iso())
+    await db[coll].insert_one(data)
+    data.pop("_id", None)
+    return data
+
+
+# ---------- Investors & Capital ----------
+class InvestorIn(BaseModel):
+    name: str
+    phone: Optional[str] = ""
+    address: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+@api.get("/investors")
+async def get_investors(user: dict = Depends(get_current_user)):
+    investors = await list_collection("investors")
+    # compute total capital per investor
+    injections = await list_collection("capital_injections")
+    total_all = sum(i.get("amount", 0) for i in injections)
+    for inv in investors:
+        inv["total_capital"] = sum(
+            ci.get("amount", 0) for ci in injections if ci.get("investor_id") == inv["id"]
+        )
+        inv["ownership_pct"] = (inv["total_capital"] / total_all * 100) if total_all else 0
+    return investors
+
+
+@api.post("/investors")
+async def create_investor(body: InvestorIn, user: dict = Depends(get_current_user)):
+    return await insert_doc("investors", body.model_dump())
+
+
+class CapitalIn(BaseModel):
+    investor_id: str
+    amount: int
+    unit: str = "umum"
+    notes: Optional[str] = ""
+    date: Optional[str] = None
+
+
+@api.get("/capital-injections")
+async def get_capital(user: dict = Depends(get_current_user)):
+    return await list_collection("capital_injections")
+
+
+@api.post("/capital-injections")
+async def add_capital(body: CapitalIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["date"] = data.get("date") or now_iso()
+    # create journal entry: Debit Kas / Credit Modal Disetor
+    await insert_doc("journal_entries", {
+        "date": data["date"],
+        "description": f"Setoran modal - {data['notes'] or 'modal'}",
+        "lines": [
+            {"account": "Kas", "debit": data["amount"], "credit": 0},
+            {"account": "Modal Disetor", "debit": 0, "credit": data["amount"]},
+        ],
+        "reference": "capital_injection",
+        "unit": data.get("unit", "umum"),
+    })
+    return await insert_doc("capital_injections", data)
+
+
+# ---------- Land Rental ----------
+class LandRentalIn(BaseModel):
+    investor_id: str
+    monthly_amount: int
+    start_date: str
+    notes: Optional[str] = ""
+
+
+@api.get("/land-rental")
+async def get_land_rental(user: dict = Depends(get_current_user)):
+    return await list_collection("land_rental")
+
+
+@api.post("/land-rental")
+async def set_land_rental(body: LandRentalIn, user: dict = Depends(get_current_user)):
+    await db.land_rental.delete_many({})
+    return await insert_doc("land_rental", body.model_dump())
+
+
+# ---------- Dividends ----------
+class DividendIn(BaseModel):
+    month: int
+    year: int
+    total_profit: int
+
+
+@api.post("/dividends/calculate")
+async def calc_dividends(body: DividendIn, user: dict = Depends(get_current_user)):
+    investors = await get_investors(user)
+    result = []
+    for inv in investors:
+        share = int(body.total_profit * inv["ownership_pct"] / 100)
+        result.append({
+            "investor_id": inv["id"],
+            "investor_name": inv["name"],
+            "ownership_pct": inv["ownership_pct"],
+            "share": share,
+        })
+    return {"month": body.month, "year": body.year, "total_profit": body.total_profit, "items": result}
+
+
+@api.get("/dividends")
+async def list_dividends(user: dict = Depends(get_current_user)):
+    return await list_collection("dividends")
+
+
+@api.post("/dividends")
+async def record_dividend(body: dict, user: dict = Depends(get_current_user)):
+    return await insert_doc("dividends", body)
+
+
+# ---------- Inventory ----------
+class InventoryIn(BaseModel):
+    name: str
+    category: str
+    unit: str = "pcs"
+    current_stock: float = 0
+    min_stock: float = 0
+    cost_price: int = 0
+    sell_price: int = 0
+    business_unit: str = "warung"
+    location: Optional[str] = ""
+    notes: Optional[str] = ""
+    image_url: Optional[str] = ""
+
+
+@api.get("/inventory")
+async def list_inventory(user: dict = Depends(get_current_user)):
+    return await list_collection("inventory_items")
+
+
+@api.post("/inventory")
+async def create_inventory(body: InventoryIn, user: dict = Depends(get_current_user)):
+    return await insert_doc("inventory_items", body.model_dump())
+
+
+@api.put("/inventory/{item_id}")
+async def update_inventory(item_id: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.inventory_items.update_one({"id": item_id}, {"$set": body})
+    doc = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
+    return doc
+
+
+@api.delete("/inventory/{item_id}")
+async def delete_inventory(item_id: str, user: dict = Depends(get_current_user)):
+    await db.inventory_items.delete_one({"id": item_id})
+    return {"ok": True}
+
+
+@api.get("/inventory/low-stock")
+async def low_stock(user: dict = Depends(get_current_user)):
+    items = await list_collection("inventory_items")
+    return [i for i in items if i.get("current_stock", 0) <= i.get("min_stock", 0) and i.get("min_stock", 0) > 0]
+
+
+@api.get("/stock-movements")
+async def stock_movements(user: dict = Depends(get_current_user)):
+    movs = await db.stock_movements.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return movs
+
+
+# ---------- BOM ----------
+class BOMIngredient(BaseModel):
+    item_id: str
+    quantity: float
+
+
+class BOMIn(BaseModel):
+    output_item_id: str
+    name: str
+    type: str = "menu"  # menu | fertilizer
+    ingredients: List[BOMIngredient]
+
+
+@api.get("/bom")
+async def list_bom(user: dict = Depends(get_current_user)):
+    return await list_collection("bom_recipes")
+
+
+@api.post("/bom")
+async def create_bom(body: BOMIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    return await insert_doc("bom_recipes", data)
+
+
+@api.delete("/bom/{bom_id}")
+async def delete_bom(bom_id: str, user: dict = Depends(get_current_user)):
+    await db.bom_recipes.delete_one({"id": bom_id})
+    return {"ok": True}
+
+
+# ---------- Produksi (Restock product via BOM) ----------
+class ProduceIn(BaseModel):
+    quantity: float  # how many finished units to produce
+
+
+@api.post("/inventory/{item_id}/produce")
+async def produce_item(item_id: str, body: ProduceIn, user: dict = Depends(get_current_user)):
+    """Tambah stok produk jadi sebanyak `quantity`, otomatis kurangi bahan baku sesuai BOM."""
+    item = await db.inventory_items.find_one({"id": item_id})
+    if not item:
+        raise HTTPException(404, "Item tidak ditemukan")
+    if body.quantity <= 0:
+        raise HTTPException(400, "Jumlah produksi harus lebih dari 0")
+    bom = await db.bom_recipes.find_one({"output_item_id": item_id}, {"_id": 0})
+    consumed = []
+    if bom:
+        # Pre-validate stock availability
+        shortages = []
+        for ing in bom["ingredients"]:
+            need = ing["quantity"] * body.quantity
+            ing_item = await db.inventory_items.find_one({"id": ing["item_id"]})
+            if not ing_item:
+                shortages.append({"item_id": ing["item_id"], "name": "(tidak ditemukan)", "need": need})
+                continue
+            available = ing_item.get("current_stock", 0)
+            if available < need:
+                shortages.append({"name": ing_item["name"], "available": available, "need": need})
+        if shortages:
+            raise HTTPException(400, "Bahan baku kurang: " + ", ".join([f"{s.get('name')} (butuh {s.get('need')}, ada {s.get('available',0)})" for s in shortages]))
+        for ing in bom["ingredients"]:
+            qty_used = ing["quantity"] * body.quantity
+            await db.inventory_items.update_one(
+                {"id": ing["item_id"]},
+                {"$inc": {"current_stock": -qty_used}},
+            )
+            await db.stock_movements.insert_one({
+                "id": gen_id(),
+                "item_id": ing["item_id"],
+                "type": "production_consume",
+                "quantity": -qty_used,
+                "reason": f"Produksi {body.quantity} {item['name']}",
+                "created_at": now_iso(),
+            })
+            consumed.append({"item_id": ing["item_id"], "quantity": qty_used})
+    # Add finished product stock
+    await db.inventory_items.update_one(
+        {"id": item_id},
+        {"$inc": {"current_stock": body.quantity}},
+    )
+    await db.stock_movements.insert_one({
+        "id": gen_id(),
+        "item_id": item_id,
+        "type": "production",
+        "quantity": body.quantity,
+        "reason": f"Produksi {body.quantity} unit",
+        "created_at": now_iso(),
+    })
+    await write_audit(user, "update", "inventory", item_id, {"action": "produce", "quantity": body.quantity, "bom_used": bool(bom)})
+    return {"ok": True, "produced": body.quantity, "has_bom": bool(bom), "consumed": consumed}
+
+
+# ---------- Tables ----------
+class TableIn(BaseModel):
+    name: str
+
+
+@api.get("/tables")
+async def list_tables(user: dict = Depends(get_current_user)):
+    tables = await list_collection("tables")
+    orders = await db.orders.find({"status": {"$in": ["open", "sent", "bill_requested"]}}, {"_id": 0}).to_list(500)
+    by_table = {}
+    for o in orders:
+        by_table.setdefault(o.get("table_id"), []).append(o)
+    for t in tables:
+        active = by_table.get(t["id"], [])
+        t["status"] = "available" if not active else (active[0].get("status") or "occupied")
+        t["active_order_id"] = active[0]["id"] if active else None
+        t["active_total"] = sum(sum(it["quantity"] * it["unit_price"] for it in o.get("items", [])) for o in active)
+    return tables
+
+
+@api.post("/tables")
+async def create_table(body: TableIn, user: dict = Depends(get_current_user)):
+    return await insert_doc("tables", body.model_dump())
+
+
+@api.delete("/tables/{table_id}")
+async def delete_table(table_id: str, user: dict = Depends(get_current_user)):
+    await db.tables.delete_one({"id": table_id})
+    return {"ok": True}
+
+
+# ---------- Orders & Transactions ----------
+class OrderItemIn(BaseModel):
+    item_id: str
+    name: str
+    quantity: int
+    unit_price: int
+    notes: Optional[str] = ""
+
+
+class OrderIn(BaseModel):
+    table_id: Optional[str] = None
+    items: List[OrderItemIn]
+    notes: Optional[str] = ""
+
+
+@api.get("/orders")
+async def list_orders(user: dict = Depends(get_current_user)):
+    return await db.orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.get("/orders/active")
+async def active_orders(user: dict = Depends(get_current_user)):
+    return await db.orders.find(
+        {"status": {"$in": ["open", "sent", "bill_requested"]}}, {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+
+
+@api.post("/orders")
+async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
+    doc = {
+        "id": gen_id(),
+        "table_id": body.table_id,
+        "items": [i.model_dump() for i in body.items],
+        "notes": body.notes,
+        "status": "sent",
+        "created_by": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.orders.insert_one(doc)
+    doc.pop("_id", None)
+    await broadcast_event("order_created", {"id": doc["id"], "table_id": doc.get("table_id")})
+    return doc
+
+
+@api.put("/orders/{order_id}")
+async def update_order(order_id: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.orders.update_one({"id": order_id}, {"$set": body})
+    doc = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return doc
+
+
+class TransactionIn(BaseModel):
+    order_id: Optional[str] = None
+    table_id: Optional[str] = None
+    items: List[OrderItemIn]
+    discount: int = 0
+    payment_method: str = "cash"
+    cash_received: int = 0
+    customer_name: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+    is_bon: bool = False
+    transaction_type: Literal["SALE", "SELF_USE", "WASTE", "ADJUSTMENT"] = "SALE"
+    notes: Optional[str] = ""
+    unit: str = "warung"
+    branch_id: Optional[str] = None
+    member_id: Optional[str] = None
+    points_redeemed: int = 0
+
+
+@api.post("/transactions")
+async def create_transaction(body: TransactionIn, user: dict = Depends(get_current_user)):
+    if not body.items:
+        raise HTTPException(400, "Item transaksi kosong")
+    trx_type = (body.transaction_type or "SALE").upper()
+    if trx_type not in ("SALE", "SELF_USE", "WASTE", "ADJUSTMENT"):
+        raise HTTPException(400, "Jenis transaksi tidak valid")
+
+    retail_subtotal = sum(i.quantity * i.unit_price for i in body.items)
+    discount = max(0, int(body.discount or 0))
+    sale_total = max(0, retail_subtotal - discount)
+    cash_received = max(0, int(body.cash_received or 0))
+
+    # Cost/HPP dihitung dari inventory saat transaksi dibuat.
+    cost_total = 0
+    trx_no = f"TRX-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    stock_type = {"SALE": "sale", "SELF_USE": "self_use", "WASTE": "waste", "ADJUSTMENT": "adjustment"}[trx_type]
+    for it in body.items:
+        inv = await db.inventory_items.find_one({"id": it.item_id})
+        unit_cost = 0
+        if inv:
+            unit_cost = int(inv.get("cost_price") or inv.get("hpp") or 0)
+            cost_total += unit_cost * it.quantity
+            await db.inventory_items.update_one({"id": it.item_id}, {"$inc": {"current_stock": -it.quantity}})
+            after = await db.inventory_items.find_one({"id": it.item_id}, {"_id": 0})
+            await db.stock_movements.insert_one({
+                "id": gen_id(),
+                "item_id": it.item_id,
+                "business_unit": inv.get("business_unit", body.unit),
+                "type": stock_type,
+                "quantity": -it.quantity,
+                "qty_out": it.quantity,
+                "qty_in": 0,
+                "balance_after": (after or {}).get("current_stock"),
+                "reason": f"{stock_type.upper()} {trx_no}",
+                "reference_id": trx_no,
+                "created_at": now_iso(),
+            })
+            await check_low_stock_and_notify(it.item_id)
+
+    is_sale = trx_type == "SALE"
+    auto_debt = is_sale and body.payment_method == "cash" and cash_received < sale_total
+    effective_is_bon = bool(body.is_bon or auto_debt) if is_sale else False
+    paid_amount = 0 if not is_sale else (min(cash_received, sale_total) if body.payment_method == "cash" else sale_total)
+    debt_amount = 0 if not is_sale else max(0, sale_total - paid_amount)
+    payment_status = (
+        "INTERNAL" if not is_sale else
+        "PAID" if debt_amount == 0 else
+        "PARTIAL" if paid_amount > 0 else
+        "DEBT"
+    )
+    change = (cash_received - sale_total) if (is_sale and body.payment_method == "cash") else 0
+    receipt_snapshot = await build_receipt_snapshot(body.unit)
+
+    doc = {
+        "id": gen_id(),
+        "trx_no": trx_no,
+        "order_id": body.order_id,
+        "table_id": body.table_id,
+        "branch_id": body.branch_id,
+        "items": [i.model_dump() for i in body.items],
+        "subtotal": retail_subtotal,
+        "discount": discount,
+        "total": sale_total if is_sale else 0,
+        "cost_total": int(cost_total),
+        "transaction_type": trx_type,
+        "payment_method": body.payment_method if is_sale else trx_type.lower(),
+        "payment_status": payment_status,
+        "paid_amount": paid_amount,
+        "debt_amount": debt_amount,
+        "cash_received": cash_received if is_sale else 0,
+        "change": change,
+        "customer_name": body.customer_name or ("Pelanggan" if auto_debt else ""),
+        "customer_phone": body.customer_phone,
+        "is_bon": effective_is_bon,
+        "notes": body.notes or "",
+        "unit": body.unit,
+        "receipt_snapshot": receipt_snapshot,
+        "cashier_id": user["id"],
+        "cashier_name": user.get("name"),
+        "created_at": now_iso(),
+    }
+    await db.transactions.insert_one(doc)
+    doc.pop("_id", None)
+
+    # Loyalty hanya untuk penjualan berbayar, bukan pemakaian sendiri/rusak.
+    if is_sale and (body.customer_name or body.member_id) and not effective_is_bon:
+        member = None
+        if body.member_id:
+            member = await db.members.find_one({"$or": [{"id": body.member_id}, {"member_id": body.member_id}, {"phone": body.member_id}]})
+        if member:
+            loy = await db.loyalty_settings.find_one({}, {"_id": 0}) or {"earn_rate": 1000}
+            points_earned = int(sale_total / loy.get("earn_rate", 1000))
+            new_points = member.get("points", 0) + points_earned
+            new_total = member.get("total_spent", 0) + sale_total
+            new_tier = "Gold" if new_points >= 500 else ("Silver" if new_points >= 100 else "Bronze")
+            await db.members.update_one({"id": member["id"]}, {"$set": {"points": new_points, "total_spent": new_total, "tier": new_tier}})
+            doc["points_earned"] = points_earned
+            doc["member_id"] = member["id"]
+            doc["member_name"] = member["name"]
+            await db.transactions.update_one({"id": doc["id"]}, {"$set": {"points_earned": points_earned, "member_id": member["id"], "member_name": member["name"]}})
+
+    if is_sale and body.member_id and body.points_redeemed:
+        await db.members.update_one({"$or": [{"id": body.member_id}, {"member_id": body.member_id}]}, {"$inc": {"points": -body.points_redeemed}})
+
+    # Close order setelah pembayaran.
+    if body.order_id:
+        await db.orders.update_one({"id": body.order_id}, {"$set": {"status": "paid" if is_sale else "closed"}})
+        await broadcast_event("order_updated", {"id": body.order_id, "status": "paid", "table_id": body.table_id})
+
+    # Customer bon/hutang otomatis jika uang kurang.
+    if effective_is_bon and debt_amount > 0:
+        await db.customer_debts.insert_one({
+            "id": gen_id(),
+            "customer_name": body.customer_name or "Pelanggan",
+            "customer_phone": body.customer_phone or "",
+            "amount": sale_total,
+            "paid": paid_amount,
+            "status": "partial" if paid_amount > 0 else "unpaid",
+            "transaction_id": doc["id"],
+            "created_at": now_iso(),
+        })
+        await write_notification("DEBT", "Transaksi menjadi hutang", f"{doc['trx_no']} kurang {format_rp_short(debt_amount)}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"], priority="high")
+
+    # Journal entries ringan ala Odoo.
+    if is_sale:
+        debit_lines = []
+        if paid_amount > 0:
+            debit_lines.append({"account": payment_account(body.payment_method), "debit": paid_amount, "credit": 0})
+        if debt_amount > 0:
+            debit_lines.append({"account": "Piutang Bon", "debit": debt_amount, "credit": 0})
+        if not debit_lines:
+            debit_lines.append({"account": "Piutang Bon", "debit": sale_total, "credit": 0})
+        await db.journal_entries.insert_one({
+            "id": gen_id(),
+            "date": doc["created_at"],
+            "description": f"Penjualan {body.unit} - {trx_no}",
+            "lines": debit_lines + [{"account": f"Pendapatan {body.unit.capitalize()}", "debit": 0, "credit": sale_total}],
+            "reference": "transaction",
+            "reference_id": doc["id"],
+            "unit": body.unit,
+            "created_at": now_iso(),
+        })
+        if cost_total > 0:
+            await db.journal_entries.insert_one({
+                "id": gen_id(), "date": doc["created_at"],
+                "description": f"HPP {body.unit} - {trx_no}",
+                "lines": [
+                    {"account": f"HPP {body.unit.capitalize()}", "debit": int(cost_total), "credit": 0},
+                    {"account": "Persediaan", "debit": 0, "credit": int(cost_total)},
+                ],
+                "reference": "hpp", "reference_id": doc["id"], "unit": body.unit, "created_at": now_iso(),
+            })
+    else:
+        expense_account = {"SELF_USE": "Beban Pemakaian Sendiri", "WASTE": "Beban Barang Rusak", "ADJUSTMENT": "Beban Penyesuaian Stok"}.get(trx_type, "Beban Persediaan")
+        if cost_total > 0:
+            await db.journal_entries.insert_one({
+                "id": gen_id(), "date": doc["created_at"],
+                "description": f"{expense_account} - {trx_no}",
+                "lines": [
+                    {"account": expense_account, "debit": int(cost_total), "credit": 0},
+                    {"account": "Persediaan", "debit": 0, "credit": int(cost_total)},
+                ],
+                "reference": trx_type.lower(), "reference_id": doc["id"], "unit": body.unit, "created_at": now_iso(),
+            })
+
+    await broadcast_event("transaction_created", {"id": doc["id"], "total": doc["total"], "unit": body.unit, "transaction_type": trx_type})
+    await write_notification("TRANSACTION", "Transaksi baru", f"{trx_no} · {format_rp_short(doc['total'])} · {payment_status}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"])
+    await write_audit(user, "create", "transaction", doc["id"], {"trx_no": trx_no, "total": doc["total"], "type": trx_type, "payment_status": payment_status})
+    return doc
+
+
+@api.get("/transactions")
+async def list_transactions(user: dict = Depends(get_current_user), limit: int = 500, unit: Optional[str] = None):
+    q = {}
+    if unit:
+        q["unit"] = unit
+    limit = max(1, min(int(limit or 500), 2000))
+    return await db.transactions.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+
+
+@api.get("/transactions/{trx_id}")
+async def get_transaction(trx_id: str, user: dict = Depends(get_current_user)):
+    trx = await db.transactions.find_one({"id": trx_id}, {"_id": 0})
+    if not trx:
+        raise HTTPException(404, "Transaksi tidak ditemukan")
+    return trx
+
+
+@api.get("/transactions/{trx_id}/receipt")
+async def get_transaction_receipt(trx_id: str, user: dict = Depends(get_current_user)):
+    trx = await get_transaction(trx_id, user)
+    if not trx.get("receipt_snapshot"):
+        trx["receipt_snapshot"] = await build_receipt_snapshot(trx.get("unit", "warung"))
+    return {"transaction": trx, "text": generate_receipt_text(trx)}
+
+
+class SendReceiptWaIn(BaseModel):
+    phone: Optional[str] = ""
+
+
+@api.post("/transactions/{trx_id}/send-whatsapp")
+async def send_transaction_receipt_wa(trx_id: str, body: SendReceiptWaIn, user: dict = Depends(get_current_user)):
+    trx = await get_transaction(trx_id, user)
+    phone = body.phone or trx.get("customer_phone")
+    text = generate_receipt_text(trx)
+    result = await send_whatsapp_message(phone, text)
+    await write_audit(user, "send", "receipt_whatsapp", trx_id, {"phone": normalize_phone(phone), "sent": result.get("sent")})
+    return {**result, "text": text}
+
+
+# ---------- Customer Debts (Bon) ----------
+@api.get("/customer-debts")
+async def list_debts(user: dict = Depends(get_current_user)):
+    return await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+class PayDebtIn(BaseModel):
+    amount: int
+
+
+@api.post("/customer-debts/{debt_id}/pay")
+async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_current_user)):
+    debt = await db.customer_debts.find_one({"id": debt_id})
+    if not debt:
+        raise HTTPException(404, "Bon tidak ditemukan")
+    new_paid = debt.get("paid", 0) + body.amount
+    status = "paid" if new_paid >= debt["amount"] else "partial"
+    await db.customer_debts.update_one(
+        {"id": debt_id},
+        {"$set": {"paid": new_paid, "status": status, "last_paid_at": now_iso()}},
+    )
+    # Record cash receipt in journal: Debit Kas / Credit Piutang Bon
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": now_iso(),
+        "description": f"Pelunasan bon {debt['customer_name']} (sebagian)" if status == "partial" else f"Pelunasan bon {debt['customer_name']}",
+        "lines": [
+            {"account": "Kas", "debit": body.amount, "credit": 0},
+            {"account": "Piutang Bon", "debit": 0, "credit": body.amount},
+        ],
+        "reference": "debt_payment",
+        "reference_id": debt_id,
+        "unit": "warung",
+        "created_at": now_iso(),
+    })
+    # If fully paid via partial payments, also clear bon flag on original trx
+    if status == "paid" and debt.get("transaction_id"):
+        await db.transactions.update_one(
+            {"id": debt["transaction_id"]},
+            {"$set": {"is_bon": False, "payment_method": "bon_paid", "settled_at": now_iso()}},
+        )
+    await write_audit(user, "update", "customer_debt", debt_id, {"amount": body.amount, "status": status})
+    return {"ok": True, "status": status, "paid": new_paid}
+
+
+@api.post("/customer-debts/{debt_id}/mark-paid")
+async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
+    debt = await db.customer_debts.find_one({"id": debt_id})
+    if not debt:
+        raise HTTPException(404, "Bon tidak ditemukan")
+    if debt.get("status") == "paid":
+        return {"ok": True, "already_paid": True}
+    remaining = debt["amount"] - debt.get("paid", 0)
+    await db.customer_debts.update_one(
+        {"id": debt_id},
+        {"$set": {"paid": debt["amount"], "status": "paid", "last_paid_at": now_iso()}},
+    )
+    # Record remaining cash receipt to journal
+    if remaining > 0:
+        await db.journal_entries.insert_one({
+            "id": gen_id(),
+            "date": now_iso(),
+            "description": f"Pelunasan bon {debt['customer_name']} (Lunas)",
+            "lines": [
+                {"account": "Kas", "debit": remaining, "credit": 0},
+                {"account": "Piutang Bon", "debit": 0, "credit": remaining},
+            ],
+            "reference": "debt_payment",
+            "reference_id": debt_id,
+            "unit": "warung",
+            "created_at": now_iso(),
+        })
+    # Update related transaction so it no longer appears as bon in Kasir history
+    if debt.get("transaction_id"):
+        await db.transactions.update_one(
+            {"id": debt["transaction_id"]},
+            {"$set": {"is_bon": False, "payment_method": "bon_paid", "settled_at": now_iso()}},
+        )
+    await write_audit(user, "update", "customer_debt", debt_id, {"status": "paid", "full": True})
+    return {"ok": True}
+
+
+@api.get("/customer-debts/{debt_id}")
+async def get_debt(debt_id: str, user: dict = Depends(get_current_user)):
+    debt = await db.customer_debts.find_one({"id": debt_id}, {"_id": 0})
+    if not debt:
+        raise HTTPException(404, "Bon tidak ditemukan")
+    # Include original transaction items if available
+    if debt.get("transaction_id"):
+        trx = await db.transactions.find_one({"id": debt["transaction_id"]}, {"_id": 0})
+        if trx:
+            debt["original_items"] = trx.get("items", [])
+            debt["customer_phone"] = trx.get("customer_phone") or ""
+    return debt
+
+
+class SettleBonIn(BaseModel):
+    payment_method: str = "cash"  # cash | transfer | qris
+    cash_received: int = 0
+
+
+@api.post("/customer-debts/{debt_id}/settle-via-kasir")
+async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends(get_current_user)):
+    """Pelunasan bon dari Kasir: cancel transaksi lama bon, buat transaksi baru cash, record nota."""
+    debt = await db.customer_debts.find_one({"id": debt_id})
+    if not debt:
+        raise HTTPException(404, "Bon tidak ditemukan")
+    if debt.get("status") == "paid":
+        raise HTTPException(400, "Bon sudah lunas")
+    remaining = debt["amount"] - debt.get("paid", 0)
+    if body.payment_method == "cash" and body.cash_received < remaining:
+        raise HTTPException(400, "Uang tunai kurang")
+
+    # Get original transaction items
+    original_trx = None
+    items = []
+    if debt.get("transaction_id"):
+        original_trx = await db.transactions.find_one({"id": debt["transaction_id"]})
+        if original_trx:
+            items = original_trx.get("items", [])
+
+    # Soft-cancel old transaction (it gets replaced)
+    if original_trx:
+        await db.transactions.update_one(
+            {"id": original_trx["id"]},
+            {"$set": {
+                "cancelled": True,
+                "cancelled_at": now_iso(),
+                "cancelled_by": user["id"],
+                "cancel_reason": "replaced_by_payment",
+                "replaced_by": None,  # filled below
+            }},
+        )
+
+    # Create new transaction (payment in cash/transfer)
+    trx_no = f"TRX-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    new_total = remaining
+    change = (body.cash_received - remaining) if body.payment_method == "cash" else 0
+    new_doc = {
+        "id": gen_id(),
+        "trx_no": trx_no,
+        "items": items,
+        "subtotal": new_total,
+        "discount": 0,
+        "tax": 0,
+        "total": new_total,
+        "payment_method": body.payment_method,
+        "cash_received": body.cash_received if body.payment_method == "cash" else new_total,
+        "change": change,
+        "customer_name": debt["customer_name"],
+        "customer_phone": original_trx.get("customer_phone", "") if original_trx else "",
+        "is_bon": False,
+        "unit": "warung",
+        "branch_id": original_trx.get("branch_id") if original_trx else None,
+        "cashier_id": user["id"],
+        "cashier_name": user.get("name", user.get("email")),
+        "settled_from_debt": debt_id,
+        "settled_from_trx": original_trx["id"] if original_trx else None,
+        "created_at": now_iso(),
+    }
+    await db.transactions.insert_one(new_doc)
+    new_doc.pop("_id", None)
+
+    # Link replaced_by on the old transaction
+    if original_trx:
+        await db.transactions.update_one({"id": original_trx["id"]}, {"$set": {"replaced_by": new_doc["id"]}})
+
+    # Mark debt paid
+    await db.customer_debts.update_one(
+        {"id": debt_id},
+        {"$set": {
+            "paid": debt["amount"],
+            "status": "paid",
+            "last_paid_at": now_iso(),
+            "settled_trx_id": new_doc["id"],
+        }},
+    )
+
+    # Journal: Debit Kas / Credit Piutang Bon
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": now_iso(),
+        "description": f"Pelunasan bon {debt['customer_name']} via Kasir ({trx_no})",
+        "lines": [
+            {"account": "Kas", "debit": remaining, "credit": 0},
+            {"account": "Piutang Bon", "debit": 0, "credit": remaining},
+        ],
+        "reference": "transaction",
+        "reference_id": new_doc["id"],
+        "unit": "warung",
+        "created_at": now_iso(),
+    })
+
+    await write_audit(user, "create", "transaction", new_doc["id"], {"trx_no": trx_no, "settled_bon": debt_id})
+    await broadcast_event("transaction_created", {"id": new_doc["id"]})
+    return new_doc
+
+
+# Update PO/online order statuses manually
+class StatusUpdateIn(BaseModel):
+    payment_status: Optional[str] = None  # paid | unpaid | partial
+    delivery_status: Optional[str] = None  # arrived | pending | shipped
+
+
+async def _record_purchase_expense(doc: dict, source: str, kind: str = "po"):
+    """Idempotent: record expense once when payment_status=paid."""
+    if doc.get("expense_recorded"):
+        return
+    label = doc.get("po_no") or doc.get("order_number") or doc.get("id")
+    await db.expenses.insert_one({
+        "id": gen_id(),
+        "amount": doc.get("total", 0),
+        "category": "Pembelian Bahan",
+        "unit": "gudang",
+        "notes": f"{kind.upper()} {label}" + (f" — {source}" if source else ""),
+        "date": now_iso(),
+        "created_at": now_iso(),
+        "reference": kind,
+        "reference_id": doc["id"],
+    })
+    # Journal: Debit Pembelian / Credit Kas
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": now_iso(),
+        "description": f"Pembayaran {kind.upper()} {label}",
+        "lines": [
+            {"account": "Pembelian Bahan", "debit": doc.get("total", 0), "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": doc.get("total", 0)},
+        ],
+        "reference": kind,
+        "reference_id": doc["id"],
+        "unit": "gudang",
+        "created_at": now_iso(),
+    })
+
+
+async def _record_stock_receipt(doc: dict, kind: str = "po"):
+    """Idempotent: add to inventory when delivery_status=arrived.
+    Returns dict with counts: {added: N, skipped: [names], items_added: [{name, qty}]}.
+    """
+    result = {"added": 0, "skipped": [], "items_added": []}
+    if doc.get("stock_received"):
+        return result
+    label = doc.get("po_no") or doc.get("order_number") or doc.get("id")
+    for it in doc.get("items", []):
+        ref_id = it.get("item_id")
+        ref_item = None
+        if ref_id:
+            ref_item = await db.inventory_items.find_one({"id": ref_id})
+        # Fallback: try to find by name
+        if not ref_item and it.get("name"):
+            ref_item = await db.inventory_items.find_one({"name": it["name"]})
+            if ref_item:
+                # Backfill the PO's item_id so next time it matches
+                ref_id = ref_item["id"]
+        if not ref_item:
+            result["skipped"].append(it.get("name") or "(tanpa nama)")
+            continue
+        update_doc = {"$inc": {"current_stock": it.get("quantity", 0)}}
+        if it.get("unit_price") and kind == "po":
+            update_doc["$set"] = {"cost_price": it["unit_price"]}
+        await db.inventory_items.update_one({"id": ref_item["id"]}, update_doc)
+        await db.stock_movements.insert_one({
+            "id": gen_id(),
+            "item_id": ref_item["id"],
+            "type": f"{kind}_in",
+            "quantity": it.get("quantity", 0),
+            "reason": f"Penerimaan {kind.upper()} {label}",
+            "created_at": now_iso(),
+        })
+        result["added"] += 1
+        result["items_added"].append({"name": ref_item["name"], "qty": it.get("quantity", 0)})
+    return result
+
+
+@api.put("/purchase-orders/{po_id}/status")
+async def update_po_status(po_id: str, body: StatusUpdateIn, user: dict = Depends(get_current_user)):
+    po = await db.purchase_orders.find_one({"id": po_id})
+    if not po:
+        raise HTTPException(404, "PO tidak ditemukan")
+    update = {}
+    if body.payment_status:
+        update["payment_status"] = body.payment_status
+    if body.delivery_status:
+        update["delivery_status"] = body.delivery_status
+    if not update:
+        return {"ok": True}
+    await db.purchase_orders.update_one({"id": po_id}, {"$set": update})
+
+    # Auto-integration: paid → expense, arrived → stock receipt
+    po_after = await db.purchase_orders.find_one({"id": po_id}, {"_id": 0})
+    suppliers = await db.suppliers.find_one({"id": po.get("supplier_id")})
+    supplier_name = (suppliers or {}).get("name", "")
+    side_effects = {}
+    if body.payment_status == "paid" and not po_after.get("expense_recorded"):
+        await _record_purchase_expense(po_after, supplier_name, kind="po")
+        await db.purchase_orders.update_one({"id": po_id}, {"$set": {"expense_recorded": True, "expense_recorded_at": now_iso()}})
+        side_effects["expense"] = True
+    if body.delivery_status == "arrived" and not po_after.get("stock_received"):
+        await _record_stock_receipt(po_after, kind="po")
+        await db.purchase_orders.update_one({"id": po_id}, {"$set": {"stock_received": True, "stock_received_at": now_iso(), "status": "received"}})
+        side_effects["stock"] = True
+    await write_audit(user, "update", "purchase_order", po_id, {**update, **side_effects})
+    return {"ok": True, **side_effects}
+
+
+@api.put("/online-orders/{oid}/status")
+async def update_online_status(oid: str, body: StatusUpdateIn, user: dict = Depends(get_current_user)):
+    o = await db.online_orders.find_one({"id": oid})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    update = {}
+    if body.payment_status:
+        update["payment_status"] = body.payment_status
+    if body.delivery_status:
+        update["delivery_status"] = body.delivery_status
+    if not update:
+        return {"ok": True}
+    await db.online_orders.update_one({"id": oid}, {"$set": update})
+
+    o_after = await db.online_orders.find_one({"id": oid}, {"_id": 0})
+    side_effects = {}
+    if body.payment_status == "paid" and not o_after.get("expense_recorded"):
+        await _record_purchase_expense(o_after, o.get("platform", ""), kind="online")
+        await db.online_orders.update_one({"id": oid}, {"$set": {"expense_recorded": True, "expense_recorded_at": now_iso()}})
+        side_effects["expense"] = True
+    if body.delivery_status == "arrived" and not o_after.get("stock_received"):
+        await _record_stock_receipt(o_after, kind="online")
+        await db.online_orders.update_one({"id": oid}, {"$set": {"stock_received": True, "stock_received_at": now_iso(), "status": "received"}})
+        side_effects["stock"] = True
+    await write_audit(user, "update", "online_order", oid, {**update, **side_effects})
+    return {"ok": True, **side_effects}
+
+
+# Cancel transaction (refund inventory)
+@api.delete("/transactions/{trx_id}")
+async def cancel_transaction(trx_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    trx = await db.transactions.find_one({"id": trx_id}, {"_id": 0})
+    if not trx:
+        raise HTTPException(404, "Transaksi tidak ditemukan")
+    if trx.get("cancelled"):
+        raise HTTPException(400, "Sudah dibatalkan")
+    # Restore inventory: only restore the product (BOM was never deducted at sale)
+    for it in trx.get("items", []):
+        await db.inventory_items.update_one({"id": it["item_id"]}, {"$inc": {"current_stock": it["quantity"]}})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": it["item_id"], "type": "cancel_refund",
+            "quantity": it["quantity"], "reason": f"Pembatalan {trx['trx_no']}",
+            "created_at": now_iso(),
+        })
+    await db.transactions.update_one({"id": trx_id}, {"$set": {"cancelled": True, "cancelled_at": now_iso(), "cancelled_by": user["id"]}})
+
+    # Cancel related customer debt (bon)
+    if trx.get("is_bon"):
+        await db.customer_debts.update_many(
+            {"transaction_id": trx_id},
+            {"$set": {"status": "cancelled", "cancelled_at": now_iso()}},
+        )
+
+    # Revert loyalty points (refund redeemed, deduct earned)
+    if trx.get("member_id"):
+        revert = {}
+        if trx.get("points_earned"):
+            revert["$inc"] = {"points": -int(trx["points_earned"]), "total_spent": -int(trx.get("total", 0))}
+        # Note: points_redeemed was deducted on create, so add it back
+        # We track points_redeemed in the transaction items field if needed; safer to look at deduction record
+        if revert:
+            await db.members.update_one({"id": trx["member_id"]}, revert)
+
+    # Reverse journal entry
+    await db.journal_entries.insert_one({
+        "id": gen_id(), "date": now_iso(),
+        "description": f"PEMBATALAN {trx['trx_no']}",
+        "lines": [
+            {"account": f"Pendapatan {trx.get('unit', 'warung').capitalize()}", "debit": trx["total"], "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": trx["total"]},
+        ],
+        "reference": "cancellation", "reference_id": trx_id, "unit": trx.get("unit"),
+        "created_at": now_iso(),
+    })
+    await write_audit(user, "delete", "transaction", trx_id, {"trx_no": trx.get("trx_no"), "total": trx.get("total")})
+    await broadcast_event("transaction_cancelled", {"id": trx_id})
+    return {"ok": True}
+
+
+# Edit transaction (only certain fields, not items)
+class TrxEditIn(BaseModel):
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@api.put("/transactions/{trx_id}")
+async def edit_transaction(trx_id: str, body: TrxEditIn, user: dict = Depends(require_roles("super_admin", "manager"))):
+    update = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if not update:
+        raise HTTPException(400, "Tidak ada perubahan")
+    await db.transactions.update_one({"id": trx_id}, {"$set": update})
+    await write_audit(user, "update", "transaction", trx_id, update)
+    return await db.transactions.find_one({"id": trx_id}, {"_id": 0})
+
+
+# Mark order items served (Warung)
+@api.put("/orders/{order_id}/items-served")
+async def mark_items_served(order_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """body: {indices: [0,1,2], served: true/false}"""
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(404, "Order tidak ditemukan")
+    items = order.get("items", [])
+    indices = body.get("indices", [])
+    served = body.get("served", True)
+    for idx in indices:
+        if 0 <= idx < len(items):
+            items[idx]["served"] = served
+    await db.orders.update_one({"id": order_id}, {"$set": {"items": items}})
+    await broadcast_event("order_updated", {"id": order_id})
+    return {"ok": True}
+
+
+@api.delete("/orders/{order_id}")
+async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
+    await db.orders.update_one({"id": order_id}, {"$set": {"status": "cancelled"}})
+    await broadcast_event("order_updated", {"id": order_id, "status": "cancelled"})
+    return {"ok": True}
+
+
+@api.put("/orders/{order_id}/items")
+async def update_order_items(order_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """body: {items: [...full new list...]}"""
+    items = body.get("items", [])
+    await db.orders.update_one({"id": order_id}, {"$set": {"items": items}})
+    await broadcast_event("order_updated", {"id": order_id})
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
+# ---------- Public Self-Order (QR di Meja) — no auth ----------
+class PublicOrderIn(BaseModel):
+    table_id: str
+    items: List[OrderItemIn]
+    customer_name: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+@api.get("/public/menu")
+async def public_menu():
+    """Daftar menu siap-jual untuk halaman QR pelanggan (no auth)."""
+    items = await db.inventory_items.find(
+        {"sell_price": {"$gt": 0}}, {"_id": 0}
+    ).sort("category", 1).to_list(500)
+    # Only expose minimal fields
+    return [
+        {
+            "id": i["id"],
+            "name": i.get("name"),
+            "category": i.get("category"),
+            "sell_price": i.get("sell_price"),
+            "image_url": i.get("image_url"),
+        }
+        for i in items
+    ]
+
+
+@api.get("/public/tables/{table_id}")
+async def public_table_info(table_id: str):
+    """Validasi meja untuk halaman QR (no auth)."""
+    t = await db.tables.find_one({"id": table_id}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Meja tidak ditemukan")
+    profile = await db.business_profile.find_one({}, {"_id": 0}) or {}
+    return {"id": t["id"], "name": t["name"], "business_name": profile.get("name", "AgriWarung")}
+
+
+@api.post("/public/orders")
+async def public_create_order(body: PublicOrderIn):
+    """Pelanggan submit order dari halaman QR (no auth)."""
+    if not body.items:
+        raise HTTPException(400, "Pesanan kosong")
+    # Validate table
+    t = await db.tables.find_one({"id": body.table_id})
+    if not t:
+        raise HTTPException(404, "Meja tidak ditemukan")
+    # Validate items exist and prices match
+    item_ids = [i.item_id for i in body.items]
+    inv = await db.inventory_items.find({"id": {"$in": item_ids}, "sell_price": {"$gt": 0}}, {"_id": 0}).to_list(500)
+    inv_by_id = {i["id"]: i for i in inv}
+    validated_items = []
+    for it in body.items:
+        ref = inv_by_id.get(it.item_id)
+        if not ref:
+            raise HTTPException(400, f"Item tidak tersedia: {it.name}")
+        validated_items.append({
+            "item_id": it.item_id,
+            "name": ref["name"],
+            "quantity": int(it.quantity),
+            "unit_price": int(ref["sell_price"]),
+            "notes": it.notes or "",
+            "served": False,
+        })
+    doc = {
+        "id": gen_id(),
+        "table_id": body.table_id,
+        "items": validated_items,
+        "notes": body.notes,
+        "status": "sent",
+        "source": "self_order",
+        "customer_name": body.customer_name,
+        "customer_phone": body.customer_phone,
+        "created_at": now_iso(),
+    }
+    await db.orders.insert_one(doc)
+    doc.pop("_id", None)
+    await write_notification("NEW_ORDER", f"Pesanan baru {t.get('name', '')}", f"{len(validated_items)} item masuk dari QR meja {t.get('name', body.table_id)}", ref_type="order", ref_id=doc["id"], priority="high")
+    await broadcast_event("order_created", {"id": doc["id"], "table_id": doc["table_id"], "source": "self_order"})
+    return {"ok": True, "order_id": doc["id"], "table_name": t["name"], "items_count": len(validated_items)}
+
+
+# ---------- Expenses (manual) ----------
+class ExpenseIn(BaseModel):
+    amount: int
+    category: str
+    unit: str = "umum"
+    notes: Optional[str] = ""
+    date: Optional[str] = None
+    payment_method: str = "cash"  # cash | transfer | qris
+
+
+@api.get("/expenses")
+async def list_expenses(user: dict = Depends(get_current_user)):
+    return await db.expenses.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/expenses")
+async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["date"] = data.get("date") or now_iso()
+    doc = await insert_doc("expenses", data)
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": doc["date"],
+        "description": f"Biaya {body.category}",
+        "lines": [
+            {"account": body.category, "debit": body.amount, "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": body.amount},
+        ],
+        "reference": "expense",
+        "reference_id": doc["id"],
+        "unit": body.unit,
+        "created_at": now_iso(),
+    })
+    return doc
+
+
+# ---------- Incomes (Non-POS revenue: cashback, tax refund, donation, etc.) ----------
+class IncomeIn(BaseModel):
+    amount: int
+    category: str  # Cashback Supplier | Pengembalian Pajak | Hibah | Bunga Bank | Pemasukan Lain-lain
+    unit: str = "umum"
+    source: Optional[str] = ""  # free text: nama supplier / referensi
+    notes: Optional[str] = ""
+    date: Optional[str] = None
+    payment_method: str = "cash"  # cash | transfer | qris
+
+
+@api.get("/incomes")
+async def list_incomes(user: dict = Depends(get_current_user)):
+    return await db.incomes.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/incomes")
+async def create_income(body: IncomeIn, user: dict = Depends(get_current_user)):
+    if body.amount <= 0:
+        raise HTTPException(400, "Jumlah harus lebih dari 0")
+    data = body.model_dump()
+    data["date"] = data.get("date") or now_iso()
+    doc = await insert_doc("incomes", data)
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": doc["date"],
+        "description": f"Pemasukan {body.category}" + (f" - {body.source}" if body.source else ""),
+        "lines": [
+            {"account": "Kas", "debit": body.amount, "credit": 0},
+            {"account": body.category, "debit": 0, "credit": body.amount},
+        ],
+        "reference": "income",
+        "reference_id": doc["id"],
+        "unit": body.unit,
+        "created_at": now_iso(),
+    })
+    await write_audit(user, "create", "income", doc["id"], {"amount": body.amount, "category": body.category})
+    return doc
+
+
+@api.delete("/incomes/{income_id}")
+async def delete_income(income_id: str, user: dict = Depends(get_current_user)):
+    inc = await db.incomes.find_one({"id": income_id})
+    if not inc:
+        raise HTTPException(404, "Pemasukan tidak ditemukan")
+    await db.incomes.delete_one({"id": income_id})
+    # Reverse journal: Debit category / Credit Kas
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": now_iso(),
+        "description": f"Pembatalan pemasukan {inc.get('category')}",
+        "lines": [
+            {"account": inc.get("category"), "debit": inc["amount"], "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": inc["amount"]},
+        ],
+        "reference": "income_void",
+        "reference_id": income_id,
+        "unit": inc.get("unit", "umum"),
+        "created_at": now_iso(),
+    })
+    await write_audit(user, "delete", "income", income_id, {"amount": inc["amount"]})
+    return {"ok": True}
+
+
+# ---------- Reports ----------
+@api.get("/reports/profit-loss")
+async def profit_loss(user: dict = Depends(get_current_user)):
+    transactions = await db.transactions.find({"cancelled": {"$ne": True}}, {"_id": 0}).to_list(5000)
+    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    revenue_by_unit = {}
+    for t in transactions:
+        if (t.get("transaction_type") or "SALE") != "SALE":
+            continue
+        u = t.get("unit", "warung")
+        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + t.get("total", 0)
+    # Include non-POS incomes (cashback, tax refund, etc.) as "other_income"
+    other_income_by_cat = {}
+    for inc in incomes:
+        c = inc.get("category", "Pemasukan Lain-lain")
+        other_income_by_cat[c] = other_income_by_cat.get(c, 0) + inc.get("amount", 0)
+    total_other_income = sum(other_income_by_cat.values())
+    total_revenue = sum(revenue_by_unit.values()) + total_other_income
+    expense_by_cat = {}
+    for e in expenses:
+        c = e.get("category", "Lain-lain")
+        expense_by_cat[c] = expense_by_cat.get(c, 0) + e.get("amount", 0)
+    # Internal use/waste/adjustment are expenses based on HPP, not revenue.
+    for t in transactions:
+        trx_type = (t.get("transaction_type") or "SALE")
+        if trx_type != "SALE" and t.get("cost_total", 0):
+            label = {"SELF_USE": "Pemakaian Sendiri", "WASTE": "Barang Rusak", "ADJUSTMENT": "Penyesuaian Stok"}.get(trx_type, "Internal")
+            expense_by_cat[label] = expense_by_cat.get(label, 0) + int(t.get("cost_total", 0))
+    total_expense = sum(expense_by_cat.values())
+    # COGS uses transaction cost snapshot first; fallback to current product/BOM cost for old data.
+    cogs = 0
+    inv_items = {i["id"]: i for i in await db.inventory_items.find({}, {"_id": 0}).to_list(2000)}
+    boms = await db.bom_recipes.find({}, {"_id": 0}).to_list(2000)
+    bom_by_output = {b["output_item_id"]: b for b in boms}
+    for t in transactions:
+        if (t.get("transaction_type") or "SALE") != "SALE":
+            continue
+        if t.get("cost_total"):
+            cogs += int(t.get("cost_total") or 0)
+            continue
+        for it in t.get("items", []):
+            bom = bom_by_output.get(it.get("item_id"))
+            if bom:
+                for ing in bom["ingredients"]:
+                    inv = inv_items.get(ing["item_id"])
+                    if inv:
+                        cogs += int(ing["quantity"] * it.get("quantity", 0) * inv.get("cost_price", 0))
+            else:
+                inv = inv_items.get(it.get("item_id"))
+                if inv:
+                    cogs += int(inv.get("cost_price", 0) * it.get("quantity", 0))
+    gross_profit = total_revenue - cogs
+    net_profit = gross_profit - total_expense
+    gpm = (gross_profit / total_revenue * 100) if total_revenue else 0
+    npm = (net_profit / total_revenue * 100) if total_revenue else 0
+    return {
+        "revenue_by_unit": revenue_by_unit,
+        "other_income_by_category": other_income_by_cat,
+        "total_other_income": total_other_income,
+        "total_revenue": total_revenue,
+        "cogs": cogs,
+        "gross_profit": gross_profit,
+        "expense_by_category": expense_by_cat,
+        "total_expense": total_expense,
+        "net_profit": net_profit,
+        "gross_profit_margin": round(gpm, 2),
+        "net_profit_margin": round(npm, 2),
+    }
+
+
+@api.get("/reports/balance-sheet")
+async def balance_sheet(user: dict = Depends(get_current_user)):
+    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+    debts = await db.customer_debts.find({}, {"_id": 0}).to_list(5000)
+    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(5000)
+
+    total_revenue = sum(t.get("paid_amount", t.get("total", 0)) for t in transactions if (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+    total_expense = sum(e.get("amount", 0) for e in expenses)
+    total_capital = sum(c.get("amount", 0) for c in capital)
+    piutang_bon = sum(d.get("amount", 0) - d.get("paid", 0) for d in debts if d.get("status") != "paid")
+    inventory_value = sum((i.get("current_stock", 0) * i.get("cost_price", 0)) for i in inventory)
+
+    cash = total_capital + total_revenue - total_expense
+    retained = total_revenue - total_expense
+
+    return {
+        "assets": {
+            "Kas": cash,
+            "Piutang Bon Pelanggan": piutang_bon,
+            "Persediaan": int(inventory_value),
+            "total": cash + piutang_bon + int(inventory_value),
+        },
+        "liabilities": {"Hutang Usaha": 0, "total": 0},
+        "equity": {
+            "Modal Disetor": total_capital,
+            "Laba Ditahan": retained,
+            "total": total_capital + retained,
+        },
+    }
+
+
+@api.get("/reports/cash-flow")
+async def cash_flow(user: dict = Depends(get_current_user)):
+    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+    operating_in = sum(t.get("paid_amount", t.get("total", 0)) for t in transactions if (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+    operating_out = sum(e.get("amount", 0) for e in expenses)
+    financing_in = sum(c.get("amount", 0) for c in capital)
+    return {
+        "operating": {"in": operating_in, "out": operating_out, "net": operating_in - operating_out},
+        "investing": {"in": 0, "out": 0, "net": 0},
+        "financing": {"in": financing_in, "out": 0, "net": financing_in},
+        "net_cash_flow": (operating_in - operating_out) + financing_in,
+    }
+
+
+def _normalize_pm(pm: str) -> str:
+    """Normalize payment method to one of: cash, bank, ewallet"""
+    if not pm:
+        return "cash"
+    p = pm.lower().strip()
+    if p in ("cash", "tunai", "bon_paid"):
+        return "cash"
+    if p in ("transfer", "bank", "bca", "mandiri", "bni", "bri", "debit"):
+        return "bank"
+    if p in ("qris", "qr", "gopay", "ovo", "dana", "shopeepay", "ewallet", "e-wallet"):
+        return "ewallet"
+    return "cash"
+
+
+@api.get("/reports/cash-balance")
+async def cash_balance(user: dict = Depends(get_current_user)):
+    """Saldo kas per metode pembayaran (tunai/bank/dompet digital).
+    Sumber: transaksi kasir (non-bon, non-cancelled), pemasukan & pengeluaran manual.
+    """
+    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+
+    methods = ["cash", "bank", "ewallet"]
+    balance = {m: 0 for m in methods}
+    inflow = {m: 0 for m in methods}
+    outflow = {m: 0 for m in methods}
+    in_count = {m: 0 for m in methods}
+    out_count = {m: 0 for m in methods}
+
+    # POS transactions (positive cash inflow). For partial/debt sales, only paid_amount enters cash/bank/QRIS.
+    for t in transactions:
+        if t.get("cancelled") or (t.get("transaction_type") or "SALE") != "SALE":
+            continue
+        m = _normalize_pm(t.get("payment_method"))
+        amt = t.get("paid_amount", t.get("total", 0))
+        if amt <= 0:
+            continue
+        balance[m] += amt
+        inflow[m] += amt
+        in_count[m] += 1
+
+    # Manual incomes
+    for i in incomes:
+        m = _normalize_pm(i.get("payment_method"))
+        amt = i.get("amount", 0)
+        balance[m] += amt
+        inflow[m] += amt
+        in_count[m] += 1
+
+    # Capital injections (assume cash unless tagged)
+    for c in capital:
+        m = _normalize_pm(c.get("payment_method"))
+        amt = c.get("amount", 0)
+        balance[m] += amt
+        inflow[m] += amt
+        in_count[m] += 1
+
+    # Expenses (outflow)
+    for e in expenses:
+        m = _normalize_pm(e.get("payment_method"))
+        amt = e.get("amount", 0)
+        balance[m] -= amt
+        outflow[m] += amt
+        out_count[m] += 1
+
+    total_balance = sum(balance.values())
+    return {
+        "by_method": {m: {"balance": balance[m], "inflow": inflow[m], "outflow": outflow[m], "in_count": in_count[m], "out_count": out_count[m]} for m in methods},
+        "total_balance": total_balance,
+        "total_inflow": sum(inflow.values()),
+        "total_outflow": sum(outflow.values()),
+    }
+
+
+@api.get("/dashboard/summary")
+async def dashboard_summary(user: dict = Depends(get_current_user)):
+    today = datetime.now(timezone.utc).date().isoformat()
+    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+
+    today_tx = [t for t in transactions if t.get("created_at", "").startswith(today)]
+    today_exp = [e for e in expenses if (e.get("date") or "").startswith(today)]
+    today_inc = [i for i in incomes if (i.get("date") or "").startswith(today)]
+    today_revenue = sum(t.get("paid_amount", t.get("total", 0)) for t in today_tx if (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+    today_other = sum(i.get("amount", 0) for i in today_inc)
+    today_expense = sum(e.get("amount", 0) for e in today_exp)
+
+    total_revenue = sum(t.get("paid_amount", t.get("total", 0)) for t in transactions if (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+    total_other = sum(i.get("amount", 0) for i in incomes)
+    total_expense = sum(e.get("amount", 0) for e in expenses)
+    total_capital = sum(c.get("amount", 0) for c in capital)
+    cash_position = total_capital + total_revenue + total_other - total_expense
+
+    # Revenue by unit
+    rev_by_unit = {}
+    for t in transactions:
+        if (t.get("transaction_type") or "SALE") != "SALE" or t.get("cancelled"):
+            continue
+        u = t.get("unit", "warung")
+        rev_by_unit[u] = rev_by_unit.get(u, 0) + t.get("paid_amount", t.get("total", 0))
+
+    # Weekly trend (last 7 days)
+    weekly = []
+    for delta in range(6, -1, -1):
+        day = (datetime.now(timezone.utc) - timedelta(days=delta)).date().isoformat()
+        rev = sum(t.get("paid_amount", t.get("total", 0)) for t in transactions if t.get("created_at", "").startswith(day) and (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+        exp = sum(e.get("amount", 0) for e in expenses if (e.get("date") or "").startswith(day))
+        weekly.append({"day": day[5:], "revenue": rev, "expense": exp})
+
+    # Low stock
+    inv = await db.inventory_items.find({}, {"_id": 0}).to_list(2000)
+    low = [i for i in inv if i.get("current_stock", 0) <= i.get("min_stock", 0) and i.get("min_stock", 0) > 0]
+
+    recent_tx = sorted(transactions, key=lambda x: x.get("created_at", ""), reverse=True)[:10]
+
+    return {
+        "today": {
+            "revenue": today_revenue + today_other,
+            "revenue_pos": today_revenue,
+            "other_income": today_other,
+            "expense": today_expense,
+            "net_profit": today_revenue + today_other - today_expense,
+            "cash_position": cash_position,
+            "tx_count": len(today_tx),
+        },
+        "revenue_by_unit": rev_by_unit,
+        "weekly_trend": weekly,
+        "low_stock": low,
+        "recent_transactions": recent_tx,
+    }
+
+
+# ---------- Sample Data Seed ----------
+@api.post("/seed/sample-data")
+async def seed_sample(user: dict = Depends(require_roles("super_admin"))):
+    # Wipe (except users)
+    for coll in ["investors", "capital_injections", "land_rental", "inventory_items", "bom_recipes",
+                 "tables", "orders", "transactions", "customer_debts", "expenses",
+                 "journal_entries", "stock_movements", "dividends"]:
+        await db[coll].delete_many({})
+
+    # Investors
+    inv_names = [
+        ("Pak Didik", "081234567001", True),
+        ("Bu Sri", "081234567002", False),
+        ("Pak Budi", "081234567003", False),
+        ("Pak Hartono", "081234567004", False),
+    ]
+    investor_ids = []
+    for n, ph, land in inv_names:
+        d = await insert_doc("investors", {"name": n, "phone": ph, "address": "Boyolali", "owns_land": land})
+        investor_ids.append(d["id"])
+
+    # Capital injections
+    amounts = [100_000_000, 75_000_000, 50_000_000, 50_000_000]
+    for iid, amt in zip(investor_ids, amounts):
+        await insert_doc("capital_injections", {
+            "investor_id": iid, "amount": amt, "unit": "umum",
+            "notes": "Modal awal", "date": now_iso(),
+        })
+
+    # Land rental
+    await insert_doc("land_rental", {
+        "investor_id": investor_ids[0], "monthly_amount": 2_500_000,
+        "start_date": now_iso(), "notes": "Lahan kebun anggur 2 hektar",
+    })
+
+    # Inventory
+    items_seed = [
+        # Bahan baku warung
+        ("Beras", "Bahan Baku Warung", "kg", 50, 10, 12000, 0, "warung"),
+        ("Ayam Potong", "Bahan Baku Warung", "kg", 15, 5, 35000, 0, "warung"),
+        ("Telur", "Bahan Baku Warung", "kg", 8, 3, 28000, 0, "warung"),
+        ("Gula Pasir", "Bahan Baku Warung", "kg", 12, 5, 14000, 0, "warung"),
+        ("Teh Celup", "Bahan Baku Warung", "pcs", 200, 50, 500, 0, "warung"),
+        ("Es Batu", "Bahan Baku Warung", "kg", 20, 5, 2000, 0, "warung"),
+        # Menu (finished)
+        ("Nasi Goreng Spesial", "Barang Jadi", "porsi", 999, 0, 0, 18000, "warung"),
+        ("Ayam Bakar", "Barang Jadi", "porsi", 999, 0, 0, 25000, "warung"),
+        ("Es Teh Manis", "Barang Jadi", "gelas", 999, 0, 0, 5000, "warung"),
+        ("Es Teh Jumbo", "Barang Jadi", "gelas", 999, 0, 0, 8000, "warung"),
+        # Pupuk
+        ("Bahan A Pupuk", "Bahan Baku Pupuk", "kg", 30, 10, 8000, 0, "pupuk"),
+        ("Bahan B Pupuk", "Bahan Baku Pupuk", "kg", 25, 10, 12000, 0, "pupuk"),
+        # Anggur
+        ("Bibit Anggur Ninel", "Bibit Anggur", "btg", 80, 20, 25000, 50000, "anggur"),
+        ("Anggur Hijau Kualitas A", "Buah Anggur", "kg", 25, 5, 0, 75000, "anggur"),
+    ]
+    item_ids = {}
+    for name, cat, unit, stock, mn, cp, sp, bu in items_seed:
+        d = await insert_doc("inventory_items", {
+            "name": name, "category": cat, "unit": unit,
+            "current_stock": stock, "min_stock": mn,
+            "cost_price": cp, "sell_price": sp, "business_unit": bu,
+        })
+        item_ids[name] = d["id"]
+
+    # BOM for menu items
+    boms_seed = [
+        ("Nasi Goreng Spesial", "menu", [("Beras", 0.15), ("Telur", 0.1), ("Ayam Potong", 0.1)]),
+        ("Ayam Bakar", "menu", [("Ayam Potong", 0.25), ("Beras", 0.15)]),
+        ("Es Teh Manis", "menu", [("Teh Celup", 1), ("Gula Pasir", 0.03), ("Es Batu", 0.1)]),
+        ("Es Teh Jumbo", "menu", [("Teh Celup", 1), ("Gula Pasir", 0.05), ("Es Batu", 0.2)]),
+    ]
+    for output_name, btype, ings in boms_seed:
+        await insert_doc("bom_recipes", {
+            "output_item_id": item_ids[output_name],
+            "name": output_name,
+            "type": btype,
+            "ingredients": [{"item_id": item_ids[n], "quantity": q} for n, q in ings],
+        })
+
+    # Tables
+    for i in range(1, 7):
+        await insert_doc("tables", {"name": f"Meja {i}"})
+    await insert_doc("tables", {"name": "Meja VIP"})
+    await insert_doc("tables", {"name": "Takeaway"})
+
+    # Some sample transactions
+    nasi = item_ids["Nasi Goreng Spesial"]
+    teh = item_ids["Es Teh Manis"]
+    for d in range(7):
+        date_iso = (datetime.now(timezone.utc) - timedelta(days=d)).isoformat()
+        for _ in range(3 + d % 4):
+            await db.transactions.insert_one({
+                "id": gen_id(),
+                "trx_no": f"TRX-DEMO-{gen_id()[:6].upper()}",
+                "items": [
+                    {"item_id": nasi, "name": "Nasi Goreng Spesial", "quantity": 1, "unit_price": 18000, "notes": ""},
+                    {"item_id": teh, "name": "Es Teh Manis", "quantity": 1, "unit_price": 5000, "notes": ""},
+                ],
+                "subtotal": 23000, "discount": 0, "total": 23000,
+                "payment_method": "cash", "cash_received": 25000, "change": 2000,
+                "is_bon": False, "unit": "warung",
+                "cashier_id": user["id"], "cashier_name": user.get("name"),
+                "created_at": date_iso,
+            })
+
+    # Sample expenses
+    await insert_doc("expenses", {"amount": 2_500_000, "category": "Sewa Tanah", "unit": "anggur", "notes": "Sewa bulan ini", "date": now_iso()})
+    await insert_doc("expenses", {"amount": 500_000, "category": "Utilitas", "unit": "warung", "notes": "Listrik & air", "date": now_iso()})
+    await insert_doc("expenses", {"amount": 1_200_000, "category": "Pembelian Bahan", "unit": "warung", "notes": "Restock", "date": now_iso()})
+
+    return {"ok": True, "message": "Data contoh berhasil dimuat"}
+
+
+# ---------- Settings ----------
+@api.get("/settings")
+async def get_settings(user: dict = Depends(get_current_user)):
+    s = await db.settings.find_one({}, {"_id": 0})
+    return s or {
+        "business_name": "AgriWarung Boyolali",
+        "address": "Boyolali, Jawa Tengah",
+        "phone": "",
+        "currency": "Rp",
+        "tax_rate": 11,
+    }
+
+
+@api.put("/settings")
+async def update_settings(body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    await db.settings.update_one({}, {"$set": body}, upsert=True)
+    return await get_settings(user)
+
+
+# ---------- Startup ----------
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+scheduler = AsyncIOScheduler(timezone="Asia/Jakarta")
+
+
+async def job_daily_summary():
+    fake_user = {"id": "system", "name": "System Scheduler"}
+    res = await wa_daily_summary(fake_user)
+    await db.scheduled_notifications.insert_one({
+        "id": gen_id(),
+        "type": "daily_summary",
+        "title": "Ringkasan Harian Otomatis",
+        "text": res["text"],
+        "scheduled_at": now_iso(),
+        "dismissed": False,
+    })
+    await broadcast_event("scheduled_notification", {"type": "daily_summary", "title": "Ringkasan Harian siap dikirim"})
+
+
+async def job_low_stock_check():
+    fake_user = {"id": "system", "name": "System Scheduler"}
+    res = await wa_low_stock(fake_user)
+    if res.get("count", 0) > 0:
+        await db.scheduled_notifications.insert_one({
+            "id": gen_id(),
+            "type": "low_stock",
+            "title": f"⚠ Stok Menipis ({res['count']} item)",
+            "text": res["text"],
+            "scheduled_at": now_iso(),
+            "dismissed": False,
+        })
+        await broadcast_event("scheduled_notification", {"type": "low_stock", "title": f"Stok menipis: {res['count']} item"})
+
+
+async def job_payroll_alert():
+    fake_user = {"id": "system", "name": "System Scheduler"}
+    res = await wa_payroll_alert(fake_user)
+    await db.scheduled_notifications.insert_one({
+        "id": gen_id(),
+        "type": "payroll",
+        "title": "Pengingat Penggajian Bulanan",
+        "text": res["text"],
+        "scheduled_at": now_iso(),
+        "dismissed": False,
+    })
+    await broadcast_event("scheduled_notification", {"type": "payroll", "title": "Pengingat penggajian bulanan"})
+
+
+@app.on_event("startup")
+async def startup():
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("phone", sparse=True)
+    await db.otp_codes.create_index("expires_at", expireAfterSeconds=0)
+    await db.transactions.create_index([("unit", 1), ("created_at", -1)])
+    await db.transactions.create_index("payment_status")
+    await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
+    await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
+    await db.audit_logs.create_index("timestamp")
+    # Seed admin
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@agriwarung.id").lower()
+    admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing = await db.users.find_one({"email": admin_email})
+    if not existing:
+        await db.users.insert_one({
+            "id": gen_id(),
+            "email": admin_email,
+            "password_hash": hash_password(admin_pw),
+            "name": "Super Admin",
+            "role": "super_admin",
+            "active": True,
+            "created_at": now_iso(),
+        })
+    # Schedule jobs (WIB timezone)
+    scheduler.add_job(job_daily_summary, CronTrigger(hour=21, minute=0), id="daily_summary", replace_existing=True)
+    scheduler.add_job(job_low_stock_check, CronTrigger(hour="8,14,20", minute=0), id="low_stock_check", replace_existing=True)
+    scheduler.add_job(job_payroll_alert, CronTrigger(day=25, hour=9, minute=0), id="payroll_alert", replace_existing=True)
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if scheduler.running:
+        scheduler.shutdown()
+    client.close()
+
+
+# Health
+@api.get("/")
+async def root():
+    return {"app": "AgriWarung Manager API", "status": "ok"}
+
+
+@api.get("/health")
+async def health():
+    """Liveness probe for hosting providers (Render, Railway, Fly.io, etc.)."""
+    try:
+        await db.command("ping")
+        return {"status": "ok", "db": "connected"}
+    except Exception as e:
+        raise HTTPException(503, f"db unreachable: {e}")
+
+
+# ---------- Production Batches (Pupuk) ----------
+class ProductionPreviewIn(BaseModel):
+    recipe_id: str
+    quantity: int
+
+
+@api.post("/production/preview")
+async def preview_production(body: ProductionPreviewIn, user: dict = Depends(get_current_user)):
+    bom = await db.bom_recipes.find_one({"id": body.recipe_id}, {"_id": 0})
+    if not bom:
+        raise HTTPException(404, "Resep tidak ditemukan")
+    checklist = []
+    total_cost = 0
+    for ing in bom["ingredients"]:
+        inv = await db.inventory_items.find_one({"id": ing["item_id"]}, {"_id": 0})
+        required = ing["quantity"] * body.quantity
+        available = inv.get("current_stock", 0) if inv else 0
+        cost = (inv.get("cost_price", 0) if inv else 0) * required
+        total_cost += cost
+        checklist.append({
+            "item_id": ing["item_id"],
+            "name": inv.get("name") if inv else "—",
+            "unit": inv.get("unit") if inv else "",
+            "required": required,
+            "available": available,
+            "sufficient": available >= required,
+            "estimated_cost": int(cost),
+        })
+    return {
+        "recipe_id": body.recipe_id,
+        "recipe_name": bom.get("name"),
+        "quantity": body.quantity,
+        "checklist": checklist,
+        "total_estimated_cost": int(total_cost),
+        "can_produce": all(c["sufficient"] for c in checklist),
+    }
+
+
+class ProductionBatchIn(BaseModel):
+    recipe_id: str
+    quantity: int
+    notes: Optional[str] = ""
+    force: bool = False  # override insufficient stock
+
+
+@api.post("/production/batches")
+async def create_batch(body: ProductionBatchIn, user: dict = Depends(get_current_user)):
+    bom = await db.bom_recipes.find_one({"id": body.recipe_id}, {"_id": 0})
+    if not bom:
+        raise HTTPException(404, "Resep tidak ditemukan")
+    actual_cost = 0
+    # Check stock
+    for ing in bom["ingredients"]:
+        inv = await db.inventory_items.find_one({"id": ing["item_id"]})
+        required = ing["quantity"] * body.quantity
+        if not inv or (inv.get("current_stock", 0) < required and not body.force):
+            raise HTTPException(400, f"Stok {inv.get('name') if inv else 'bahan'} tidak cukup")
+    # Deduct
+    for ing in bom["ingredients"]:
+        inv = await db.inventory_items.find_one({"id": ing["item_id"]})
+        required = ing["quantity"] * body.quantity
+        actual_cost += int(required * inv.get("cost_price", 0))
+        await db.inventory_items.update_one({"id": ing["item_id"]}, {"$inc": {"current_stock": -required}})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": ing["item_id"], "type": "production_out",
+            "quantity": -required, "reason": f"Produksi {bom.get('name')}",
+            "created_at": now_iso(),
+        })
+    # Add output
+    await db.inventory_items.update_one({"id": bom["output_item_id"]}, {"$inc": {"current_stock": body.quantity}})
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": bom["output_item_id"], "type": "production_in",
+        "quantity": body.quantity, "reason": f"Hasil produksi {bom.get('name')}",
+        "created_at": now_iso(),
+    })
+    batch_no = f"BATCH-{datetime.now().strftime('%Y%m')}-{str(uuid.uuid4())[:5].upper()}"
+    doc = {
+        "id": gen_id(), "batch_no": batch_no, "recipe_id": body.recipe_id,
+        "recipe_name": bom.get("name"), "output_item_id": bom["output_item_id"],
+        "quantity": body.quantity, "actual_cost": actual_cost,
+        "notes": body.notes, "created_by": user["id"], "created_at": now_iso(),
+    }
+    await db.production_batches.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/production/batches")
+async def list_batches(user: dict = Depends(get_current_user)):
+    return await db.production_batches.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+# ---------- Vineyard (Anggur/Kebun) ----------
+class PlotIn(BaseModel):
+    name: str
+    location: Optional[str] = ""
+    area_sqm: Optional[float] = 0
+    variety: Optional[str] = ""
+    planted_count: Optional[int] = 0
+    planted_date: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+@api.get("/vineyard/plots")
+async def list_plots(user: dict = Depends(get_current_user)):
+    return await list_collection("vineyard_plots")
+
+
+@api.post("/vineyard/plots")
+async def create_plot(body: PlotIn, user: dict = Depends(get_current_user)):
+    return await insert_doc("vineyard_plots", body.model_dump())
+
+
+@api.delete("/vineyard/plots/{plot_id}")
+async def delete_plot(plot_id: str, user: dict = Depends(get_current_user)):
+    await db.vineyard_plots.delete_one({"id": plot_id})
+    return {"ok": True}
+
+
+class HarvestIn(BaseModel):
+    plot_id: str
+    variety: Optional[str] = ""
+    quantity_kg: float
+    quality_grade: str = "A"
+    notes: Optional[str] = ""
+    date: Optional[str] = None
+
+
+@api.get("/vineyard/harvests")
+async def list_harvests(user: dict = Depends(get_current_user)):
+    return await db.vineyard_harvests.find({}, {"_id": 0}).sort("date", -1).to_list(500)
+
+
+@api.post("/vineyard/harvests")
+async def create_harvest(body: HarvestIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["date"] = data.get("date") or now_iso()
+    return await insert_doc("vineyard_harvests", data)
+
+
+# ---------- B2B Customers & Invoices ----------
+class B2BCustomerIn(BaseModel):
+    name: str
+    contact: Optional[str] = ""
+    address: Optional[str] = ""
+    payment_terms: Optional[str] = "cash"
+
+
+@api.get("/b2b/customers")
+async def list_b2b_customers(user: dict = Depends(get_current_user)):
+    return await list_collection("b2b_customers")
+
+
+@api.post("/b2b/customers")
+async def create_b2b_customer(body: B2BCustomerIn, user: dict = Depends(get_current_user)):
+    return await insert_doc("b2b_customers", body.model_dump())
+
+
+class B2BInvoiceItemIn(BaseModel):
+    item_id: Optional[str] = ""
+    name: str
+    quantity: float
+    unit_price: int
+
+
+class B2BInvoiceIn(BaseModel):
+    customer_id: str
+    items: List[B2BInvoiceItemIn]
+    notes: Optional[str] = ""
+    delivery_date: Optional[str] = None
+
+
+@api.get("/b2b/invoices")
+async def list_b2b_invoices(user: dict = Depends(get_current_user)):
+    invoices = await db.b2b_invoices.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    customers = {c["id"]: c for c in await list_collection("b2b_customers")}
+    for inv in invoices:
+        inv["customer_name"] = customers.get(inv.get("customer_id"), {}).get("name", "—")
+    return invoices
+
+
+@api.post("/b2b/invoices")
+async def create_b2b_invoice(body: B2BInvoiceIn, user: dict = Depends(get_current_user)):
+    items = [i.model_dump() for i in body.items]
+    total = sum(i["quantity"] * i["unit_price"] for i in items)
+    inv_no = f"INV-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    doc = {
+        "id": gen_id(), "invoice_no": inv_no, "customer_id": body.customer_id,
+        "items": items, "total": int(total), "paid": 0, "status": "sent",
+        "notes": body.notes, "delivery_date": body.delivery_date,
+        "created_by": user["id"], "created_at": now_iso(),
+    }
+    await db.b2b_invoices.insert_one(doc)
+    doc.pop("_id", None)
+    # Journal entry: piutang B2B
+    await db.journal_entries.insert_one({
+        "id": gen_id(), "date": doc["created_at"],
+        "description": f"Penjualan B2B {inv_no}",
+        "lines": [
+            {"account": "Piutang Usaha B2B", "debit": int(total), "credit": 0},
+            {"account": "Pendapatan Anggur B2B", "debit": 0, "credit": int(total)},
+        ],
+        "reference": "b2b_invoice", "reference_id": doc["id"],
+        "unit": "anggur", "created_at": now_iso(),
+    })
+    return doc
+
+
+class B2BPayIn(BaseModel):
+    amount: int
+
+
+@api.post("/b2b/invoices/{inv_id}/pay")
+async def pay_b2b(inv_id: str, body: B2BPayIn, user: dict = Depends(get_current_user)):
+    inv = await db.b2b_invoices.find_one({"id": inv_id})
+    if not inv:
+        raise HTTPException(404, "Invoice tidak ditemukan")
+    new_paid = inv.get("paid", 0) + body.amount
+    status = "paid" if new_paid >= inv["total"] else "partial"
+    await db.b2b_invoices.update_one({"id": inv_id}, {"$set": {"paid": new_paid, "status": status}})
+    return {"ok": True}
+
+
+# ---------- Suppliers & Purchase Orders ----------
+class SupplierIn(BaseModel):
+    name: str
+    contact: Optional[str] = ""
+    phone: Optional[str] = ""
+    address: Optional[str] = ""
+    payment_terms: Optional[str] = "cash"
+    notes: Optional[str] = ""
+
+
+@api.get("/suppliers")
+async def list_suppliers(user: dict = Depends(get_current_user)):
+    return await list_collection("suppliers")
+
+
+@api.post("/suppliers")
+async def create_supplier(body: SupplierIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    allowed = {"cash", "transfer", "qris", "bon"}
+    term = (data.get("payment_terms") or "cash").lower()
+    aliases = {"tunai": "cash", "cod": "cash", "credit": "bon", "hutang": "bon"}
+    data["payment_terms"] = aliases.get(term, term if term in allowed else "cash")
+    return await insert_doc("suppliers", data)
+
+
+@api.delete("/suppliers/{sup_id}")
+async def delete_supplier(sup_id: str, user: dict = Depends(get_current_user)):
+    await db.suppliers.delete_one({"id": sup_id})
+    return {"ok": True}
+
+
+class POItemIn(BaseModel):
+    item_id: str
+    name: str
+    quantity: float
+    unit_price: int
+
+
+class POIn(BaseModel):
+    supplier_id: str
+    items: List[POItemIn]
+    expected_date: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+@api.get("/purchase-orders")
+async def list_po(user: dict = Depends(get_current_user)):
+    pos = await db.purchase_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    suppliers = {s["id"]: s for s in await list_collection("suppliers")}
+    for p in pos:
+        p["supplier_name"] = suppliers.get(p.get("supplier_id"), {}).get("name", "—")
+    return pos
+
+
+@api.post("/purchase-orders")
+async def create_po(body: POIn, user: dict = Depends(get_current_user)):
+    items = [i.model_dump() for i in body.items]
+    total = sum(i["quantity"] * i["unit_price"] for i in items)
+    po_no = f"PO-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    doc = {
+        "id": gen_id(), "po_no": po_no, "supplier_id": body.supplier_id,
+        "items": items, "total": int(total), "status": "sent",
+        "expected_date": body.expected_date, "notes": body.notes,
+        "created_by": user["id"], "created_at": now_iso(),
+    }
+    await db.purchase_orders.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.post("/purchase-orders/{po_id}/receive")
+async def receive_po(po_id: str, user: dict = Depends(get_current_user)):
+    po = await db.purchase_orders.find_one({"id": po_id}, {"_id": 0})
+    if not po:
+        raise HTTPException(404, "PO tidak ditemukan")
+    if po.get("stock_received"):
+        raise HTTPException(400, "Stok PO sudah diterima sebelumnya")
+    stock_result = await _record_stock_receipt(po, kind="po")
+    if stock_result["added"] == 0 and stock_result["skipped"]:
+        raise HTTPException(400, f"Tidak ada item PO yang cocok dengan inventori: {', '.join(stock_result['skipped'])}. Periksa nama/ID item.")
+    supplier = await db.suppliers.find_one({"id": po.get("supplier_id")})
+    if not po.get("expense_recorded"):
+        await _record_purchase_expense(po, (supplier or {}).get("name", ""), kind="po")
+    await db.purchase_orders.update_one(
+        {"id": po_id},
+        {"$set": {
+            "status": "received", "received_at": now_iso(),
+            "stock_received": True, "stock_received_at": now_iso(),
+            "expense_recorded": True, "expense_recorded_at": now_iso(),
+            "delivery_status": "arrived", "payment_status": po.get("payment_status") or "paid",
+        }},
+    )
+    await write_audit(user, "update", "purchase_order", po_id, {"action": "receive"})
+    return {"ok": True, "added": stock_result["added"], "skipped": stock_result["skipped"], "items": stock_result["items_added"]}
+
+
+# ---------- Online Orders (Shopee/Tokopedia) ----------
+class OnlineOrderIn(BaseModel):
+    platform: str  # shopee/tokopedia/manual
+    order_number: str
+    items: List[POItemIn]
+    shipping_cost: Optional[int] = 0
+    order_date: Optional[str] = None
+    expected_date: Optional[str] = None
+    invoice_image_url: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+@api.get("/online-orders")
+async def list_online(user: dict = Depends(get_current_user)):
+    return await db.online_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/online-orders")
+async def create_online(body: OnlineOrderIn, user: dict = Depends(get_current_user)):
+    items = [i.model_dump() for i in body.items]
+    total = sum(i["quantity"] * i["unit_price"] for i in items) + (body.shipping_cost or 0)
+    doc = {
+        "id": gen_id(), "platform": body.platform, "order_number": body.order_number,
+        "items": items, "total": int(total), "shipping_cost": body.shipping_cost or 0,
+        "status": "ordered", "order_date": body.order_date or now_iso(),
+        "expected_date": body.expected_date, "invoice_image_url": body.invoice_image_url,
+        "notes": body.notes, "created_at": now_iso(),
+    }
+    await db.online_orders.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.post("/online-orders/{oid}/receive")
+async def receive_online(oid: str, user: dict = Depends(get_current_user)):
+    o = await db.online_orders.find_one({"id": oid}, {"_id": 0})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    if o.get("stock_received"):
+        raise HTTPException(400, "Stok order sudah diterima sebelumnya")
+    stock_result = await _record_stock_receipt(o, kind="online")
+    if stock_result["added"] == 0 and stock_result["skipped"]:
+        raise HTTPException(400, f"Tidak ada item yang cocok dengan inventori: {', '.join(stock_result['skipped'])}. Edit order ini di Pengaturan lalu kaitkan dengan item inventori.")
+    if not o.get("expense_recorded"):
+        await _record_purchase_expense(o, o.get("platform", ""), kind="online")
+    await db.online_orders.update_one(
+        {"id": oid},
+        {"$set": {
+            "status": "received", "received_at": now_iso(),
+            "stock_received": True, "stock_received_at": now_iso(),
+            "expense_recorded": True, "expense_recorded_at": now_iso(),
+            "delivery_status": "arrived", "payment_status": o.get("payment_status") or "paid",
+        }},
+    )
+    await write_audit(user, "update", "online_order", oid, {"action": "receive"})
+    return {"ok": True, "added": stock_result["added"], "skipped": stock_result["skipped"], "items": stock_result["items_added"]}
+
+
+# ---------- KDS (Kitchen Display) ----------
+@api.get("/orders/kds")
+async def kds_orders(user: dict = Depends(get_current_user)):
+    orders = await db.orders.find(
+        {"status": {"$in": ["sent", "preparing", "bill_requested"]}},
+        {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+    tables = {t["id"]: t for t in await list_collection("tables")}
+    for o in orders:
+        o["table_name"] = tables.get(o.get("table_id"), {}).get("name", "Takeaway")
+    return orders
+
+
+class ItemStatusIn(BaseModel):
+    item_index: int
+    status: str  # new | preparing | ready | served
+
+
+@api.put("/orders/{order_id}/item-status")
+async def update_item_status(order_id: str, body: ItemStatusIn, user: dict = Depends(get_current_user)):
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(404, "Order tidak ditemukan")
+    items = order.get("items", [])
+    if body.item_index >= len(items):
+        raise HTTPException(400, "Index tidak valid")
+    items[body.item_index]["status"] = body.status
+    # If all items ready/served, mark order ready
+    all_ready = all(it.get("status") in ("ready", "served") for it in items)
+    new_status = "bill_requested" if all_ready else "preparing"
+    await db.orders.update_one(
+        {"id": order_id}, {"$set": {"items": items, "status": new_status}}
+    )
+    await broadcast_event("order_updated", {"id": order_id, "status": new_status})
+    return {"ok": True, "order_status": new_status}
+
+
+# ---------- CSV Exports ----------
+from fastapi.responses import PlainTextResponse
+
+
+def csv_quote(v):
+    s = str(v) if v is not None else ""
+    if "," in s or '"' in s or "\n" in s:
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+@api.get("/reports/transactions/csv", response_class=PlainTextResponse)
+async def export_transactions_csv(user: dict = Depends(get_current_user)):
+    trx = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    lines = ["trx_no,date,unit,payment_method,subtotal,discount,total,cashier,is_bon"]
+    for t in trx:
+        lines.append(",".join(csv_quote(x) for x in [
+            t.get('trx_no',''), t.get('created_at',''), t.get('unit',''),
+            t.get('payment_method',''), t.get('subtotal',0), t.get('discount',0),
+            t.get('total',0), t.get('cashier_name',''), t.get('is_bon',False)
+        ]))
+    return "\n".join(lines)
+
+
+@api.get("/reports/expenses/csv", response_class=PlainTextResponse)
+async def export_expenses_csv(user: dict = Depends(get_current_user)):
+    exps = await db.expenses.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    lines = ["date,category,unit,amount,notes"]
+    for e in exps:
+        lines.append(",".join(csv_quote(x) for x in [
+            e.get('date',''), e.get('category',''), e.get('unit',''),
+            e.get('amount',0), e.get('notes','')
+        ]))
+    return "\n".join(lines)
+
+
+# ---------- Employees & HR ----------
+class EmployeeIn(BaseModel):
+    name: str
+    nik: Optional[str] = ""
+    role: str
+    unit: str = "warung"
+    salary_type: str = "monthly"  # monthly/weekly/daily
+    base_salary: int = 0
+    overtime_rate: int = 0
+    bank_account: Optional[str] = ""
+    phone: Optional[str] = ""
+    start_date: Optional[str] = None
+    active: bool = True
+
+
+@api.get("/employees")
+async def list_employees(user: dict = Depends(get_current_user)):
+    return await list_collection("employees")
+
+
+@api.post("/employees")
+async def create_employee(body: EmployeeIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["start_date"] = data.get("start_date") or now_iso()
+    return await insert_doc("employees", data)
+
+
+@api.put("/employees/{emp_id}")
+async def update_employee(emp_id: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.employees.update_one({"id": emp_id}, {"$set": body})
+    return await db.employees.find_one({"id": emp_id}, {"_id": 0})
+
+
+@api.delete("/employees/{emp_id}")
+async def delete_employee(emp_id: str, user: dict = Depends(get_current_user)):
+    await db.employees.delete_one({"id": emp_id})
+    return {"ok": True}
+
+
+class AttendanceIn(BaseModel):
+    employee_id: str
+    type: str  # check_in / check_out
+    overtime_hours: Optional[float] = 0
+
+
+@api.get("/attendance")
+async def list_attendance(user: dict = Depends(get_current_user), month: Optional[int] = None, year: Optional[int] = None):
+    q = {}
+    if month and year:
+        prefix = f"{year}-{month:02d}"
+        q["date"] = {"$regex": f"^{prefix}"}
+    return await db.attendance.find(q, {"_id": 0}).sort("date", -1).to_list(5000)
+
+
+@api.post("/attendance")
+async def record_attendance(body: AttendanceIn, user: dict = Depends(get_current_user)):
+    today = datetime.now(timezone.utc).date().isoformat()
+    existing = await db.attendance.find_one({"employee_id": body.employee_id, "date": today})
+    now_t = datetime.now(timezone.utc).isoformat()
+    if existing:
+        if body.type == "check_out":
+            await db.attendance.update_one(
+                {"id": existing["id"]},
+                {"$set": {"check_out": now_t, "overtime_hours": body.overtime_hours or 0}}
+            )
+            return await db.attendance.find_one({"id": existing["id"]}, {"_id": 0})
+        raise HTTPException(400, "Sudah check-in hari ini")
+    doc = {
+        "id": gen_id(), "employee_id": body.employee_id, "date": today,
+        "check_in": now_t, "check_out": None,
+        "overtime_hours": body.overtime_hours or 0,
+        "created_at": now_iso(),
+    }
+    await db.attendance.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+def calc_pph21(annual_gross: int) -> int:
+    """Simplified PPh21 Indonesia (TK/0 PTKP 54jt/year)"""
+    PTKP = 54_000_000
+    taxable = max(0, annual_gross - PTKP)
+    brackets = [(60_000_000, 0.05), (250_000_000, 0.15), (500_000_000, 0.25), (5_000_000_000, 0.30)]
+    tax = 0
+    prev = 0
+    for limit, rate in brackets:
+        if taxable <= prev:
+            break
+        portion = min(taxable, limit) - prev
+        tax += portion * rate
+        prev = limit
+    if taxable > 5_000_000_000:
+        tax += (taxable - 5_000_000_000) * 0.35
+    return int(tax)
+
+
+class PayrollGenIn(BaseModel):
+    month: int
+    year: int
+
+
+@api.post("/payroll/generate")
+async def generate_payroll(body: PayrollGenIn, user: dict = Depends(get_current_user)):
+    # Don't regenerate if already exists
+    existing = await db.payroll.find({"month": body.month, "year": body.year}, {"_id": 0}).to_list(1000)
+    if existing:
+        return existing
+    employees = await db.employees.find({"active": True}, {"_id": 0}).to_list(1000)
+    prefix = f"{body.year}-{body.month:02d}"
+    att = await db.attendance.find({"date": {"$regex": f"^{prefix}"}}, {"_id": 0}).to_list(5000)
+    att_by_emp = {}
+    for a in att:
+        att_by_emp.setdefault(a["employee_id"], []).append(a)
+    result = []
+    for e in employees:
+        days = len(att_by_emp.get(e["id"], []))
+        overtime = sum(a.get("overtime_hours", 0) for a in att_by_emp.get(e["id"], []))
+        if e["salary_type"] == "daily":
+            gross = e["base_salary"] * days
+        elif e["salary_type"] == "weekly":
+            gross = e["base_salary"] * max(1, days // 6)
+        else:
+            gross = e["base_salary"]
+        overtime_pay = int(overtime * e.get("overtime_rate", 0))
+        gross_total = gross + overtime_pay
+        annual = gross_total * 12
+        pph21_monthly = calc_pph21(annual) // 12
+        net = gross_total - pph21_monthly
+        doc = {
+            "id": gen_id(), "employee_id": e["id"], "employee_name": e["name"],
+            "month": body.month, "year": body.year, "days_worked": days,
+            "overtime_hours": overtime, "overtime_pay": overtime_pay,
+            "gross_salary": gross_total, "pph21": pph21_monthly,
+            "net_salary": net, "paid": False, "created_at": now_iso(),
+        }
+        await db.payroll.insert_one(doc)
+        doc.pop("_id", None)
+        result.append(doc)
+    return result
+
+
+@api.get("/payroll")
+async def list_payroll(user: dict = Depends(get_current_user), month: Optional[int] = None, year: Optional[int] = None):
+    q = {}
+    if month:
+        q["month"] = month
+    if year:
+        q["year"] = year
+    return await db.payroll.find(q, {"_id": 0}).sort("created_at", -1).to_list(1000)
+
+
+class PayPayrollIn(BaseModel):
+    amount: Optional[int] = None  # custom amount; default = net_salary
+    payment_method: str = "cash"  # cash | transfer | qris
+    notes: Optional[str] = ""
+
+
+@api.post("/payroll/{pid}/pay")
+async def pay_payroll(pid: str, body: PayPayrollIn = PayPayrollIn(), user: dict = Depends(get_current_user)):
+    pay = await db.payroll.find_one({"id": pid})
+    if not pay:
+        raise HTTPException(404, "Tidak ditemukan")
+    if pay.get("paid"):
+        raise HTTPException(400, "Sudah dibayar")
+    amount = body.amount if body.amount and body.amount > 0 else pay["net_salary"]
+    await db.payroll.update_one(
+        {"id": pid},
+        {"$set": {
+            "paid": True, "paid_date": now_iso(),
+            "paid_amount": amount, "payment_method": body.payment_method,
+            "payment_notes": body.notes or "",
+        }},
+    )
+    # Expense + journal
+    label = f"Gaji {pay['employee_name']} {pay['month']:02d}/{pay['year']}"
+    exp_doc = {
+        "id": gen_id(), "amount": amount, "category": "Gaji Karyawan",
+        "unit": "umum", "notes": label, "payment_method": body.payment_method,
+        "date": now_iso(), "created_at": now_iso(),
+        "reference": "payroll", "reference_id": pid,
+    }
+    await db.expenses.insert_one(exp_doc)
+    await db.journal_entries.insert_one({
+        "id": gen_id(), "date": now_iso(),
+        "description": label,
+        "lines": [
+            {"account": "Gaji Karyawan", "debit": amount, "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": amount},
+        ],
+        "reference": "payroll", "reference_id": pid,
+        "unit": "umum", "created_at": now_iso(),
+    })
+    await write_audit(user, "update", "payroll", pid, {"action": "pay", "amount": amount, "method": body.payment_method})
+    return {"ok": True, "amount": amount}
+
+
+@api.post("/payroll/{pid}/unpay")
+async def unpay_payroll(pid: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    """Batalkan status bayar (jika user salah klik). Hapus expense + reverse journal."""
+    pay = await db.payroll.find_one({"id": pid})
+    if not pay:
+        raise HTTPException(404, "Tidak ditemukan")
+    if not pay.get("paid"):
+        raise HTTPException(400, "Belum dibayar")
+    # Remove related expense
+    await db.expenses.delete_many({"reference": "payroll", "reference_id": pid})
+    await db.payroll.update_one(
+        {"id": pid},
+        {"$set": {"paid": False}, "$unset": {"paid_date": "", "paid_amount": "", "payment_method": "", "payment_notes": ""}},
+    )
+    await write_audit(user, "update", "payroll", pid, {"action": "unpay"})
+    return {"ok": True}
+
+
+# ---------- Reminders Dashboard ----------
+@api.get("/reminders")
+async def reminders(user: dict = Depends(get_current_user)):
+    """Daftar to-do/pengingat di Dashboard: gaji belum dibayar, PO tiba blm dibayar, dll."""
+    now = datetime.now(timezone.utc)
+    items = []
+
+    # 1. Payroll belum dibayar
+    unpaid_payroll = await db.payroll.find({"paid": {"$ne": True}}, {"_id": 0}).to_list(500)
+    for p in unpaid_payroll:
+        items.append({
+            "id": f"payroll:{p['id']}",
+            "kind": "payroll_unpaid",
+            "icon": "users",
+            "color": "amber",
+            "priority": 2,
+            "title": f"Gaji {p['employee_name']} belum dibayar",
+            "subtitle": f"Periode {p['month']:02d}/{p['year']} · Net Rp {p['net_salary']:,}",
+            "amount": p["net_salary"],
+            "action_url": "/karyawan",
+            "ref_id": p["id"],
+        })
+
+    # 2. PO sudah tiba (stock_received) tapi belum dibayar (payment_status != paid)
+    pos = await db.purchase_orders.find(
+        {"stock_received": True, "payment_status": {"$ne": "paid"}}, {"_id": 0}
+    ).to_list(500)
+    for p in pos:
+        items.append({
+            "id": f"po:{p['id']}",
+            "kind": "po_unpaid",
+            "icon": "truck",
+            "color": "red",
+            "priority": 1,
+            "title": f"PO {p.get('po_no')} sudah tiba — belum dibayar",
+            "subtitle": f"{p.get('supplier_name','')} · Rp {p.get('total',0):,}",
+            "amount": p.get("total", 0),
+            "action_url": "/pembelian",
+            "ref_id": p["id"],
+        })
+
+    # 3. Online orders sudah tiba tapi belum dibayar
+    onlines = await db.online_orders.find(
+        {"stock_received": True, "payment_status": {"$ne": "paid"}}, {"_id": 0}
+    ).to_list(500)
+    for o in onlines:
+        items.append({
+            "id": f"online:{o['id']}",
+            "kind": "online_unpaid",
+            "icon": "package",
+            "color": "red",
+            "priority": 1,
+            "title": f"Order online {o.get('order_number')} tiba — belum dibayar",
+            "subtitle": f"{o.get('platform','')} · Rp {o.get('total',0):,}",
+            "amount": o.get("total", 0),
+            "action_url": "/pembelian",
+            "ref_id": o["id"],
+        })
+
+    # 4. Bon pelanggan jatuh tempo (umur > 30 hari) belum lunas
+    debts = await db.customer_debts.find({"status": {"$ne": "paid"}}, {"_id": 0}).to_list(500)
+    for d in debts:
+        created = d.get("created_at", "")
+        age_days = 0
+        if created:
+            try:
+                age_days = (now - datetime.fromisoformat(created.replace("Z", "+00:00"))).days
+            except (ValueError, TypeError):
+                pass
+        if age_days >= 30:
+            items.append({
+                "id": f"debt:{d['id']}",
+                "kind": "debt_overdue",
+                "icon": "clock",
+                "color": "amber",
+                "priority": 2,
+                "title": f"Bon {d['customer_name']} sudah {age_days} hari belum lunas",
+                "subtitle": f"Rp {(d['amount']-d.get('paid',0)):,}",
+                "amount": d["amount"] - d.get("paid", 0),
+                "action_url": "/keuangan",
+                "ref_id": d["id"],
+            })
+
+    # 5. Stok menipis
+    low = await db.inventory_items.find({"$expr": {"$and": [
+        {"$gt": ["$min_stock", 0]},
+        {"$lte": ["$current_stock", "$min_stock"]},
+    ]}}, {"_id": 0}).to_list(50)
+    for i in low:
+        items.append({
+            "id": f"stock:{i['id']}",
+            "kind": "low_stock",
+            "icon": "package",
+            "color": "red",
+            "priority": 2,
+            "title": f"Stok {i['name']} menipis",
+            "subtitle": f"Tersisa {i.get('current_stock',0)} {i.get('unit','')} (min {i.get('min_stock',0)})",
+            "amount": 0,
+            "action_url": "/inventori",
+            "ref_id": i["id"],
+        })
+
+    items.sort(key=lambda x: (x["priority"], -x.get("amount", 0)))
+    counts = {}
+    for it in items:
+        counts[it["kind"]] = counts.get(it["kind"], 0) + 1
+    return {"items": items, "counts": counts, "total": len(items)}
+
+
+# ---------- Stock Opname ----------
+class OpnameStartIn(BaseModel):
+    name: str
+    category: Optional[str] = None  # null = all categories
+
+
+@api.get("/opname/sessions")
+async def list_opname(user: dict = Depends(get_current_user)):
+    return await db.opname_sessions.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/opname/sessions")
+async def start_opname(body: OpnameStartIn, user: dict = Depends(get_current_user)):
+    q = {}
+    if body.category:
+        q["category"] = body.category
+    items = await db.inventory_items.find(q, {"_id": 0}).to_list(5000)
+    snapshot = [{
+        "item_id": i["id"], "name": i["name"], "unit": i["unit"],
+        "system_qty": i.get("current_stock", 0), "physical_qty": None,
+        "cost_price": i.get("cost_price", 0),
+    } for i in items]
+    doc = {
+        "id": gen_id(), "name": body.name, "category": body.category or "Semua",
+        "status": "draft", "items": snapshot,
+        "created_by": user["id"], "created_at": now_iso(),
+    }
+    await db.opname_sessions.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+class OpnameCountIn(BaseModel):
+    counts: dict  # {item_id: physical_qty}
+
+
+@api.put("/opname/sessions/{sid}/counts")
+async def update_counts(sid: str, body: OpnameCountIn, user: dict = Depends(get_current_user)):
+    sess = await db.opname_sessions.find_one({"id": sid}, {"_id": 0})
+    if not sess:
+        raise HTTPException(404, "Sesi tidak ditemukan")
+    if sess["status"] == "finalized":
+        raise HTTPException(400, "Sudah difinalisasi")
+    for it in sess["items"]:
+        if it["item_id"] in body.counts:
+            it["physical_qty"] = float(body.counts[it["item_id"]])
+    await db.opname_sessions.update_one({"id": sid}, {"$set": {"items": sess["items"]}})
+    return {"ok": True}
+
+
+@api.post("/opname/sessions/{sid}/finalize")
+async def finalize_opname(sid: str, user: dict = Depends(get_current_user)):
+    sess = await db.opname_sessions.find_one({"id": sid}, {"_id": 0})
+    if not sess:
+        raise HTTPException(404, "Sesi tidak ditemukan")
+    if sess["status"] == "finalized":
+        raise HTTPException(400, "Sudah difinalisasi")
+    total_variance_value = 0
+    for it in sess["items"]:
+        if it.get("physical_qty") is None:
+            continue
+        diff = it["physical_qty"] - it["system_qty"]
+        if diff != 0:
+            await db.inventory_items.update_one(
+                {"id": it["item_id"]},
+                {"$set": {"current_stock": it["physical_qty"]}}
+            )
+            await db.stock_movements.insert_one({
+                "id": gen_id(), "item_id": it["item_id"], "type": "opname_adjust",
+                "quantity": diff, "reason": f"Opname {sess['name']}",
+                "created_at": now_iso(),
+            })
+            total_variance_value += int(diff * it.get("cost_price", 0))
+    await db.opname_sessions.update_one(
+        {"id": sid},
+        {"$set": {"status": "finalized", "finalized_at": now_iso(), "variance_value": total_variance_value}}
+    )
+    return {"ok": True, "variance_value": total_variance_value}
+
+
+@api.get("/opname/sessions/{sid}")
+async def get_opname(sid: str, user: dict = Depends(get_current_user)):
+    sess = await db.opname_sessions.find_one({"id": sid}, {"_id": 0})
+    if not sess:
+        raise HTTPException(404, "Tidak ditemukan")
+    # Compute variance for finalized + draft
+    for it in sess["items"]:
+        if it.get("physical_qty") is not None:
+            it["variance"] = it["physical_qty"] - it["system_qty"]
+            it["variance_value"] = int(it["variance"] * it.get("cost_price", 0))
+    return sess
+
+
+# ---------- Bank Import & Reconciliation ----------
+class BankRowIn(BaseModel):
+    date: str
+    description: str
+    amount: int  # positive = credit, negative = debit
+    reference: Optional[str] = ""
+
+
+class BankImportIn(BaseModel):
+    account_name: str
+    rows: List[BankRowIn]
+
+
+@api.post("/bank/import")
+async def import_bank(body: BankImportIn, user: dict = Depends(get_current_user)):
+    # Get all transactions and expenses for matching
+    trxs = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    exps = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    imported = []
+    for r in body.rows:
+        amt = r.amount
+        # Match: same absolute amount, same date (YYYY-MM-DD)
+        date_prefix = r.date[:10]
+        match_id = None
+        match_type = None
+        if amt > 0:
+            for t in trxs:
+                if t.get("total") == amt and (t.get("created_at") or "").startswith(date_prefix):
+                    match_id = t["id"]
+                    match_type = "transaction"
+                    break
+        else:
+            for e in exps:
+                if e.get("amount") == -amt and (e.get("date") or "").startswith(date_prefix):
+                    match_id = e["id"]
+                    match_type = "expense"
+                    break
+        doc = {
+            "id": gen_id(), "account_name": body.account_name,
+            "date": r.date, "description": r.description, "amount": amt,
+            "reference": r.reference, "matched": bool(match_id),
+            "match_id": match_id, "match_type": match_type,
+            "imported_at": now_iso(),
+        }
+        await db.bank_transactions.insert_one(doc)
+        doc.pop("_id", None)
+        imported.append(doc)
+    matched = sum(1 for d in imported if d["matched"])
+    return {"imported": len(imported), "matched": matched, "unmatched": len(imported) - matched, "rows": imported}
+
+
+@api.get("/bank/transactions")
+async def list_bank_tx(user: dict = Depends(get_current_user)):
+    return await db.bank_transactions.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
+
+
+class BankReconcileIn(BaseModel):
+    match_type: str  # transaction | expense | manual
+    match_id: Optional[str] = None
+
+
+@api.put("/bank/transactions/{bid}/reconcile")
+async def reconcile_bank(bid: str, body: BankReconcileIn, user: dict = Depends(get_current_user)):
+    await db.bank_transactions.update_one(
+        {"id": bid},
+        {"$set": {"matched": True, "match_type": body.match_type, "match_id": body.match_id, "reconciled_at": now_iso()}}
+    )
+    return {"ok": True}
+
+
+# ---------- Onboarding ----------
+@api.get("/onboarding/status")
+async def onboarding_status(user: dict = Depends(get_current_user)):
+    s = await db.settings.find_one({}, {"_id": 0})
+    investors = await db.investors.count_documents({})
+    inventory = await db.inventory_items.count_documents({})
+    tables = await db.tables.count_documents({})
+    employees = await db.employees.count_documents({})
+    return {
+        "completed": bool(s and s.get("onboarding_completed")),
+        "checklist": {
+            "business_profile": bool(s and s.get("business_name") and s.get("business_name") != "AgriWarung Boyolali"),
+            "investors": investors >= 2,
+            "inventory": inventory > 0,
+            "tables": tables > 0,
+            "employees": employees > 0,
+        }
+    }
+
+
+class OnboardingCompleteIn(BaseModel):
+    business_name: str
+    address: Optional[str] = ""
+    phone: Optional[str] = ""
+
+
+@api.post("/onboarding/complete")
+async def complete_onboarding(body: OnboardingCompleteIn, user: dict = Depends(get_current_user)):
+    await db.settings.update_one(
+        {},
+        {"$set": {
+            "business_name": body.business_name,
+            "address": body.address, "phone": body.phone,
+            "onboarding_completed": True,
+            "completed_at": now_iso(),
+        }},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+# ---------- Business Units ----------
+class BizUnitIn(BaseModel):
+    code: str  # slug e.g. warung, anggur, custom_xx
+    name: str
+    receipt_name: Optional[str] = ""  # Custom name printed on struk; defaults to `name` if empty
+    receipt_address: Optional[str] = ""
+    receipt_phone: Optional[str] = ""
+    receipt_footer: Optional[str] = ""
+    receipt_note: Optional[str] = ""
+    receipt_logo: Optional[str] = ""
+    description: Optional[str] = ""
+    icon: Optional[str] = ""
+    color: Optional[str] = "#1a6b3c"
+    active: bool = True
+
+
+@api.get("/business-units")
+async def list_units(user: dict = Depends(get_current_user)):
+    units = await db.business_units.find({}, {"_id": 0}).to_list(200)
+    if not units:
+        # Seed defaults
+        defaults = [
+            {"code": "warung", "name": "Warung Makan", "color": "#ea580c", "icon": "utensils"},
+            {"code": "anggur", "name": "Kebun Anggur", "color": "#6b46c1", "icon": "grape"},
+            {"code": "pupuk", "name": "Produksi Pupuk", "color": "#b45309", "icon": "beaker"},
+            {"code": "pembibitan", "name": "Pembibitan", "color": "#059669", "icon": "sprout"},
+            {"code": "gudang", "name": "Gudang", "color": "#2563eb", "icon": "warehouse"},
+        ]
+        for d in defaults:
+            await insert_doc("business_units", {**d, "active": True})
+        units = await db.business_units.find({}, {"_id": 0}).to_list(200)
+    return units
+
+
+@api.post("/business-units")
+async def create_unit(body: BizUnitIn, user: dict = Depends(get_current_user)):
+    existing = await db.business_units.find_one({"code": body.code})
+    if existing:
+        raise HTTPException(400, "Kode unit sudah ada")
+    doc = await insert_doc("business_units", body.model_dump())
+    await broadcast_event("bizunit_updated", {"action": "create", "code": body.code})
+    return doc
+
+
+@api.put("/business-units/{uid}")
+async def update_unit(uid: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.business_units.update_one({"id": uid}, {"$set": body})
+    doc = await db.business_units.find_one({"id": uid}, {"_id": 0})
+    await broadcast_event("bizunit_updated", {"action": "update", "id": uid})
+    return doc
+
+
+@api.delete("/business-units/{uid}")
+async def delete_unit(uid: str, user: dict = Depends(get_current_user)):
+    u = await db.business_units.find_one({"id": uid})
+    if not u:
+        raise HTTPException(404, "Tidak ditemukan")
+    if u["code"] in ("warung", "anggur", "pupuk", "pembibitan", "gudang"):
+        raise HTTPException(400, "Unit default tidak bisa dihapus")
+    await db.business_units.delete_one({"id": uid})
+    return {"ok": True}
+
+
+# Per-unit investor allocation report
+@api.get("/investors/allocations")
+async def investor_allocations(user: dict = Depends(get_current_user)):
+    """Returns: { unit_code: [{investor_id, name, capital, ownership_pct}] }"""
+    injections = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+    investors = await db.investors.find({}, {"_id": 0}).to_list(500)
+    inv_by_id = {i["id"]: i for i in investors}
+    # group injections by (investor_id, unit)
+    by_unit = {}
+    for ij in injections:
+        u = ij.get("unit", "umum")
+        by_unit.setdefault(u, {})
+        by_unit[u][ij["investor_id"]] = by_unit[u].get(ij["investor_id"], 0) + ij.get("amount", 0)
+    result = {}
+    for unit, m in by_unit.items():
+        total = sum(m.values())
+        rows = []
+        for inv_id, amt in m.items():
+            inv = inv_by_id.get(inv_id, {})
+            rows.append({
+                "investor_id": inv_id,
+                "name": inv.get("name", "—"),
+                "capital": amt,
+                "ownership_pct": (amt / total * 100) if total else 0,
+            })
+        rows.sort(key=lambda x: -x["capital"])
+        result[unit] = {"total_capital": total, "investors": rows}
+    return result
+
+
+# Dividend calc per unit
+class DividendUnitIn(BaseModel):
+    unit: str  # 'all' or unit_code
+    month: int
+    year: int
+    total_profit: int
+
+
+@api.post("/dividends/calculate-by-unit")
+async def calc_dividend_unit(body: DividendUnitIn, user: dict = Depends(get_current_user)):
+    allocs = await investor_allocations(user)
+    if body.unit == "all":
+        # Consolidated: use overall ownership across all units
+        injections = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+        total_all = sum(i.get("amount", 0) for i in injections)
+        per_inv = {}
+        for ij in injections:
+            per_inv[ij["investor_id"]] = per_inv.get(ij["investor_id"], 0) + ij.get("amount", 0)
+        investors = await db.investors.find({}, {"_id": 0}).to_list(500)
+        inv_by_id = {i["id"]: i for i in investors}
+        items = []
+        for inv_id, cap in per_inv.items():
+            pct = (cap / total_all * 100) if total_all else 0
+            items.append({
+                "investor_id": inv_id, "investor_name": inv_by_id.get(inv_id, {}).get("name", "—"),
+                "ownership_pct": pct, "share": int(body.total_profit * pct / 100),
+            })
+        return {"unit": "all", "items": items, "total_profit": body.total_profit}
+    # Per-unit
+    unit_data = allocs.get(body.unit, {"investors": []})
+    items = [{
+        "investor_id": r["investor_id"], "investor_name": r["name"],
+        "ownership_pct": r["ownership_pct"],
+        "share": int(body.total_profit * r["ownership_pct"] / 100),
+    } for r in unit_data["investors"]]
+    return {"unit": body.unit, "items": items, "total_profit": body.total_profit}
+
+
+# ---------- Promo & Discount Engine ----------
+class PromoIn(BaseModel):
+    name: str
+    code: Optional[str] = ""  # promo code; empty = always-on
+    discount_type: str = "percentage"  # percentage | fixed
+    discount_value: int = 0  # for percentage: 0-100, for fixed: rupiah
+    scope: str = "total"  # total | item | category
+    target_ids: List[str] = []  # item_ids or category names
+    min_purchase: int = 0
+    max_discount: int = 0  # cap for percentage; 0 = no cap
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    max_uses: int = 0  # 0 = unlimited
+    used_count: int = 0
+    active: bool = True
+
+
+@api.get("/promos")
+async def list_promos(user: dict = Depends(get_current_user)):
+    return await list_collection("promos")
+
+
+@api.post("/promos")
+async def create_promo(body: PromoIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    if data["code"]:
+        data["code"] = data["code"].upper().strip()
+        existing = await db.promos.find_one({"code": data["code"]})
+        if existing:
+            raise HTTPException(400, "Kode promo sudah ada")
+    return await insert_doc("promos", data)
+
+
+@api.delete("/promos/{pid}")
+async def delete_promo(pid: str, user: dict = Depends(get_current_user)):
+    await db.promos.delete_one({"id": pid})
+    return {"ok": True}
+
+
+@api.put("/promos/{pid}")
+async def update_promo(pid: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.promos.update_one({"id": pid}, {"$set": body})
+    return await db.promos.find_one({"id": pid}, {"_id": 0})
+
+
+class PromoApplyIn(BaseModel):
+    code: str
+    items: List[dict]  # [{item_id, quantity, unit_price, category}]
+
+
+@api.post("/promos/apply")
+async def apply_promo(body: PromoApplyIn, user: dict = Depends(get_current_user)):
+    code = body.code.upper().strip()
+    promo = await db.promos.find_one({"code": code, "active": True}, {"_id": 0})
+    if not promo:
+        raise HTTPException(404, "Kode promo tidak valid")
+    today = now_iso()
+    if promo.get("start_date") and today < promo["start_date"]:
+        raise HTTPException(400, "Promo belum berlaku")
+    if promo.get("end_date") and today > promo["end_date"]:
+        raise HTTPException(400, "Promo sudah berakhir")
+    if promo.get("max_uses") and promo.get("used_count", 0) >= promo["max_uses"]:
+        raise HTTPException(400, "Promo sudah habis terpakai")
+    subtotal = sum(it["quantity"] * it["unit_price"] for it in body.items)
+    if subtotal < promo.get("min_purchase", 0):
+        raise HTTPException(400, f"Minimal pembelian {promo['min_purchase']}")
+    # Compute discount
+    discount = 0
+    if promo["scope"] == "total":
+        if promo["discount_type"] == "percentage":
+            discount = int(subtotal * promo["discount_value"] / 100)
+        else:
+            discount = promo["discount_value"]
+    elif promo["scope"] == "item":
+        for it in body.items:
+            if it.get("item_id") in promo.get("target_ids", []):
+                base = it["quantity"] * it["unit_price"]
+                if promo["discount_type"] == "percentage":
+                    discount += int(base * promo["discount_value"] / 100)
+                else:
+                    discount += promo["discount_value"] * it["quantity"]
+    elif promo["scope"] == "category":
+        for it in body.items:
+            if it.get("category") in promo.get("target_ids", []):
+                base = it["quantity"] * it["unit_price"]
+                if promo["discount_type"] == "percentage":
+                    discount += int(base * promo["discount_value"] / 100)
+                else:
+                    discount += promo["discount_value"] * it["quantity"]
+    # Cap
+    if promo.get("max_discount") and discount > promo["max_discount"]:
+        discount = promo["max_discount"]
+    discount = min(discount, subtotal)
+    return {"promo_id": promo["id"], "promo_name": promo["name"], "discount": discount, "subtotal": subtotal}
+
+
+# ---------- User Management ----------
+class UserUpdateIn(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    phone: Optional[str] = None
+    active: Optional[bool] = None
+
+
+@api.put("/users/{uid}")
+async def update_user(uid: str, body: UserUpdateIn, user: dict = Depends(require_roles("super_admin"))):
+    update = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if "phone" in update:
+        update["phone"] = normalize_phone(update.get("phone"))
+        update["phone_verified"] = bool(update["phone"])
+    if not update:
+        raise HTTPException(400, "Tidak ada field untuk diupdate")
+    await db.users.update_one({"id": uid}, {"$set": update})
+    return await db.users.find_one({"id": uid}, {"_id": 0, "password_hash": 0})
+
+
+@api.delete("/users/{uid}")
+async def delete_user(uid: str, user: dict = Depends(require_roles("super_admin"))):
+    if uid == user["id"]:
+        raise HTTPException(400, "Tidak bisa hapus diri sendiri")
+    target = await db.users.find_one({"id": uid})
+    if target and target.get("role") == "super_admin":
+        count = await db.users.count_documents({"role": "super_admin", "active": True})
+        if count <= 1:
+            raise HTTPException(400, "Minimal 1 super admin aktif harus tersisa")
+    await db.users.delete_one({"id": uid})
+    return {"ok": True}
+
+
+class ResetPasswordIn(BaseModel):
+    new_password: str
+
+
+@api.post("/users/{uid}/reset-password")
+async def reset_password(uid: str, body: ResetPasswordIn, user: dict = Depends(require_roles("super_admin"))):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password minimal 6 karakter")
+    await db.users.update_one({"id": uid}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    await write_audit(user, "reset_password", "user", uid, {"method": "super_admin"})
+    await write_notification("SECURITY", "Super Admin reset password", f"Password user berhasil direset oleh {user.get('name')}", ref_type="user", ref_id=uid, priority="high")
+    return {"ok": True}
+
+
+# ---------- Self Profile (any logged-in user) ----------
+class SelfProfileIn(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+
+@api.put("/auth/me")
+async def update_my_profile(body: SelfProfileIn, user: dict = Depends(get_current_user)):
+    update = {}
+    if body.name is not None and body.name.strip():
+        update["name"] = body.name.strip()
+    if body.email is not None and body.email.strip():
+        new_email = body.email.lower().strip()
+        if new_email != user.get("email"):
+            existing = await db.users.find_one({"email": new_email, "id": {"$ne": user["id"]}})
+            if existing:
+                raise HTTPException(400, "Email sudah dipakai user lain")
+            update["email"] = new_email
+    if not update:
+        raise HTTPException(400, "Tidak ada perubahan")
+    await db.users.update_one({"id": user["id"]}, {"$set": update})
+    return await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@api.post("/auth/change-password")
+async def change_my_password(body: ChangePasswordIn, response: Response, user: dict = Depends(get_current_user)):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password baru minimal 6 karakter")
+    db_user = await db.users.find_one({"id": user["id"]})
+    if not db_user or not verify_password(body.current_password, db_user["password_hash"]):
+        raise HTTPException(401, "Password lama salah")
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    # Issue fresh token so session stays valid
+    token = create_access_token(user["id"], user["email"], user["role"])
+    response.set_cookie(
+        key="access_token", value=token, httponly=True,
+        secure=False, samesite="lax", max_age=604800, path="/",
+    )
+    return {"ok": True, "token": token}
+
+
+# ---------- System: Reset Demo Data (Super Admin only) ----------
+class ResetDataIn(BaseModel):
+    confirm: str  # must equal "RESET" to proceed
+    keep_business_units: bool = True
+    keep_branches: bool = True
+    keep_business_profile: bool = True
+
+
+# Module → list of collections to wipe
+MODULE_COLLECTIONS = {
+    "inventori":  ["inventory_items", "bom_recipes", "stock_movements"],
+    "pembelian":  ["purchase_orders", "online_orders", "suppliers"],
+    "keuangan":   ["transactions", "expenses", "incomes", "customer_debts",
+                   "journal_entries", "bank_transactions", "bank_accounts"],
+    "kasir":      ["transactions", "orders", "customer_debts"],
+    "warung":     ["tables", "orders"],
+    "karyawan":   ["employees", "attendance", "payroll"],
+    "members":    ["members", "loyalty_settings"],
+    "anggur":     ["vineyard_plots", "vineyard_harvests", "b2b_customers", "b2b_invoices"],
+    "pupuk":      ["production_batches"],
+    "investor":   ["investors", "capital_injections", "dividends", "land_rental"],
+    "promo":      ["promos"],
+    "audit":      ["audit_logs"],
+    "opname":     ["opname_sessions"],
+}
+
+
+@api.post("/system/reset-module/{module}")
+async def reset_module(module: str, user: dict = Depends(require_roles("super_admin"))):
+    """Wipe data for one specific module."""
+    colls = MODULE_COLLECTIONS.get(module.lower())
+    if not colls:
+        raise HTTPException(400, f"Modul tidak dikenal: {module}. Pilih dari: {', '.join(MODULE_COLLECTIONS.keys())}")
+    counts = {}
+    for c in colls:
+        result = await db[c].delete_many({})
+        counts[c] = result.deleted_count
+    await write_audit(user, "delete", "module_reset", module, {"wiped": counts})
+    return {"ok": True, "module": module, "wiped": counts, "total_deleted": sum(counts.values())}
+
+
+@api.post("/system/reset-data")
+async def reset_demo_data(body: ResetDataIn, user: dict = Depends(require_roles("super_admin"))):
+    """Hapus seluruh data transaksional. Pertahankan: users, business_units (opt),
+    branches (opt), business_profile (opt), settings, notification_settings, wa_templates.
+    """
+    if body.confirm != "RESET":
+        raise HTTPException(400, "Konfirmasi tidak cocok. Ketik 'RESET' untuk melanjutkan.")
+    # Collections to wipe (transactional / demo-able)
+    wipe = [
+        "transactions", "orders", "customer_debts", "expenses", "incomes",
+        "journal_entries", "stock_movements",
+        "purchase_orders", "online_orders", "suppliers",
+        "inventory_items", "bom_recipes",
+        "tables", "investors", "capital_injections", "land_rental", "dividends",
+        "employees", "attendance", "payroll",
+        "opname_sessions", "bank_transactions", "bank_accounts",
+        "production_batches", "vineyard_plots", "vineyard_harvests",
+        "b2b_customers", "b2b_invoices",
+        "members", "loyalty_settings", "promos",
+        "audit_logs",
+    ]
+    keep_optional = []
+    if body.keep_business_units:
+        keep_optional.append("business_units")
+    else:
+        wipe.append("business_units")
+    if body.keep_branches:
+        keep_optional.append("branches")
+    else:
+        wipe.append("branches")
+    if body.keep_business_profile:
+        keep_optional.append("business_profile")
+    else:
+        wipe.append("business_profile")
+
+    counts = {}
+    for coll in wipe:
+        result = await db[coll].delete_many({})
+        counts[coll] = result.deleted_count
+
+    await write_audit(user, "delete", "system_reset", "all", {
+        "wiped": counts,
+        "kept": keep_optional + ["users", "settings", "notification_settings", "wa_templates"],
+    })
+    return {
+        "ok": True,
+        "wiped": counts,
+        "kept_collections": keep_optional + ["users", "settings", "notification_settings", "wa_templates"],
+        "total_deleted": sum(counts.values()),
+    }
+
+
+# ---------- Delete endpoints for PO / Online order / Expense ----------
+@api.delete("/purchase-orders/{po_id}")
+async def delete_purchase_order(po_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    po = await db.purchase_orders.find_one({"id": po_id})
+    if not po:
+        raise HTTPException(404, "PO tidak ditemukan")
+    # If stock had been received, reverse the stock increase
+    if po.get("stock_received"):
+        for it in po.get("items", []):
+            inv = await db.inventory_items.find_one({"id": it.get("item_id")}) if it.get("item_id") else None
+            if not inv and it.get("name"):
+                inv = await db.inventory_items.find_one({"name": it["name"]})
+            if inv:
+                await db.inventory_items.update_one(
+                    {"id": inv["id"]},
+                    {"$inc": {"current_stock": -it.get("quantity", 0)}},
+                )
+                await db.stock_movements.insert_one({
+                    "id": gen_id(), "item_id": inv["id"], "type": "po_delete_reverse",
+                    "quantity": -it.get("quantity", 0),
+                    "reason": f"Hapus PO {po.get('po_no', po_id)}",
+                    "created_at": now_iso(),
+                })
+    # If expense had been recorded, delete it
+    if po.get("expense_recorded"):
+        await db.expenses.delete_many({"reference": "po", "reference_id": po_id})
+        await db.journal_entries.delete_many({"reference": "po", "reference_id": po_id})
+    await db.purchase_orders.delete_one({"id": po_id})
+    await write_audit(user, "delete", "purchase_order", po_id, {"po_no": po.get("po_no")})
+    return {"ok": True, "reversed_stock": bool(po.get("stock_received")), "reversed_expense": bool(po.get("expense_recorded"))}
+
+
+@api.delete("/online-orders/{oid}")
+async def delete_online_order(oid: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    o = await db.online_orders.find_one({"id": oid})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    if o.get("stock_received"):
+        for it in o.get("items", []):
+            inv = await db.inventory_items.find_one({"id": it.get("item_id")}) if it.get("item_id") else None
+            if not inv and it.get("name"):
+                inv = await db.inventory_items.find_one({"name": it["name"]})
+            if inv:
+                await db.inventory_items.update_one(
+                    {"id": inv["id"]},
+                    {"$inc": {"current_stock": -it.get("quantity", 0)}},
+                )
+                await db.stock_movements.insert_one({
+                    "id": gen_id(), "item_id": inv["id"], "type": "online_delete_reverse",
+                    "quantity": -it.get("quantity", 0),
+                    "reason": f"Hapus Online {o.get('order_number', oid)}",
+                    "created_at": now_iso(),
+                })
+    if o.get("expense_recorded"):
+        await db.expenses.delete_many({"reference": "online", "reference_id": oid})
+        await db.journal_entries.delete_many({"reference": "online", "reference_id": oid})
+    await db.online_orders.delete_one({"id": oid})
+    await write_audit(user, "delete", "online_order", oid, {"order_number": o.get("order_number")})
+    return {"ok": True}
+
+
+@api.delete("/expenses/{eid}")
+async def delete_expense(eid: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    exp = await db.expenses.find_one({"id": eid})
+    if not exp:
+        raise HTTPException(404, "Pengeluaran tidak ditemukan")
+    # Reverse journal: Debit Kas / Credit (category)
+    await db.journal_entries.insert_one({
+        "id": gen_id(), "date": now_iso(),
+        "description": f"Pembatalan biaya {exp.get('category', '')}",
+        "lines": [
+            {"account": "Kas", "debit": exp.get("amount", 0), "credit": 0},
+            {"account": exp.get("category", "Lain-lain"), "debit": 0, "credit": exp.get("amount", 0)},
+        ],
+        "reference": "expense_void", "reference_id": eid,
+        "unit": exp.get("unit", "umum"), "created_at": now_iso(),
+    })
+    await db.expenses.delete_one({"id": eid})
+    await write_audit(user, "delete", "expense", eid, {"amount": exp.get("amount"), "category": exp.get("category")})
+    return {"ok": True}
+
+
+# ---------- WhatsApp Notification Generators ----------
+def format_rp_id(n: int) -> str:
+    s = str(abs(int(n)))
+    parts = []
+    while len(s) > 3:
+        parts.insert(0, s[-3:])
+        s = s[:-3]
+    if s:
+        parts.insert(0, s)
+    return "Rp " + ".".join(parts)
+
+
+@api.get("/notifications/wa/low-stock")
+async def wa_low_stock(user: dict = Depends(get_current_user)):
+    items = await db.inventory_items.find({}, {"_id": 0}).to_list(2000)
+    low = [i for i in items if i.get("current_stock", 0) <= i.get("min_stock", 0) and i.get("min_stock", 0) > 0]
+    if not low:
+        return {"text": "✅ Semua stok aman, tidak ada item di bawah minimum.", "count": 0}
+    lines = ["⚠️ *PERINGATAN STOK MENIPIS — AgriWarung*", ""]
+    for i in low[:20]:
+        lines.append(f"• {i['name']}: *{i['current_stock']} {i['unit']}* (min: {i.get('min_stock', 0)})")
+    if len(low) > 20:
+        lines.append(f"...dan {len(low) - 20} item lainnya")
+    lines.append("")
+    lines.append("_Segera lakukan restock untuk hindari kekosongan._")
+    return {"text": "\n".join(lines), "count": len(low)}
+
+
+@api.get("/notifications/wa/daily-summary")
+async def wa_daily_summary(user: dict = Depends(get_current_user)):
+    today = datetime.now(timezone.utc).date().isoformat()
+    trxs = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    exps = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    incs = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    # Exclude cancelled & bon (not yet collected) from POS revenue
+    today_trx = [t for t in trxs if (t.get("created_at") or "").startswith(today) and not t.get("cancelled") and not t.get("is_bon")]
+    today_all_trx = [t for t in trxs if (t.get("created_at") or "").startswith(today)]
+    today_exp = [e for e in exps if (e.get("date") or "").startswith(today)]
+    today_inc = [i for i in incs if (i.get("date") or "").startswith(today)]
+    revenue_pos = sum(t.get("total", 0) for t in today_trx)
+    other_income = sum(i.get("amount", 0) for i in today_inc)
+    revenue_total = revenue_pos + other_income
+    expense = sum(e.get("amount", 0) for e in today_exp)
+    net_profit = revenue_total - expense
+    by_unit = {}
+    for t in today_trx:
+        u = t.get("unit", "warung")
+        by_unit[u] = by_unit.get(u, 0) + t.get("total", 0)
+    by_pay = {}
+    for t in today_trx:
+        p = t.get("payment_method", "cash")
+        by_pay[p] = by_pay.get(p, 0) + t.get("total", 0)
+    profit_label = "📈 Laba Bersih" if net_profit >= 0 else "📉 Rugi Bersih"
+    profit_val = format_rp_id(net_profit) if net_profit >= 0 else f"-{format_rp_id(abs(net_profit))}"
+    lines = [
+        "📊 *RINGKASAN HARIAN — AgriWarung*",
+        f"_{datetime.now().strftime('%A, %d %B %Y')}_",
+        "",
+        f"💰 Pendapatan Kasir: *{format_rp_id(revenue_pos)}*",
+    ]
+    if other_income > 0:
+        lines.append(f"➕ Pemasukan Lain: *{format_rp_id(other_income)}*")
+        lines.append(f"📊 Total Revenue: *{format_rp_id(revenue_total)}*")
+    lines += [
+        f"💸 Pengeluaran: *{format_rp_id(expense)}*",
+        f"{profit_label}: *{profit_val}*",
+        f"🧾 Transaksi: *{len(today_trx)}* (dari {len(today_all_trx)} total — {len([t for t in today_all_trx if t.get('cancelled')])} dibatalkan, {len([t for t in today_all_trx if t.get('is_bon')])} bon)",
+        "",
+    ]
+    if by_unit:
+        lines.append("*Per Unit Bisnis:*")
+        for u, v in by_unit.items():
+            lines.append(f"• {u.capitalize()}: {format_rp_id(v)}")
+        lines.append("")
+    if by_pay:
+        lines.append("*Per Metode Bayar:*")
+        for p, v in by_pay.items():
+            lines.append(f"• {p.upper()}: {format_rp_id(v)}")
+    return {"text": "\n".join(lines), "revenue": revenue_total, "expense": expense, "net_profit": net_profit, "tx_count": len(today_trx)}
+
+
+@api.get("/notifications/wa/payroll-alert")
+async def wa_payroll_alert(user: dict = Depends(get_current_user)):
+    now = datetime.now()
+    month, year = now.month, now.year
+    payroll = await db.payroll.find({"month": month, "year": year}, {"_id": 0}).to_list(1000)
+    unpaid = [p for p in payroll if not p.get("paid")]
+    if not payroll:
+        return {"text": f"⚠️ Penggajian *{month}/{year}* belum dihitung. Buka menu Karyawan & HR untuk generate.", "count": 0}
+    if not unpaid:
+        return {"text": f"✅ Semua gaji bulan *{month}/{year}* sudah dibayar ({len(payroll)} karyawan).", "count": 0}
+    total = sum(p.get("net_salary", 0) for p in unpaid)
+    lines = [
+        f"💼 *PENGGAJIAN BELUM DIBAYAR — {month}/{year}*",
+        "",
+        f"Jumlah karyawan: *{len(unpaid)}*",
+        f"Total gaji: *{format_rp_id(total)}*",
+        "",
+        "Detail karyawan:",
+    ]
+    for p in unpaid[:15]:
+        lines.append(f"• {p['employee_name']}: {format_rp_id(p['net_salary'])}")
+    if len(unpaid) > 15:
+        lines.append(f"...dan {len(unpaid) - 15} lainnya")
+    return {"text": "\n".join(lines), "count": len(unpaid), "total": total}
+
+
+# ---------- WhatsApp Notification Templates (Custom) ----------
+class WaTemplateIn(BaseModel):
+    title: str
+    body: str  # supports {today}, {revenue}, {expense}, {net_profit}, {tx_count}, {time}
+    icon: Optional[str] = "💬"
+    enabled: bool = True
+    recipient_phone: Optional[str] = ""
+
+
+def _render_wa_template(body: str, ctx: dict) -> str:
+    out = body or ""
+    for k, v in ctx.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+@api.get("/notifications/wa/templates")
+async def list_wa_templates(user: dict = Depends(get_current_user)):
+    items = await db.wa_templates.find({}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return items
+
+
+@api.post("/notifications/wa/templates")
+async def create_wa_template(body: WaTemplateIn, user: dict = Depends(get_current_user)):
+    doc = await insert_doc("wa_templates", body.model_dump())
+    return doc
+
+
+@api.put("/notifications/wa/templates/{tid}")
+async def update_wa_template(tid: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.wa_templates.update_one({"id": tid}, {"$set": body})
+    return await db.wa_templates.find_one({"id": tid}, {"_id": 0})
+
+
+@api.delete("/notifications/wa/templates/{tid}")
+async def delete_wa_template(tid: str, user: dict = Depends(get_current_user)):
+    await db.wa_templates.delete_one({"id": tid})
+    return {"ok": True}
+
+
+@api.get("/notifications/wa/templates/{tid}/preview")
+async def preview_wa_template(tid: str, user: dict = Depends(get_current_user)):
+    tpl = await db.wa_templates.find_one({"id": tid}, {"_id": 0})
+    if not tpl:
+        raise HTTPException(404, "Template tidak ditemukan")
+    # Build context from today's summary
+    today = datetime.now(timezone.utc).date().isoformat()
+    trxs = await db.transactions.find({}, {"_id": 0}).to_list(5000)
+    exps = await db.expenses.find({}, {"_id": 0}).to_list(5000)
+    incs = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    today_trx = [t for t in trxs if (t.get("created_at") or "").startswith(today) and not t.get("cancelled") and not t.get("is_bon")]
+    today_exp = [e for e in exps if (e.get("date") or "").startswith(today)]
+    today_inc = [i for i in incs if (i.get("date") or "").startswith(today)]
+    rev = sum(t.get("total", 0) for t in today_trx) + sum(i.get("amount", 0) for i in today_inc)
+    expense = sum(e.get("amount", 0) for e in today_exp)
+    ctx = {
+        "today": datetime.now().strftime("%d %B %Y"),
+        "time": datetime.now().strftime("%H:%M"),
+        "revenue": format_rp_id(rev),
+        "expense": format_rp_id(expense),
+        "net_profit": format_rp_id(rev - expense) if rev - expense >= 0 else f"-{format_rp_id(abs(rev - expense))}",
+        "tx_count": len(today_trx),
+    }
+    return {"text": _render_wa_template(tpl["body"], ctx), "ctx": ctx}
+
+
+@api.get("/notifications/settings")
+async def get_notif_settings(user: dict = Depends(get_current_user)):
+    s = await db.notification_settings.find_one({}, {"_id": 0})
+    return s or {"recipient_phone": "", "low_stock_alerts": True, "daily_summary": True, "payroll_alerts": True}
+
+
+@api.put("/notifications/settings")
+async def update_notif_settings(body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.notification_settings.update_one({}, {"$set": body}, upsert=True)
+    return await get_notif_settings(user)
+
+
+# ---------- Branches (Multi-Cabang) ----------
+class BranchIn(BaseModel):
+    code: str
+    name: str
+    address: Optional[str] = ""
+    phone: Optional[str] = ""
+    manager: Optional[str] = ""
+    active: bool = True
+
+
+@api.get("/branches")
+async def list_branches(user: dict = Depends(get_current_user)):
+    branches = await list_collection("branches")
+    if not branches:
+        default = {"code": "main", "name": "Cabang Utama", "address": "Boyolali", "active": True}
+        await insert_doc("branches", default)
+        branches = await list_collection("branches")
+    # Compute stats per branch
+    for b in branches:
+        b["tx_count"] = await db.transactions.count_documents({"branch_id": b["id"]})
+        revenue_agg = await db.transactions.aggregate([
+            {"$match": {"branch_id": b["id"], "is_bon": {"$ne": True}}},
+            {"$group": {"_id": None, "total": {"$sum": "$total"}}},
+        ]).to_list(1)
+        b["total_revenue"] = revenue_agg[0]["total"] if revenue_agg else 0
+    return branches
+
+
+@api.post("/branches")
+async def create_branch(body: BranchIn, user: dict = Depends(require_roles("super_admin"))):
+    if await db.branches.find_one({"code": body.code}):
+        raise HTTPException(400, "Kode cabang sudah ada")
+    return await insert_doc("branches", body.model_dump())
+
+
+@api.put("/branches/{bid}")
+async def update_branch(bid: str, body: dict, user: dict = Depends(require_roles("super_admin"))):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.branches.update_one({"id": bid}, {"$set": body})
+    return await db.branches.find_one({"id": bid}, {"_id": 0})
+
+
+@api.delete("/branches/{bid}")
+async def delete_branch(bid: str, user: dict = Depends(require_roles("super_admin"))):
+    b = await db.branches.find_one({"id": bid})
+    if not b:
+        raise HTTPException(404, "Tidak ditemukan")
+    if b["code"] == "main":
+        raise HTTPException(400, "Cabang utama tidak bisa dihapus")
+    await db.branches.delete_one({"id": bid})
+    return {"ok": True}
+
+
+# ---------- Audit Log ----------
+async def write_audit(user: dict, action: str, entity_type: str, entity_id: str = None, payload: dict = None):
+    try:
+        await db.audit_logs.insert_one({
+            "id": gen_id(),
+            "user_id": user.get("id"),
+            "user_name": user.get("name"),
+            "user_role": user.get("role"),
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "payload": payload or {},
+            "timestamp": now_iso(),
+        })
+    except Exception:
+        pass
+
+
+@api.get("/audit-logs")
+async def list_audit(user: dict = Depends(get_current_user), limit: int = 200, entity_type: Optional[str] = None, action: Optional[str] = None, user_id: Optional[str] = None):
+    q = {}
+    if entity_type:
+        q["entity_type"] = entity_type
+    if action:
+        q["action"] = action
+    if user_id:
+        q["user_id"] = user_id
+    logs = await db.audit_logs.find(q, {"_id": 0}).sort("timestamp", -1).to_list(limit)
+    return logs
+
+
+# ---------- Loyalty / Member ----------
+class MemberIn(BaseModel):
+    name: str
+    phone: str
+    email: Optional[str] = ""
+    address: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+@api.get("/members")
+async def list_members(user: dict = Depends(get_current_user), search: Optional[str] = None):
+    q = {}
+    if search:
+        q["$or"] = [{"name": {"$regex": search, "$options": "i"}}, {"phone": {"$regex": search}}]
+    members = await db.members.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return members
+
+
+@api.post("/members")
+async def create_member(body: MemberIn, user: dict = Depends(get_current_user)):
+    # Auto member_id
+    count = await db.members.count_documents({})
+    member_id = f"MBR-{(count + 1):05d}"
+    data = body.model_dump()
+    data["member_id"] = member_id
+    data["points"] = 0
+    data["total_spent"] = 0
+    data["tier"] = "Bronze"
+    data["joined_at"] = now_iso()
+    doc = await insert_doc("members", data)
+    await write_audit(user, "create", "member", doc["id"], {"name": body.name})
+    return doc
+
+
+@api.get("/members/{mid}")
+async def get_member(mid: str, user: dict = Depends(get_current_user)):
+    m = await db.members.find_one({"$or": [{"id": mid}, {"member_id": mid}, {"phone": mid}]}, {"_id": 0})
+    if not m:
+        raise HTTPException(404, "Member tidak ditemukan")
+    return m
+
+
+@api.put("/members/{mid}")
+async def update_member(mid: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None)
+    body.pop("id", None)
+    await db.members.update_one({"id": mid}, {"$set": body})
+    return await db.members.find_one({"id": mid}, {"_id": 0})
+
+
+@api.delete("/members/{mid}")
+async def delete_member(mid: str, user: dict = Depends(require_roles("super_admin"))):
+    await db.members.delete_one({"id": mid})
+    return {"ok": True}
+
+
+class LoyaltySettings(BaseModel):
+    earn_rate: int = 1000  # 1 point per Rp 1000 spent
+    redeem_rate: int = 100  # 1 point = Rp 100 discount
+    tier_silver_at: int = 100  # points
+    tier_gold_at: int = 500
+
+
+@api.get("/loyalty/settings")
+async def get_loyalty_settings(user: dict = Depends(get_current_user)):
+    s = await db.loyalty_settings.find_one({}, {"_id": 0})
+    return s or LoyaltySettings().model_dump()
+
+
+@api.put("/loyalty/settings")
+async def update_loyalty_settings(body: LoyaltySettings, user: dict = Depends(get_current_user)):
+    await db.loyalty_settings.update_one({}, {"$set": body.model_dump()}, upsert=True)
+    return await get_loyalty_settings(user)
+
+
+class RedeemIn(BaseModel):
+    member_id: str
+    points: int
+
+
+@api.post("/members/redeem")
+async def redeem_points(body: RedeemIn, user: dict = Depends(get_current_user)):
+    m = await db.members.find_one({"$or": [{"id": body.member_id}, {"member_id": body.member_id}]})
+    if not m:
+        raise HTTPException(404, "Member tidak ditemukan")
+    if (m.get("points", 0)) < body.points:
+        raise HTTPException(400, "Poin tidak cukup")
+    settings = await get_loyalty_settings(user)
+    discount = body.points * settings.get("redeem_rate", 100)
+    return {"member_id": m["id"], "name": m["name"], "points_used": body.points, "discount": discount}
+
+
+# ---------- Notification Center ----------
+@api.get("/notifications")
+async def list_notifications(user: dict = Depends(get_current_user), unread_only: bool = False, limit: int = 100):
+    q = {}
+    if unread_only:
+        q["is_read"] = False
+    limit = max(1, min(int(limit or 100), 500))
+    return await db.notifications.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+
+
+@api.put("/notifications/{nid}/read")
+async def mark_notification_read(nid: str, user: dict = Depends(get_current_user)):
+    await db.notifications.update_one({"id": nid}, {"$set": {"is_read": True, "read_at": now_iso(), "read_by": user.get("id")}})
+    return {"ok": True}
+
+
+@api.post("/notifications/manual")
+async def create_manual_notification(body: dict, user: dict = Depends(get_current_user)):
+    doc = await write_notification(
+        body.get("type", "SYSTEM"),
+        body.get("title", "Notifikasi"),
+        body.get("message", ""),
+        business_id=body.get("business_id", ""),
+        ref_type=body.get("ref_type", "manual"),
+        ref_id=body.get("ref_id", ""),
+        priority=body.get("priority", "normal"),
+    )
+    return doc
+
+
+# ---------- Help / Tutorial CMS ----------
+class HelpContentIn(BaseModel):
+    type: Literal["GUIDE", "VIDEO", "FAQ", "SUPPORT"] = "GUIDE"
+    title: str
+    content: Optional[str] = ""
+    youtube_url: Optional[str] = ""
+    wa_url: Optional[str] = ""
+    active: bool = True
+    sort_order: int = 0
+
+
+@api.get("/help-contents")
+async def list_help_contents(user: dict = Depends(get_current_user)):
+    items = await db.help_contents.find({}, {"_id": 0}).sort("sort_order", 1).to_list(500)
+    if not items:
+        defaults = [
+            {"type": "GUIDE", "title": "Mulai menggunakan kasir", "content": "Buka menu Kasir, pilih lini bisnis, tambah produk ke keranjang, pilih jenis transaksi, lalu konfirmasi pembayaran.", "sort_order": 1, "active": True},
+            {"type": "FAQ", "title": "Bagaimana mencatat pemakaian sendiri?", "content": "Di Kasir pilih Jenis Transaksi: Pemakaian Sendiri. Stok dan HPP berkurang tanpa menambah pendapatan.", "sort_order": 2, "active": True},
+            {"type": "SUPPORT", "title": "Kontak Super Admin", "content": "Isi link WhatsApp admin di tombol edit agar tim bisa langsung menghubungi support.", "wa_url": "", "sort_order": 3, "active": True},
+        ]
+        for d in defaults:
+            await insert_doc("help_contents", d)
+        items = await db.help_contents.find({}, {"_id": 0}).sort("sort_order", 1).to_list(500)
+    return items
+
+
+@api.post("/help-contents")
+async def create_help_content(body: HelpContentIn, user: dict = Depends(get_current_user)):
+    doc = await insert_doc("help_contents", body.model_dump())
+    await write_audit(user, "create", "help_content", doc["id"], {"title": doc.get("title")})
+    return doc
+
+
+@api.put("/help-contents/{hid}")
+async def update_help_content(hid: str, body: dict, user: dict = Depends(get_current_user)):
+    body.pop("_id", None); body.pop("id", None)
+    await db.help_contents.update_one({"id": hid}, {"$set": body})
+    await write_audit(user, "update", "help_content", hid, body)
+    return await db.help_contents.find_one({"id": hid}, {"_id": 0})
+
+
+@api.delete("/help-contents/{hid}")
+async def delete_help_content(hid: str, user: dict = Depends(get_current_user)):
+    await db.help_contents.delete_one({"id": hid})
+    await write_audit(user, "delete", "help_content", hid, {})
+    return {"ok": True}
+
+
+# ---------- Payment Gateway Abstraction (QRIS ready, provider can be added later) ----------
+class PaymentGatewayIn(BaseModel):
+    name: str
+    provider: Literal["midtrans", "xendit", "duitku", "custom"] = "custom"
+    active: bool = False
+    server_key: Optional[str] = ""
+    client_key: Optional[str] = ""
+    webhook_secret: Optional[str] = ""
+    config: dict = Field(default_factory=dict)
+
+
+def safe_gateway(doc: dict) -> dict:
+    if not doc:
+        return doc
+    out = clean_doc(doc.copy())
+    for k in ("server_key", "client_key", "webhook_secret"):
+        if out.get(k):
+            out[k] = "••••" + str(out[k])[-4:]
+    return out
+
+
+@api.get("/payment-gateways")
+async def list_payment_gateways(user: dict = Depends(get_current_user)):
+    items = await db.payment_gateways.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return [safe_gateway(x) for x in items]
+
+
+@api.post("/payment-gateways")
+async def create_payment_gateway(body: PaymentGatewayIn, user: dict = Depends(require_roles("super_admin"))):
+    data = body.model_dump()
+    if data.get("active"):
+        await db.payment_gateways.update_many({}, {"$set": {"active": False}})
+    doc = await insert_doc("payment_gateways", data)
+    await write_audit(user, "create", "payment_gateway", doc["id"], {"provider": doc.get("provider"), "active": doc.get("active")})
+    return safe_gateway(doc)
+
+
+@api.put("/payment-gateways/{gid}")
+async def update_payment_gateway(gid: str, body: dict, user: dict = Depends(require_roles("super_admin"))):
+    body.pop("_id", None); body.pop("id", None)
+    if body.get("active"):
+        await db.payment_gateways.update_many({"id": {"$ne": gid}}, {"$set": {"active": False}})
+    await db.payment_gateways.update_one({"id": gid}, {"$set": body})
+    doc = await db.payment_gateways.find_one({"id": gid}, {"_id": 0})
+    await write_audit(user, "update", "payment_gateway", gid, {"active": body.get("active")})
+    return safe_gateway(doc)
+
+
+@api.post("/payment-webhooks/{provider}")
+async def payment_webhook(provider: str, request: Request):
+    payload = await request.json()
+    rec = {"id": gen_id(), "provider": provider, "payload": payload, "processed": False, "created_at": now_iso()}
+    await db.payment_webhooks.insert_one(rec)
+    amount = int(payload.get("gross_amount") or payload.get("amount") or payload.get("total") or 0)
+    order_id = str(payload.get("order_id") or payload.get("external_id") or payload.get("reference_id") or "")
+    status_raw = str(payload.get("transaction_status") or payload.get("status") or "").lower()
+    success = status_raw in ("settlement", "capture", "paid", "success", "completed")
+    if success:
+        await write_notification("PAYMENT", "Pembayaran masuk", f"{provider.upper()} {format_rp_short(amount)} diterima. Ref: {order_id}", ref_type="payment_webhook", ref_id=rec["id"], priority="high")
+        await db.payment_webhooks.update_one({"id": rec["id"]}, {"$set": {"processed": True, "processed_at": now_iso()}})
+    return {"ok": True, "processed": success}
+
+
+# ---------- Scheduled Notifications ----------
+@api.get("/scheduled-notifications")
+async def list_scheduled(user: dict = Depends(get_current_user)):
+    return await db.scheduled_notifications.find({}, {"_id": 0}).sort("scheduled_at", -1).to_list(200)
+
+
+@api.delete("/scheduled-notifications/{nid}")
+async def dismiss_scheduled(nid: str, user: dict = Depends(get_current_user)):
+    await db.scheduled_notifications.update_one({"id": nid}, {"$set": {"dismissed": True}})
+    return {"ok": True}
+
+
+# ---------- File Upload (Images) ----------
+import base64 as _b64
+from fastapi import UploadFile, File
+
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+@api.post("/upload")
+async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(400, "Hanya gambar yang didukung")
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Maksimal 5MB")
+    ext = (file.filename or "img.png").rsplit(".", 1)[-1].lower()
+    if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
+        ext = "png"
+    fname = f"{gen_id()}.{ext}"
+    fpath = UPLOAD_DIR / fname
+    fpath.write_bytes(contents)
+    return {"url": f"/api/uploads/{fname}", "filename": fname, "size": len(contents)}
+
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+app.include_router(api)
+
+
+class WSManager:
+    def __init__(self):
+        self.active: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for d in dead:
+            self.disconnect(d)
+
+
+ws_manager = WSManager()
+
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws_manager.connect(ws)
+    try:
+        await ws.send_json({"type": "connected", "ts": now_iso()})
+        while True:
+            # Keep connection alive; clients may send pings
+            data = await ws.receive_text()
+            if data == "ping":
+                await ws.send_text("pong")
+    except WebSocketDisconnect:
+        ws_manager.disconnect(ws)
+    except Exception:
+        ws_manager.disconnect(ws)
+
+
+async def broadcast_event(event_type: str, payload: dict = None):
+    try:
+        await ws_manager.broadcast({"type": event_type, "payload": payload or {}, "ts": now_iso()})
+    except Exception:
+        pass
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)

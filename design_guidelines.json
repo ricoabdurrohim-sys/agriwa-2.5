@@ -1,0 +1,175 @@
+{
+  "project_name": "AgriWarung Manager",
+  "domain": "Agribusiness, Multi-unit Management, POS, Finance",
+  "theme": "Light Theme",
+  "archetype": "Archetype 1: Organic & Earthy (Professional & Trustworthy)",
+  "language": "Bahasa Indonesia",
+  "design_philosophy": "A clean, modern, mobile-first PWA inspired by Jago Bank's 'pocket' system. It unifies 5 disparate business units under one cohesive, earthy design system. It uses 'Digital Envelopes' (Kantong) for each business unit to provide clear financial segregation while maintaining a unified overview. The UI is high-contrast for outdoor (vineyard) readability, relying on solid structural elements rather than generic SaaS aesthetics.",
+  "colors": {
+    "brand": {
+      "primary": "#1a6b3c",
+      "primary_hover": "#14522d",
+      "accent": "#f4a228",
+      "accent_hover": "#d98b1a"
+    },
+    "functional": {
+      "danger": "#e53e3e",
+      "warning": "#d69e2e",
+      "success": "#38a169",
+      "info": "#3182ce"
+    },
+    "neutrals": {
+      "background": "#f7f8fa",
+      "surface": "#ffffff",
+      "border": "#e2e8f0",
+      "text_primary": "#111827",
+      "text_secondary": "#4b5563",
+      "text_tertiary": "#9ca3af"
+    },
+    "business_units": {
+      "kebun_anggur": {
+        "color": "#6b46c1",
+        "bg_soft": "#f3e8ff",
+        "icon": "Grape"
+      },
+      "pembibitan": {
+        "color": "#059669",
+        "bg_soft": "#d1fae5",
+        "icon": "Sprout"
+      },
+      "pupuk": {
+        "color": "#b45309",
+        "bg_soft": "#fef3c7",
+        "icon": "Box"
+      },
+      "warung": {
+        "color": "#ea580c",
+        "bg_soft": "#ffedd5",
+        "icon": "Utensils"
+      },
+      "gudang": {
+        "color": "#2563eb",
+        "bg_soft": "#dbeafe",
+        "icon": "Warehouse"
+      }
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "Poppins, sans-serif",
+      "body": "Inter, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "rules": {
+      "h1": "text-2xl sm:text-3xl font-bold tracking-tight text-gray-900",
+      "h2": "text-xl sm:text-2xl font-semibold tracking-tight text-gray-900",
+      "h3": "text-lg font-semibold text-gray-800",
+      "body": "text-base text-gray-600 leading-relaxed",
+      "small": "text-sm text-gray-500",
+      "currency": "font-mono font-medium tracking-tight",
+      "overline": "text-xs font-bold uppercase tracking-[0.15em] text-gray-500"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "Generous spacing. Mobile-first design (375-414px) scalable to tablet and desktop. Tap targets minimum 44px for outdoor staff use.",
+    "border_radius": {
+      "card": "rounded-xl",
+      "button": "rounded-lg",
+      "badge": "rounded-full"
+    },
+    "shadows": {
+      "card": "shadow-sm border border-gray-100",
+      "card_hover": "shadow-md transition-shadow duration-200",
+      "floating_action": "shadow-lg shadow-green-900/20"
+    },
+    "grid": {
+      "mobile": "grid-cols-1 gap-4",
+      "tablet": "grid-cols-2 gap-6",
+      "desktop": "grid-cols-3 lg:grid-cols-4 gap-6"
+    }
+  },
+  "components": {
+    "navigation": {
+      "bottom_nav": "Fixed bottom. White bg, shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]. 5 items (Dashboard, Warung, Kasir, Inventori, Laporan). Active state uses Primary Green text and icon fill.",
+      "hamburger_drawer": "Left side drawer (Sheet component from shadcn). Dark green (#1a6b3c) background, white text. Lists all 13 modules."
+    },
+    "cards": {
+      "unit_pocket": "Jago Bank inspired 'Kantong'. White background, 12px radius. Colored top border or subtle colored background tint based on unit color. Contains title, balance (monospace), and quick action.",
+      "stat_card": "Padded p-4, white bg, border border-gray-200, rounded-xl."
+    },
+    "buttons": {
+      "primary": "bg-[#1a6b3c] hover:bg-[#14522d] text-white font-semibold rounded-lg px-4 py-3 min-h-[44px]",
+      "accent": "bg-[#f4a228] hover:bg-[#d98b1a] text-white font-semibold rounded-lg px-4 py-3 min-h-[44px]",
+      "fab": "Fixed bottom-right (above nav), rounded-full w-14 h-14 flex items-center justify-center bg-[#1a6b3c] text-white shadow-lg"
+    },
+    "forms": {
+      "inputs": "bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 focus:ring-2 focus:ring-[#1a6b3c] focus:border-transparent text-base (prevents iOS zoom)"
+    },
+    "charts": {
+      "library": "Recharts",
+      "usage": "Use CustomTooltip with white bg and shadow. Remove CartesianGrid lines for cleaner look. Use business_units colors for pie/donut charts."
+    },
+    "feedback": {
+      "toast": "Sonner library. Bottom-center on mobile. Use semantic colors for success/error."
+    }
+  },
+  "screens": {
+    "login": {
+      "layout": "Full height split screen on desktop, relative overlap on mobile.",
+      "background": "Use vineyard landscape image with a dark green overlay (bg-[#1a6b3c]/80).",
+      "card": "White glassmorphic card on mobile, solid white on desktop. Contains brand logo, email/pin login, and 'Masuk' button."
+    },
+    "dashboard": {
+      "header": "Welcome text, current date, notification bell.",
+      "kpi_section": "Total Revenue, Total Expense, Net Profit, Cash Position. Format using JetBrains Mono.",
+      "pockets_section": "Horizontal scrollable list of 'Kantong Unit' (Business Unit summary cards).",
+      "charts": "Weekly trend area chart (Revenue vs Expense).",
+      "feed": "Recent transactions list with icon indicating source unit."
+    },
+    "warung": {
+      "layout": "Two-pane on tablet/desktop, tabbed on mobile.",
+      "tables_view": "Grid of tables. Status colors: Green (Available), Amber (Occupied), Red (Needs Cleaning).",
+      "order_panel": "Selected table details. Menu browser with categories. Add to cart functionality."
+    },
+    "kasir": {
+      "layout": "Point of Sale interface.",
+      "cart": "List of selected items, qty modifiers (+/- minimum 44px tap target), subtotal.",
+      "payment": "Multi-payment method selector (Tunai, QRIS, Transfer, e-Wallet).",
+      "action": "Massive 'Bayar' (Pay) CTA at the bottom."
+    },
+    "inventori": {
+      "layout": "List view with robust filtering (Unit, Kategori).",
+      "items": "Row contains: Item Name, Stock Level, Unit. Low stock gets warning badge.",
+      "bom_editor": "Modal or distinct page to link raw materials to finished goods (e.g. Anggur -> Wine/Jus)."
+    },
+    "laporan": {
+      "layout": "Tabbed view: Laba/Rugi (P&L), Neraca (Balance Sheet), Arus Kas (Cash Flow).",
+      "ui": "Structured tabular data with indentation for sub-accounts. Tooltips [?] on complex financial terms for non-accountant users."
+    },
+    "investor_modal": {
+      "layout": "Investor dashboard.",
+      "visuals": "Pie chart of ownership equity (4 investors).",
+      "features": "Capital injection log, Dividend distribution simulator."
+    }
+  },
+  "media_urls": {
+    "login_background": "https://images.pexels.com/photos/29042319/pexels-photo-29042319.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+    "vineyard_landscape": "https://images.unsplash.com/photo-1588084188698-e626698fd8cb?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "grapes_macro": "https://images.unsplash.com/photo-1631128361770-5cdefd9dbca2?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "nursery": "https://images.unsplash.com/photo-1778404664597-80eb1d3e73c2?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "restaurant_aerial": "https://images.unsplash.com/photo-1564808868420-8aff5890528b?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "abstract_texture": "https://images.unsplash.com/photo-1593900154763-1db4833d1784?crop=entropy&cs=srgb&fm=jpg&q=85"
+  },
+  "testing_attributes": {
+    "instructions": "All interactive elements MUST include data-testid. Format: kebab-case, role-based. e.g., data-testid='login-submit-button', data-testid='nav-warung-tab'."
+  },
+  "instructions_to_main_agent": [
+    "Install required dependencies: lucide-react, recharts, sonner.",
+    "Implement layout as a mobile-first PWA with bottom navigation.",
+    "Ensure typography strictness: Poppins for headings, Inter for body, JetBrains Mono for all numeric/financial values.",
+    "Prefix all currency values with 'Rp' and format with periods (e.g., Rp 1.500.000).",
+    "Adhere strictly to the business_units color coding for charts and 'Kantong' style cards to create visual distinction between the 5 units.",
+    "Use data-testid on all interactive elements as mandated.",
+    "Build the Jago Bank inspired 'Pockets' (Kantong) UI for the Dashboard."
+  ]
+}

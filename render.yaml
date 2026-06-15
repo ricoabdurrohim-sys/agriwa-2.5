@@ -1,0 +1,37 @@
+# Render.com Blueprint — auto-provisions the FastAPI backend.
+# Usage: push this repo to GitHub, then in Render: New > Blueprint > pick the repo.
+# Free tier ("starter" plan) is sufficient for evaluating AgriWarung.
+#
+# After provisioning, set these env vars in Render dashboard (NOT here, for security):
+#   MONGO_URL        — your MongoDB Atlas SRV connection string
+#   DB_NAME          — agriwarung_db
+#   JWT_SECRET       — generate via: openssl rand -hex 32
+#   ADMIN_EMAIL      — your admin email
+#   ADMIN_PASSWORD   — your admin password (min 6 chars)
+#   CORS_ORIGINS     — comma-separated frontend URLs, e.g. "https://your-app.vercel.app,https://your-app.netlify.app"
+
+services:
+  - type: web
+    name: agriwarung-backend
+    runtime: python
+    plan: starter
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MONGO_URL
+        sync: false       # set manually in dashboard
+      - key: DB_NAME
+        value: agriwarung_db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

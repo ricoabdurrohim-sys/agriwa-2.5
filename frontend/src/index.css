@@ -1,0 +1,91 @@
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f7f8fa;
+  color: #111827;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Poppins', sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.font-mono, .mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+@layer base {
+  :root {
+    --background: 220 14% 97%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 146 61% 26%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 36 90% 55%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 75% 57%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 146 61% 26%;
+    --chart-1: 146 61% 26%;
+    --chart-2: 36 90% 55%;
+    --chart-3: 217 91% 60%;
+    --chart-4: 271 56% 52%;
+    --chart-5: 14 90% 53%;
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; }
+}
+
+/* Hide scrollbar for horizontal lists */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Smooth animations */
+.fade-in { animation: fadeIn 0.3s ease-out; }
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Color helpers for business units */
+.unit-warung { color: #ea580c; background-color: #ffedd5; }
+.unit-anggur { color: #6b46c1; background-color: #f3e8ff; }
+.unit-pupuk { color: #b45309; background-color: #fef3c7; }
+.unit-gudang { color: #2563eb; background-color: #dbeafe; }
+.unit-pembibitan { color: #059669; background-color: #d1fae5; }
+
+/* Vineyard themed gradient overlay (kept solid for dark text legibility) */
+.vine-pattern {
+  background-color: #1a6b3c;
+  background-image:
+    radial-gradient(at 30% 20%, rgba(244, 162, 40, 0.18) 0px, transparent 50%),
+    radial-gradient(at 80% 70%, rgba(20, 82, 45, 0.55) 0px, transparent 50%);
+}
+
+/* Prevent iOS zoom on inputs */
+input, select, textarea { font-size: 16px; }
+@media (min-width: 640px) {
+  input, select, textarea { font-size: 14px; }
+}
