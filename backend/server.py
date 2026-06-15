@@ -2342,7 +2342,58 @@ def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None)
     }
 
 
-async def _build_unified_finance_summary(limit: int = 1000) -> dict:
+# Cache singkat untuk ringkasan finance.
+# Tujuannya: Dashboard, Keuangan, dan Laporan sering dibuka berurutan; tanpa cache backend
+# menghitung ulang seluruh transaksi beberapa kali sehingga terasa lambat di HuggingFace free.
+FINANCE_CACHE_TTL_SECONDS = int(os.environ.get("FINANCE_CACHE_TTL_SECONDS", "20"))
+_finance_summary_cache = {"expires_at": None, "summary": None}
+_finance_summary_lock = asyncio.Lock()
+
+
+def _slice_finance_summary(summary: dict, limit: int = 1000) -> dict:
+    safe_limit = max(1, min(_money(limit, 1000), 5000))
+    sliced = dict(summary or {})
+    for key in ("cashier_ledger", "pos_transactions", "incomes", "expenses", "debts"):
+        val = sliced.get(key)
+        if isinstance(val, list):
+            sliced[key] = val[:safe_limit]
+    if isinstance(sliced.get("recent_transactions"), list):
+        sliced["recent_transactions"] = sliced["recent_transactions"][:10]
+    sliced["cache"] = {
+        "enabled": True,
+        "ttl_seconds": FINANCE_CACHE_TTL_SECONDS,
+        "generated_at": sliced.get("generated_at"),
+    }
+    return sliced
+
+
+def invalidate_finance_summary_cache():
+    _finance_summary_cache["expires_at"] = None
+    _finance_summary_cache["summary"] = None
+
+
+async def _build_unified_finance_summary(limit: int = 1000, force_refresh: bool = False) -> dict:
+    now_ts = datetime.now(timezone.utc)
+    cached = _finance_summary_cache.get("summary")
+    expires_at = _finance_summary_cache.get("expires_at")
+    if not force_refresh and cached and expires_at and expires_at > now_ts:
+        return _slice_finance_summary(cached, limit)
+
+    async with _finance_summary_lock:
+        cached = _finance_summary_cache.get("summary")
+        expires_at = _finance_summary_cache.get("expires_at")
+        now_ts = datetime.now(timezone.utc)
+        if not force_refresh and cached and expires_at and expires_at > now_ts:
+            return _slice_finance_summary(cached, limit)
+
+        # Hitung sekali dengan limit terbesar, lalu endpoint lain cukup slicing.
+        summary = await _build_unified_finance_summary_uncached(limit=5000)
+        _finance_summary_cache["summary"] = summary
+        _finance_summary_cache["expires_at"] = now_ts + timedelta(seconds=FINANCE_CACHE_TTL_SECONDS)
+        return _slice_finance_summary(summary, limit)
+
+
+async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     """Satu sumber kebenaran untuk Kasir, Keuangan, Dashboard, dan Laporan.
 
     Prinsip:
@@ -2565,8 +2616,14 @@ async def _build_unified_finance_summary(limit: int = 1000) -> dict:
 
 
 @api.get("/finance/system-summary")
-async def finance_system_summary(user: dict = Depends(get_current_user), limit: int = 1000):
-    return await _build_unified_finance_summary(limit=limit)
+async def finance_system_summary(user: dict = Depends(get_current_user), limit: int = 1000, refresh: bool = False):
+    return await _build_unified_finance_summary(limit=limit, force_refresh=refresh)
+
+
+@api.post("/finance/refresh-summary")
+async def finance_refresh_summary(user: dict = Depends(get_current_user)):
+    invalidate_finance_summary_cache()
+    return {"ok": True, "message": "Ringkasan keuangan akan dihitung ulang pada request berikutnya."}
 
 # ---------- Reports ----------
 @api.get("/reports/profit-loss")
