@@ -84,7 +84,8 @@ export default function Anggur() {
   };
   const saveHarv = async () => {
     if (!harvForm.plot_id || !harvForm.quantity_kg) return toast.error("Lengkapi data panen");
-    await api.post("/vineyard/harvests", { ...harvForm, quantity_kg: parseFloat(harvForm.quantity_kg) });
+    const p = plots.find((x) => x.id === harvForm.plot_id);
+    await api.post("/vineyard/harvests", { ...harvForm, variety: harvForm.variety || p?.variety || p?.name || "Panen", quantity_kg: parseFloat(harvForm.quantity_kg) });
     setHarvForm(initHarv); setShowHarv(false); load(); toast.success("Panen dicatat dan stok gudang bertambah");
   };
   const deleteHarvest = async (h) => {
@@ -227,7 +228,13 @@ export default function Anggur() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={showHarv} onOpenChange={setShowHarv}><DialogContent><DialogHeader><DialogTitle>Catat Panen</DialogTitle></DialogHeader><SelectField label="Plot" value={harvForm.plot_id} onChange={(v)=>setHarvForm({...harvForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><Field label="Jumlah kg" type="number" value={harvForm.quantity_kg || ''} onChange={(v)=>setHarvForm({...harvForm,quantity_kg:v})}/><SelectField label="Kualitas" value={harvForm.quality_grade} onChange={(v)=>setHarvForm({...harvForm,quality_grade:v})} items={[{value:'A',label:'A Premium'},{value:'B',label:'B Standard'},{value:'C',label:'C Olahan'}]}/><SelectField label="Masukkan ke Item Inventori (opsional, kosong = otomatis)" value={harvForm.inventory_item_id || 'auto'} onChange={(v)=>setHarvForm({...harvForm,inventory_item_id:v === 'auto' ? '' : v})} items={[{value:'auto',label:'Otomatis per Grade'},...grapeItems.map(i=>({value:i.id,label:`${i.name} (${i.current_stock || 0} ${i.unit})`}))]}/><DialogFooter><Button variant="outline" onClick={()=>setShowHarv(false)}>Batal</Button><Button onClick={saveHarv}>Simpan</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={showHarv} onOpenChange={setShowHarv}><DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto"><DialogHeader><DialogTitle>Catat Panen</DialogTitle></DialogHeader>
+        <SelectField label="Plot" value={harvForm.plot_id} onChange={(v)=>{ const p=plots.find(x=>x.id===v); setHarvForm({...harvForm,plot_id:v,variety:p?.variety || p?.name || ''}); }} items={plots.map(p=>({value:p.id,label:`${p.name}${p.variety ? ` · ${p.variety}` : ''}`}))}/>
+        <Field label="Varietas / Jenis Panen" value={harvForm.variety || ''} onChange={(v)=>setHarvForm({...harvForm,variety:v})}/>
+        <Field label="Jumlah kg" type="number" value={harvForm.quantity_kg || ''} onChange={(v)=>setHarvForm({...harvForm,quantity_kg:v})}/>
+        <SelectField label="Kualitas / Grade" value={harvForm.quality_grade} onChange={(v)=>setHarvForm({...harvForm,quality_grade:v})} items={[{value:'A',label:'Grade A'},{value:'B',label:'Grade B'},{value:'C',label:'Grade C'}]}/>
+        <div className="text-xs bg-blue-50 border border-blue-100 text-blue-800 rounded-lg p-2">Kosongkan item inventori agar sistem membuat/memilih item otomatis: <b>{harvForm.variety || 'Nama Varietas'} Grade {harvForm.quality_grade}</b>. Batch juga dibuat otomatis dengan format singkatan + tanggal + urutan.</div>
+        <SelectField label="Masukkan ke Item Inventori (opsional, kosong = otomatis)" value={harvForm.inventory_item_id || 'auto'} onChange={(v)=>setHarvForm({...harvForm,inventory_item_id:v === 'auto' ? '' : v})} items={[{value:'auto',label:'Otomatis sesuai varietas + grade'},...grapeItems.map(i=>({value:i.id,label:`${i.name} (${i.current_stock || 0} ${i.unit})`}))]}/><DialogFooter><Button variant="outline" onClick={()=>setShowHarv(false)}>Batal</Button><Button onClick={saveHarv}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={showAct} onOpenChange={setShowAct}><DialogContent><DialogHeader><DialogTitle>Aktivitas Kebun</DialogTitle></DialogHeader><SelectField label="Plot" value={actForm.plot_id} onChange={(v)=>setActForm({...actForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><SelectField label="Jenis" value={actForm.activity_type} onChange={(v)=>setActForm({...actForm,activity_type:v})} items={['pemangkasan','pemupukan','penyiraman','pengendalian hama','panen persiapan','perawatan'].map(x=>({value:x,label:x}))}/><Field label="Jam Kerja" type="number" value={actForm.labor_hours || ''} onChange={(v)=>setActForm({...actForm,labor_hours:v})}/><Field label="Biaya" type="number" value={actForm.cost || ''} onChange={(v)=>setActForm({...actForm,cost:v})}/><Label>Catatan</Label><Textarea value={actForm.notes} onChange={(e)=>setActForm({...actForm,notes:e.target.value})}/><DialogFooter><Button variant="outline" onClick={()=>setShowAct(false)}>Batal</Button><Button onClick={saveActivity}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 

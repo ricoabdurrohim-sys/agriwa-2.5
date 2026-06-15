@@ -37,6 +37,9 @@ export default function Inventori() {
   const [produceItem, setProduceItem] = useState(null);
   const [produceQty, setProduceQty] = useState("");
   const [producing, setProducing] = useState(false);
+  const [batchItem, setBatchItem] = useState(null);
+  const [batchRows, setBatchRows] = useState([]);
+  const [templateId, setTemplateId] = useState("new");
 
   const load = async () => {
     const { data } = await api.get("/inventory");
@@ -86,7 +89,26 @@ export default function Inventori() {
     return f;
   }, [items, filter, search]);
 
-  const openNew = () => { setEditing(null); setForm(initial); setShowForm(true); };
+  const openNew = () => { setEditing(null); setTemplateId("new"); setForm(initial); setShowForm(true); };
+  const useTemplate = (id) => {
+    setTemplateId(id);
+    if (id === "new") { setForm(initial); return; }
+    const item = items.find((x) => x.id === id);
+    if (!item) return;
+    setForm({
+      ...initial,
+      name: item.name || "", category: item.category || initial.category, unit: item.unit || "pcs",
+      business_unit: item.business_unit || "warung", min_stock: item.min_stock || "",
+      cost_price: item.cost_price || "", sell_price: item.sell_price || "",
+      location: item.location || "", supplier_name: item.last_supplier_name || "",
+      current_stock: "", batch_no: "", notes: "", image_url: item.image_url || "",
+    });
+  };
+  const openBatches = async (item) => {
+    setBatchItem(item);
+    try { const { data } = await api.get(`/inventory/${item.id}/batches`); setBatchRows(data); }
+    catch { toast.error("Gagal memuat batch"); }
+  };
   const openEdit = (item) => {
     setEditing(item);
     // Keep blank strings if 0 so user can clear them when editing
@@ -216,6 +238,11 @@ export default function Inventori() {
                         Batch terakhir: {i.last_batch_no || "—"}{i.last_supplier_name && ` · ${i.last_supplier_name}`}{i.last_stock_in_at && ` · ${new Date(i.last_stock_in_at).toLocaleDateString('id-ID')}`}
                       </div>
                     )}
+                    {i.batch_count > 0 && (
+                      <button onClick={() => openBatches(i)} className="text-[10px] text-emerald-700 hover:underline mt-0.5">
+                        Lihat {i.batch_count} batch · sisa batch {Number(i.batch_remaining_total || 0).toFixed(2)} {i.unit}
+                      </button>
+                    )}
                   </div>
                   <div className="text-right">
                     <div className={`font-mono font-semibold text-sm ${low ? "text-red-600" : "text-gray-900"}`}>
@@ -248,6 +275,19 @@ export default function Inventori() {
             <div className="col-span-2">
               <ImageUpload value={form.image_url} onChange={(v) => setForm({ ...form, image_url: v })} label="Foto Produk (opsional)" testid="inv-image" />
             </div>
+            {!editing && (
+              <div className="col-span-2 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
+                <Label>Tambah dari barang yang sudah ada</Label>
+                <Select value={templateId} onValueChange={useTemplate}>
+                  <SelectTrigger className="mt-1 bg-white"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="new">Barang baru / isi manual</SelectItem>
+                    {items.map((i) => <SelectItem key={i.id} value={i.id}>{i.name} · stok {i.current_stock} {i.unit}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <div className="text-[11px] text-emerald-800 mt-1">Pilih barang lama agar nama, kategori, satuan, harga, dan supplier terakhir otomatis terisi. Kamu tinggal isi stok masuk baru.</div>
+              </div>
+            )}
             <div className="col-span-2">
               <Label>Nama Barang</Label>
               <Input data-testid="form-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
@@ -291,10 +331,10 @@ export default function Inventori() {
                   Jika nama barang sudah ada, stok akan otomatis ditambahkan ke item lama dan dicatat sebagai batch baru. Ini membantu trace supplier kalau ada retur/komplain.
                 </div>
                 <div><Label>Supplier / Sumber</Label><Input value={form.supplier_name || ""} onChange={(e) => setForm({ ...form, supplier_name: e.target.value })} placeholder="Nama supplier" /></div>
-                <div><Label>No Batch / Invoice</Label><Input value={form.batch_no || ""} onChange={(e) => setForm({ ...form, batch_no: e.target.value })} placeholder="INV-001 / Batch A" /></div>
+                <div><Label>No Batch / Invoice</Label><Input value={form.batch_no || ""} onChange={(e) => setForm({ ...form, batch_no: e.target.value })} placeholder="Kosong = otomatis GP150626001" /></div>
                 <div><Label>Ref Pembelian</Label><Input value={form.purchase_ref || ""} onChange={(e) => setForm({ ...form, purchase_ref: e.target.value })} placeholder="PO/Marketplace" /></div>
                 <div><Label>Link Pembelian</Label><Input value={form.purchase_url || ""} onChange={(e) => setForm({ ...form, purchase_url: e.target.value })} placeholder="https://..." /></div>
-                <div><Label>Kadaluarsa / Evaluasi</Label><Input type="date" value={form.expiry_date || ""} onChange={(e) => setForm({ ...form, expiry_date: e.target.value })} /></div>
+                <div><Label>Tanggal Beli/Panen</Label><Input type="date" value={form.purchase_date || ""} onChange={(e) => setForm({ ...form, purchase_date: e.target.value })} /></div><div><Label>Kadaluarsa / Evaluasi</Label><Input type="date" value={form.expiry_date || ""} onChange={(e) => setForm({ ...form, expiry_date: e.target.value })} /></div>
               </div>
             )}
             <div>
@@ -310,6 +350,24 @@ export default function Inventori() {
             <Button variant="outline" onClick={() => setShowForm(false)}>Batal</Button>
             <Button onClick={save} data-testid="save-inventory-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!batchItem} onOpenChange={() => setBatchItem(null)}>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>Batch {batchItem?.name}</DialogTitle></DialogHeader>
+          <div className="text-xs text-gray-500">Riwayat batch tidak ditumpuk. Sisa batch lama berkurang otomatis saat barang keluar lewat kasir/pemakaian.</div>
+          <div className="divide-y divide-gray-100 border rounded-lg overflow-hidden">
+            {batchRows.length === 0 ? <div className="p-6 text-center text-gray-400 text-sm">Belum ada batch</div> : batchRows.map((b) => (
+              <div key={b.id} className="p-3 grid sm:grid-cols-4 gap-2 text-sm">
+                <div><div className="text-[10px] text-gray-500 uppercase">Batch</div><div className="font-mono font-semibold">{b.batch_no}</div></div>
+                <div><div className="text-[10px] text-gray-500 uppercase">Supplier</div><div>{b.supplier_name || '—'}</div></div>
+                <div><div className="text-[10px] text-gray-500 uppercase">Masuk</div><div className="font-mono">{b.quantity} {b.unit}</div></div>
+                <div><div className="text-[10px] text-gray-500 uppercase">Sisa</div><div className="font-mono font-bold text-emerald-700">{Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} {b.unit}</div></div>
+                <div className="sm:col-span-4 text-xs text-gray-500">{b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''} {b.purchase_ref && `· Ref ${b.purchase_ref}`} {b.purchase_url && <a className="text-blue-600 underline" href={b.purchase_url} target="_blank" rel="noreferrer">· Link</a>} {b.notes && `· ${b.notes}`}</div>
+              </div>
+            ))}
+          </div>
         </DialogContent>
       </Dialog>
 

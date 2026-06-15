@@ -10,8 +10,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 
+const ROLE_OPTIONS = ["Kasir", "Koki", "Pelayan", "Penjaga Kebun", "Produksi", "Gudang", "Supplier/Pembelian", "Akuntan", "Finance", "HR", "Admin", "Supervisor", "Owner"];
+
 const initEmp = {
-  name: "", nik: "", role: "", unit: "warung",
+  name: "", nik: "", role: "", unit: "lintas",
   salary_type: "monthly", base_salary: 0, overtime_rate: 0,
   bank_account: "", phone: "", department: "", employment_status: "tetap", emergency_contact: "", leave_quota: 12, active: true,
 };
@@ -317,13 +319,20 @@ export default function Karyawan() {
             <div className="col-span-2"><Label>Nama Lengkap</Label><Input data-testid="emp-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
             <div><Label>NIK / ID</Label><Input value={form.nik} onChange={(e) => setForm({ ...form, nik: e.target.value })} /></div>
             <div><Label>No. HP</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
-            <div><Label>Posisi/Jabatan</Label><Input data-testid="emp-role" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })} placeholder="Koki, Pelayan, Penjaga Kebun" /></div>
+            <div><Label>Posisi/Jabatan</Label>
+              <Select value={ROLE_OPTIONS.includes(form.role) ? form.role : "custom"} onValueChange={(v) => setForm({ ...form, role: v === "custom" ? "" : v })}>
+                <SelectTrigger data-testid="emp-role"><SelectValue placeholder="Pilih jabatan" /></SelectTrigger>
+                <SelectContent>{ROLE_OPTIONS.map(r => <SelectItem key={r} value={r}>{r}</SelectItem>)}<SelectItem value="custom">Lainnya / tulis manual</SelectItem></SelectContent>
+              </Select>
+              {!ROLE_OPTIONS.includes(form.role) && <Input className="mt-1" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })} placeholder="Tulis jabatan manual" />}
+            </div>
             <div><Label>Departemen</Label><Input value={form.department || ""} onChange={(e) => setForm({ ...form, department: e.target.value })} placeholder="Operasional, Kebun, Gudang" /></div>
             <div>
               <Label>Unit</Label>
               <Select value={form.unit} onValueChange={(v) => setForm({ ...form, unit: v })}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="lintas">Lintas Bisnis / Kantor Pusat</SelectItem>
                   {(bizUnits.length ? bizUnits : ["warung", "anggur", "pupuk", "pembibitan", "gudang"].map(c => ({code:c, name:c}))).map((u) => <SelectItem key={u.code} value={u.code}>{u.name}</SelectItem>)}
                 </SelectContent>
               </Select>

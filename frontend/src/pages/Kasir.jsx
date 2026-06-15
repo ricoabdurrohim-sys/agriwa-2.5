@@ -49,6 +49,9 @@ export default function Kasir() {
   const [bonInfo, setBonInfo] = useState(null); // {id, customer_name, amount, paid, customer_phone}
   const [bizUnits, setBizUnits] = useState([]);
   const [unit, setUnit] = useState("warung");
+  const [debts, setDebts] = useState([]);
+  const [debtSearch, setDebtSearch] = useState("");
+  const [showDebtFinder, setShowDebtFinder] = useState(false);
 
   const getBonRemaining = (d) => {
     if (!d) return 0;
@@ -119,6 +122,32 @@ export default function Kasir() {
       const { data } = await api.get("/transactions");
       setRecentTrx(data.slice(0, 30));
     } catch (err) { /* ignore */ }
+  };
+  const loadDebts = async (q = debtSearch) => {
+    try {
+      const { data } = await api.get(`/customer-debts/search?q=${encodeURIComponent(q || "")}`);
+      setDebts(data);
+    } catch (err) {
+      toast.error("Gagal memuat daftar bon");
+    }
+  };
+  const openDebtFinder = () => { setShowDebtFinder((v) => !v); loadDebts(); };
+  const startDebtSettlement = async (d) => {
+    try {
+      const { data } = await api.get(`/customer-debts/${d.id}`);
+      const full = { ...d, ...data };
+      setBonInfo(full);
+      setCustomerName(full.customer_name || "");
+      setCustomerPhone(full.customer_phone || "");
+      setPayment("cash"); setTransactionType("SALE"); setIsBon(false);
+      const due = getBonRemaining(full);
+      setCashReceived(due > 0 ? String(due) : "0");
+      if (full.original_items?.length) setCart(full.original_items.map((it) => ({ item_id: it.item_id, name: it.name, unit_price: it.unit_price, quantity: it.quantity, notes: it.notes || "" })));
+      window.history.replaceState({}, "", `/kasir?bon=${full.id}`);
+      setShowDebtFinder(false);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Gagal membuka bon");
+    }
   };
   useEffect(() => { load(); loadBizUnits(); loadRecent(); api.get("/settings").then(({ data }) => setSettings((p) => ({ ...p, ...data }))).catch(() => {}); }, []);
 
@@ -330,7 +359,7 @@ export default function Kasir() {
       setCart([]); setCashReceived(""); setDiscount(0); setIsBon(false); setTransactionType("SALE"); setCustomerName(""); setCustomerPhone("");
       setBonInfo(null);
       clearPromo(); clearMember();
-      load(); loadRecent();
+      load(); loadRecent(); loadDebts();
       // Clear bon URL param after settlement so reload doesn't re-trigger
       if (bonInfo) {
         window.history.replaceState({}, "", "/kasir");
@@ -350,11 +379,44 @@ export default function Kasir() {
             <p className="text-sm text-gray-500 mt-0.5">{tableId ? "Pesanan untuk meja terpilih" : bonInfo ? `Pelunasan bon — ${bonInfo.customer_name}` : `Penjualan ${currentUnitInfo.name}`}</p>
           </div>
           <div className="flex gap-2">
+            <Button data-testid="open-debt-finder-btn" onClick={openDebtFinder} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">
+              <Search className="w-4 h-4 mr-1.5" /> Cari Bon
+            </Button>
             <Button data-testid="open-history-btn" onClick={() => { setShowHistory(true); loadRecent(); }} variant="outline" className="border-gray-300">
               <ReceiptIcon className="w-4 h-4 mr-1.5" /> Riwayat / Batal
             </Button>
           </div>
         </div>
+
+        {showDebtFinder && !bonInfo && (
+          <div className="bg-white rounded-xl border border-amber-200 p-3 space-y-3 shadow-sm">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-semibold text-amber-900">Cari Bon Pelanggan</div>
+                <div className="text-xs text-amber-700">Cari nama/no HP, lalu lanjutkan pelunasan langsung dari Kasir.</div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => setShowDebtFinder(false)}>Tutup</Button>
+            </div>
+            <div className="flex gap-2">
+              <Input value={debtSearch} onChange={(e) => setDebtSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadDebts()} placeholder="Nama pelanggan / no HP" className="h-10" />
+              <Button onClick={() => loadDebts()} className="bg-amber-600 hover:bg-amber-700">Cari</Button>
+            </div>
+            <div className="max-h-64 overflow-y-auto divide-y divide-amber-100 border border-amber-100 rounded-lg">
+              {debts.length === 0 ? <div className="p-4 text-center text-xs text-gray-400">Tidak ada bon aktif</div> : debts.map((d) => (
+                <button key={d.id} onClick={() => startDebtSettlement(d)} className="w-full text-left p-3 hover:bg-amber-50 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-gray-900 truncate">{d.customer_name || 'Pelanggan'}</div>
+                    <div className="text-xs text-gray-500 truncate">{d.customer_phone || 'Tanpa HP'} · {d.original_trx_no || d.transaction_id || ''}</div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <div className="font-mono font-bold text-amber-700">{formatRupiah(getBonRemaining(d))}</div>
+                    <div className="text-[10px] text-gray-500">Klik bayar</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Business Unit Selector */}
         {!bonInfo && (

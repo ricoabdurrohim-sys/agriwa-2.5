@@ -668,23 +668,56 @@ class InventoryIn(BaseModel):
     purchase_ref: Optional[str] = ""
     purchase_url: Optional[str] = ""
     expiry_date: Optional[str] = ""
+    purchase_date: Optional[str] = ""
 
 
 def _inventory_name_key(name: str) -> str:
     return (name or "").strip().lower()
 
 
+def _batch_prefix_from_name(name: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", (name or "").upper())
+    if not words:
+        return "BT"
+    if len(words) == 1:
+        return words[0][:2].ljust(2, "X")
+    return "".join(w[0] for w in words[:3])[:3]
+
+
+async def _generate_batch_no(item_name: str, purchase_date: str = "") -> str:
+    # Format contoh: GP150626001 = Gula Pasir, 15 Juni 2026, pembelian ke-001 hari itu.
+    prefix = _batch_prefix_from_name(item_name)
+    if purchase_date:
+        raw = str(purchase_date)[:10]
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    date_part = dt.strftime("%d%m%y")
+    regex = f"^{re.escape(prefix + date_part)}"
+    count = await db.inventory_batches.count_documents({"batch_no": {"$regex": regex}})
+    return f"{prefix}{date_part}{count + 1:03d}"
+
+
 async def _record_inventory_batch(item: dict, qty: float, body: dict, source: str = "manual"):
     if qty == 0:
         return None
+    batch_no = (body.get("batch_no") or "").strip()
+    purchase_date = body.get("purchase_date") or body.get("date") or ""
+    if not batch_no:
+        batch_no = await _generate_batch_no(item.get("name"), purchase_date)
     batch = {
         "id": gen_id(),
         "item_id": item.get("id"),
         "item_name": item.get("name"),
         "quantity": float(qty),
+        "remaining_quantity": float(qty),
         "unit": item.get("unit", body.get("unit", "pcs")),
         "supplier_name": body.get("supplier_name") or "",
-        "batch_no": body.get("batch_no") or f"BATCH-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}",
+        "batch_no": batch_no,
+        "purchase_date": purchase_date or now_iso(),
         "purchase_ref": body.get("purchase_ref") or "",
         "purchase_url": body.get("purchase_url") or "",
         "expiry_date": body.get("expiry_date") or "",
@@ -699,9 +732,34 @@ async def _record_inventory_batch(item: dict, qty: float, body: dict, source: st
         "reason": f"Stok masuk {batch['batch_no']} dari {batch['supplier_name'] or 'manual'}",
         "reference": "inventory_batch", "reference_id": batch["id"],
         "supplier_name": batch["supplier_name"], "batch_no": batch["batch_no"],
+        "remaining_quantity": batch["remaining_quantity"],
         "created_at": now_iso(),
     })
     return batch
+
+
+async def _consume_inventory_batches(item_id: str, qty: float, reference: str = "stock_out"):
+    """Kurangi sisa batch secara FIFO agar sisa batch lama bisa dilihat di Inventori."""
+    remaining = float(qty or 0)
+    if remaining <= 0:
+        return []
+    consumed = []
+    cursor = db.inventory_batches.find({"item_id": item_id}).sort("created_at", 1)
+    async for b in cursor:
+        if remaining <= 0:
+            break
+        current_left = b.get("remaining_quantity")
+        if current_left is None:
+            current_left = b.get("quantity", 0)
+        current_left = float(current_left or 0)
+        if current_left <= 0:
+            continue
+        take = min(current_left, remaining)
+        new_left = max(0, current_left - take)
+        await db.inventory_batches.update_one({"id": b.get("id")}, {"$set": {"remaining_quantity": new_left, "updated_at": now_iso()}})
+        consumed.append({"batch_id": b.get("id"), "batch_no": b.get("batch_no"), "qty_out": take, "remaining_after": new_left})
+        remaining -= take
+    return consumed
 
 
 @api.get("/inventory")
@@ -712,8 +770,14 @@ async def list_inventory(user: dict = Depends(get_current_user)):
     for b in batches:
         by_item.setdefault(b.get("item_id"), []).append(b)
     for item in items:
-        recent = by_item.get(item.get("id"), [])[:5]
+        all_batches = by_item.get(item.get("id"), [])
+        for b in all_batches:
+            if b.get("remaining_quantity") is None:
+                b["remaining_quantity"] = float(b.get("quantity") or 0)
+        recent = all_batches[:5]
         item["recent_batches"] = recent
+        item["batch_count"] = len(all_batches)
+        item["batch_remaining_total"] = sum(float(b.get("remaining_quantity") or 0) for b in all_batches)
         if recent:
             item["last_supplier_name"] = recent[0].get("supplier_name", "")
             item["last_batch_no"] = recent[0].get("batch_no", "")
@@ -1031,6 +1095,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
             unit_cost = int(inv.get("cost_price") or inv.get("hpp") or 0)
             cost_total += unit_cost * it.quantity
             await db.inventory_items.update_one({"id": it.item_id}, {"$inc": {"current_stock": -it.quantity}})
+            consumed_batches = await _consume_inventory_batches(it.item_id, it.quantity, reference=trx_no)
             after = await db.inventory_items.find_one({"id": it.item_id}, {"_id": 0})
             await db.stock_movements.insert_one({
                 "id": gen_id(),
@@ -1043,6 +1108,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
                 "balance_after": (after or {}).get("current_stock"),
                 "reason": f"{stock_type.upper()} {trx_no}",
                 "reference_id": trx_no,
+                "consumed_batches": consumed_batches if 'consumed_batches' in locals() else [],
                 "created_at": now_iso(),
             })
             await check_low_stock_and_notify(it.item_id)
@@ -1131,6 +1197,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
             "original_total": sale_total,
             "initial_paid": paid_amount,
             "transaction_id": doc["id"],
+            "unit": body.unit,
             "created_at": now_iso(),
         })
         await write_notification("DEBT", "Transaksi menjadi hutang", f"{doc['trx_no']} kurang {format_rp_short(debt_amount)}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"], priority="high")
@@ -1282,6 +1349,21 @@ async def list_debts(user: dict = Depends(get_current_user)):
     return [_normalize_debt_for_response(d) for d in debts]
 
 
+@api.get("/customer-debts/search")
+async def search_debts(q: str = "", include_paid: bool = False, user: dict = Depends(get_current_user)):
+    query = {}
+    if not include_paid:
+        query["status"] = {"$ne": "paid"}
+    q = (q or "").strip()
+    if q:
+        query["$or"] = [
+            {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
+            {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
+        ]
+    rows = await db.customer_debts.find(query, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return [_normalize_debt_for_response(r) for r in rows]
+
+
 class PayDebtIn(BaseModel):
     amount: int
 
@@ -1354,6 +1436,7 @@ async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_curre
                     "cash_collected": trx_paid,
                 }, "$unset": {"cancel_reason": "", "cancelled_at": "", "cancelled_by": "", "replaced_by": ""}}
             )
+    invalidate_finance_summary_cache()
     await write_audit(user, "update", "customer_debt", debt_id, {"amount": pay_amount, "status": status})
     return {"ok": True, "status": status, "paid": new_paid, "remaining": max(0, int(debt.get("amount", 0)) - new_paid)}
 
@@ -1423,6 +1506,7 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
                     "cash_collected": trx_paid,
                 }, "$unset": {"cancel_reason": "", "cancelled_at": "", "cancelled_by": "", "replaced_by": ""}}
             )
+    invalidate_finance_summary_cache()
     await write_audit(user, "update", "customer_debt", debt_id, {"status": "paid", "full": True})
     return {"ok": True}
 
@@ -1982,6 +2066,7 @@ async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)
         "unit": body.unit,
         "created_at": now_iso(),
     })
+    invalidate_finance_summary_cache()
     return doc
 
 
@@ -2021,6 +2106,7 @@ async def create_income(body: IncomeIn, user: dict = Depends(get_current_user)):
         "unit": body.unit,
         "created_at": now_iso(),
     })
+    invalidate_finance_summary_cache()
     await write_audit(user, "create", "income", doc["id"], {"amount": body.amount, "category": body.category})
     return doc
 
@@ -2345,9 +2431,11 @@ def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None)
 # Cache singkat untuk ringkasan finance.
 # Tujuannya: Dashboard, Keuangan, dan Laporan sering dibuka berurutan; tanpa cache backend
 # menghitung ulang seluruh transaksi beberapa kali sehingga terasa lambat di HuggingFace free.
-FINANCE_CACHE_TTL_SECONDS = int(os.environ.get("FINANCE_CACHE_TTL_SECONDS", "20"))
+FINANCE_CACHE_TTL_SECONDS = int(os.environ.get("FINANCE_CACHE_TTL_SECONDS", "120"))
 _finance_summary_cache = {"expires_at": None, "summary": None}
 _finance_summary_lock = asyncio.Lock()
+_finance_repair_done = False
+FINANCE_MAX_DOCS = int(os.environ.get("FINANCE_MAX_DOCS", "3000"))
 
 
 def _slice_finance_summary(summary: dict, limit: int = 1000) -> dict:
@@ -2402,19 +2490,23 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     - dokumen/receipt pelunasan bon tidak dihitung sebagai penjualan baru;
     - halaman frontend tidak menghitung ulang rumus sendiri.
     """
-    try:
-        await _repair_legacy_bon_settlement_transactions()
-    except Exception:
-        # Repair tidak boleh membuat halaman crash. Data tetap diringkas best-effort.
-        pass
+    global _finance_repair_done
+    if not _finance_repair_done:
+        try:
+            await _repair_legacy_bon_settlement_transactions()
+        except Exception:
+            # Repair tidak boleh membuat halaman crash. Data tetap diringkas best-effort.
+            pass
+        _finance_repair_done = True
 
+    max_docs = max(500, min(FINANCE_MAX_DOCS, 10000))
     debt_ctx = await _load_debt_financial_context()
-    raw_transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(10000)
-    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(10000)
-    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(10000)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(10000)
-    debts_raw = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(10000)
-    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(10000)
+    raw_transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(max_docs)
+    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs)
+    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(max_docs)
+    debts_raw = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(max_docs)
+    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(max_docs)
 
     inv_items = {i.get("id"): i for i in inventory}
 
@@ -2888,6 +2980,7 @@ async def startup():
     await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_items.create_index([("name_key", 1), ("unit", 1), ("business_unit", 1)])
     await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
+    await db.inventory_batches.create_index([("batch_no", 1)])
     await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
     await db.audit_logs.create_index("timestamp")
     await db.debt_payments.create_index([("transaction_id", 1), ("created_at", -1)])
@@ -3153,21 +3246,23 @@ async def list_harvests(user: dict = Depends(get_current_user)):
     return await db.vineyard_harvests.find({}, {"_id": 0}).sort("date", -1).to_list(500)
 
 
-async def _get_or_create_harvest_inventory_item(grade: str, item_id: str = "") -> dict:
+async def _get_or_create_harvest_inventory_item(grade: str, item_id: str = "", plot: Optional[dict] = None) -> dict:
     if item_id:
         existing = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
         if existing:
             return existing
     grade = (grade or "A").upper()
-    name = f"Anggur Panen Grade {grade}"
-    existing = await db.inventory_items.find_one({"name": name, "business_unit": "anggur"}, {"_id": 0})
+    variety = ((plot or {}).get("variety") or (plot or {}).get("crop_type") or (plot or {}).get("name") or "Panen").strip()
+    # Nama dibuat generik supaya bisa anggur, kelengkeng, ayam/telur, dll.
+    name = f"{variety} Grade {grade}"
+    existing = await db.inventory_items.find_one({"name_key": _inventory_name_key(name), "business_unit": "anggur"}, {"_id": 0})
     if existing:
         return existing
     doc = {
-        "id": gen_id(), "name": name, "category": "Hasil Panen", "unit": "kg",
+        "id": gen_id(), "name": name, "name_key": _inventory_name_key(name), "category": "Hasil Panen", "unit": "kg",
         "current_stock": 0, "min_stock": 0, "cost_price": 0, "sell_price": 0,
         "business_unit": "anggur", "location": "Gudang Panen",
-        "notes": "Dibuat otomatis saat catat panen kebun anggur", "created_at": now_iso(),
+        "notes": f"Dibuat otomatis saat catat panen {variety}", "created_at": now_iso(),
     }
     await db.inventory_items.insert_one(doc)
     doc.pop("_id", None)
@@ -3181,23 +3276,28 @@ async def create_harvest(body: HarvestIn, user: dict = Depends(get_current_user)
     plot = await db.vineyard_plots.find_one({"id": body.plot_id}, {"_id": 0})
     if not plot:
         raise HTTPException(404, "Plot kebun tidak ditemukan")
-    inv_item = await _get_or_create_harvest_inventory_item(body.quality_grade, body.inventory_item_id or "")
+    inv_item = await _get_or_create_harvest_inventory_item(body.quality_grade, body.inventory_item_id or "", plot)
     data = body.model_dump()
     data["date"] = data.get("date") or now_iso()
     data["inventory_item_id"] = inv_item["id"]
     data["inventory_item_name"] = inv_item.get("name")
+    data["variety"] = body.variety or plot.get("variety") or plot.get("name", "")
     data["stock_recorded"] = True
     data["plot_name"] = plot.get("name", "")
     doc = await insert_doc("vineyard_harvests", data)
     await db.inventory_items.update_one({"id": inv_item["id"]}, {"$inc": {"current_stock": float(body.quantity_kg)}})
+    batch = await _record_inventory_batch(inv_item, float(body.quantity_kg), {
+        "supplier_name": "Panen", "purchase_ref": doc["id"], "notes": f"Panen {plot.get('name','Plot')} grade {body.quality_grade}", "purchase_date": data.get("date")
+    }, source="vineyard_harvest")
     await db.stock_movements.insert_one({
         "id": gen_id(), "item_id": inv_item["id"], "type": "vineyard_harvest",
         "quantity": float(body.quantity_kg),
         "reason": f"Panen {plot.get('name','Kebun')} kualitas {body.quality_grade}",
         "reference": "vineyard_harvest", "reference_id": doc["id"],
+        "batch_no": (batch or {}).get("batch_no", ""),
         "created_at": now_iso(),
     })
-    await write_notification("HARVEST", "Panen anggur dicatat", f"{plot.get('name','Plot')} +{body.quantity_kg:g} kg masuk Inventori/Gudang", business_id="anggur", ref_type="vineyard_harvest", ref_id=doc["id"])
+    await write_notification("HARVEST", "Panen dicatat", f"{inv_item.get('name')} +{body.quantity_kg:g} kg masuk Inventori/Gudang", business_id="anggur", ref_type="vineyard_harvest", ref_id=doc["id"])
     await write_audit(user, "create", "vineyard_harvest", doc["id"], {"qty": body.quantity_kg, "item_id": inv_item["id"]})
     return doc
 
