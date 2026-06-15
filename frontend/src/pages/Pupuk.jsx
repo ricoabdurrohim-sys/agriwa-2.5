@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Beaker, Play, History, CheckCircle2, XCircle } from "lucide-react";
 import api, { formatRupiah, formatDateTime } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -51,7 +50,6 @@ export default function Pupuk() {
           <p className="text-sm text-gray-500 mt-0.5">Batch produksi dengan checklist bahan</p>
         </div>
         <div className="flex gap-2">
-          <ResetModuleButton module="pupuk" label="Pupuk" />
           <Button data-testid="start-production-btn" onClick={() => setShow(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Play className="w-4 h-4 mr-1.5" /> Mulai Produksi
           </Button>

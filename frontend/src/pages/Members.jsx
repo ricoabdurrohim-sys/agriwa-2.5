@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Plus, Search, Crown, Award, Star, User, Phone, Mail, Gift, Settings as SettingsIcon } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -62,7 +61,6 @@ export default function Members() {
           <p className="text-sm text-gray-500 mt-0.5">{totalMembers} member · {totalPoints.toLocaleString("id-ID")} total poin · {goldCount} Gold tier</p>
         </div>
         <div className="flex gap-2">
-          <ResetModuleButton module="members" label="Member" />
           <Button variant="outline" onClick={() => setShowSettings(true)} data-testid="loyalty-settings-btn">
             <SettingsIcon className="w-4 h-4 mr-1.5" /> Aturan Poin
           </Button>

@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
 import { printViaIframe } from "@/lib/safePrint";
 import { resolveImageUrl } from "@/components/ImageUpload";
@@ -50,6 +49,17 @@ export default function Kasir() {
   const [bonInfo, setBonInfo] = useState(null); // {id, customer_name, amount, paid, customer_phone}
   const [bizUnits, setBizUnits] = useState([]);
   const [unit, setUnit] = useState("warung");
+
+  const getBonRemaining = (d) => {
+    if (!d) return 0;
+    const explicit = d.remaining ?? d.debt_amount ?? d.open_receivable;
+    if (explicit !== undefined && explicit !== null && explicit !== "") return Math.max(0, Number(explicit) || 0);
+    const amount = Number(d.amount || 0);
+    const paid = Number(d.paid || 0);
+    // Schema baru: amount = sisa bon awal, paid = cicilan atas bon.
+    // Schema lama: amount = total belanja, paid = DP. Fallback tetap aman.
+    return Math.max(0, amount - paid);
+  };
 
   const lookupMember = async () => {
     if (!memberQuery.trim()) return;
@@ -145,8 +155,11 @@ export default function Kasir() {
           })));
         }
         setIsBon(false);
-        const remaining = Math.max(0, (data.amount || 0) - (data.paid || 0));
-        if (remaining > 0) setCashReceived(String(remaining));
+        const remaining = getBonRemaining(data);
+        setPayment("cash");
+        setTransactionType("SALE");
+        setDiscount(0);
+        setCashReceived(remaining > 0 ? String(remaining) : "0");
       }).catch((e) => {
         toast.error(e?.response?.data?.detail || "Bon tidak ditemukan");
       });
@@ -266,7 +279,7 @@ export default function Kasir() {
 
   const subtotal = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const total = Math.max(0, subtotal - discount - redeemDiscount);
-  const bonRemaining = bonInfo ? Math.max(0, (bonInfo.amount || 0) - (bonInfo.paid || 0)) : 0;
+  const bonRemaining = bonInfo ? getBonRemaining(bonInfo) : 0;
   const paymentDue = bonInfo ? bonRemaining : total;
   const cashReceivedNum = parseInt(cashReceived) || 0;
   const change = payment === "cash" ? (cashReceivedNum - paymentDue) : 0;
@@ -280,13 +293,15 @@ export default function Kasir() {
       let data;
       if (bonInfo) {
         // Settle bon: bayar hanya sisa bon, tidak membuat penjualan baru dan tidak mengurangi stok lagi.
-        const remaining = bonRemaining;
-        if (payment === "cash" && cashReceivedNum < remaining) {
-          return toast.error(`Uang tunai kurang. Minimal ${formatRupiah(remaining)}`);
+        const remaining = paymentDue;
+        const receivedForDebt = payment === "cash" ? (cashReceivedNum || remaining) : remaining;
+        if (payment === "cash" && receivedForDebt < remaining) {
+          setCashReceived(String(remaining));
+          return toast.error(`Nominal pelunasan bon harus minimal ${formatRupiah(remaining)}. Kolom sudah diisi otomatis.`);
         }
         const resp = await api.post(`/customer-debts/${bonInfo.id}/settle-via-kasir`, {
           payment_method: payment,
-          cash_received: cashReceivedNum || remaining,
+          cash_received: receivedForDebt,
         });
         data = resp.data;
         toast.success("Bon berhasil dilunasi — revenue dan piutang diperbarui");
@@ -325,7 +340,6 @@ export default function Kasir() {
             <p className="text-sm text-gray-500 mt-0.5">{tableId ? "Pesanan untuk meja terpilih" : bonInfo ? `Pelunasan bon — ${bonInfo.customer_name}` : `Penjualan ${currentUnitInfo.name}`}</p>
           </div>
           <div className="flex gap-2">
-            <ResetModuleButton module="kasir" label="Transaksi Kasir" />
             <Button data-testid="open-history-btn" onClick={() => { setShowHistory(true); loadRecent(); }} variant="outline" className="border-gray-300">
               <ReceiptIcon className="w-4 h-4 mr-1.5" /> Riwayat / Batal
             </Button>
@@ -518,7 +532,7 @@ export default function Kasir() {
           </div>
 
           {/* Transaction Type */}
-          <div className="space-y-1.5">
+          {!bonInfo && <div className="space-y-1.5">
             <label className="text-xs font-medium text-gray-600">Jenis Transaksi</label>
             <div className="grid grid-cols-2 gap-1.5">
               {[
@@ -538,7 +552,7 @@ export default function Kasir() {
                 Mode ini hanya mengurangi stok dan mencatat HPP sebagai biaya. Tidak menambah pendapatan/laba.
               </div>
             )}
-          </div>
+          </div>}
 
           {/* Payment Methods */}
           {transactionType === "SALE" && <div className="grid grid-cols-4 gap-1.5">
@@ -556,10 +570,11 @@ export default function Kasir() {
           {transactionType === "SALE" && payment === "cash" && !isBon && (
             <>
               <div>
-                <label className="text-xs font-medium text-gray-600">Uang Diterima</label>
+                <label className="text-xs font-medium text-gray-600">{bonInfo ? "Uang Diterima untuk Pelunasan Bon" : "Uang Diterima"}</label>
                 <Input data-testid="cash-received-input" type="number" value={cashReceived}
                   onChange={(e) => setCashReceived(e.target.value)}
-                  className="h-11 mt-1 font-mono text-right" placeholder="0" />
+                  onFocus={() => { if (bonInfo && (!cashReceived || Number(cashReceived) <= 0)) setCashReceived(String(paymentDue)); }}
+                  className="h-11 mt-1 font-mono text-right" placeholder={bonInfo ? String(paymentDue) : "0"} />
               </div>
               {cashReceivedNum > 0 && (
                 <div className={`flex justify-between text-sm rounded-lg px-2.5 py-1.5 ${isUnderpaid ? "bg-red-50 border border-red-200" : ""}`}>
@@ -571,7 +586,7 @@ export default function Kasir() {
                   </span>
                 </div>
               )}
-              {isUnderpaid && (
+              {isUnderpaid && !bonInfo && (
                 <div className="text-xs text-red-600 bg-red-50 rounded px-2 py-1.5 leading-snug">
                   ⚠ Bayar tunai &lt; total. Transaksi akan otomatis tercatat sebagai <strong>BON</strong> sebesar {formatRupiah(Math.abs(change))}. Pastikan No. HP pelanggan diisi untuk penagihan.
                 </div>
@@ -598,9 +613,9 @@ export default function Kasir() {
               placeholder="Nama pelanggan" className="h-10" />
           )}
 
-          <Button data-testid="checkout-btn" onClick={checkout} disabled={cart.length === 0}
+          <Button data-testid="checkout-btn" onClick={checkout} disabled={cart.length === 0 || (bonInfo && paymentDue <= 0)}
             className="w-full h-12 bg-[#f4a228] hover:bg-[#d98b1a] text-white font-semibold text-base">
-            Konfirmasi Pembayaran
+            {bonInfo ? `Lunasi Bon ${formatRupiah(paymentDue)}` : "Konfirmasi Pembayaran"}
           </Button>
         </div>
       </div>

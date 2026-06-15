@@ -107,7 +107,7 @@ export default function Keuangan() {
     load(); toast.success("Bon lunas — dana tercatat di kas");
   };
 
-  const totalDebt = debts.filter(d => d.status !== "paid").reduce((s, d) => s + (d.amount - (d.paid || 0)), 0);
+  const totalDebt = debts.filter(d => d.status !== "paid").reduce((s, d) => s + debtRemaining(d), 0);
   const totalExpense = expenses.reduce((s, e) => s + e.amount, 0);
   const totalIncome = incomes.reduce((s, i) => s + i.amount, 0);
   const isFinancialSale = (t) => {
@@ -116,6 +116,7 @@ export default function Keuangan() {
     if (t.cancelled) return false;
     return String(t.transaction_type || "SALE").toUpperCase() === "SALE";
   };
+  const debtRemaining = (d) => Math.max(0, Number(d.remaining ?? d.payment_due ?? ((d.amount || 0) - (d.paid || 0))) || 0);
   const cashCollected = (t) => {
     const total = Number(t.transaction_total ?? t.total ?? 0);
     const paidRaw = t.cash_collected ?? t.paid_amount ?? t.cash_received ?? t.total ?? 0;
@@ -199,16 +200,20 @@ export default function Keuangan() {
                         <span className="text-sm font-medium">{t.trx_no}</span>
                         <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${tag}`}>{label}</span>
                         {t.is_bon && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-amber-100 text-amber-800 border-amber-300">BON</span>}
+                        {t.debt_payments_total > 0 && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-blue-100 text-blue-700 border-blue-200">ADA PELUNASAN</span>}
                         {t.payment_status === "PAID" && t.debt_amount === 0 && (t.paid_amount || 0) >= (t.total || 0) && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-emerald-100 text-emerald-700 border-emerald-300">LUNAS</span>}
                       </div>
                       <div className="text-xs text-gray-500 mt-0.5">
                         {formatDate(t.created_at)} · {t.unit}{t.customer_name && ` · ${t.customer_name}`}
+                        {t.initial_paid > 0 && ` · DP awal ${formatRupiah(t.initial_paid)}`}
+                        {t.debt_payments_total > 0 && ` · Pelunasan ${formatRupiah(t.debt_payments_total)}`}
                         {t.debt_amount > 0 && ` · Sisa bon ${formatRupiah(t.debt_amount)}`}
-                        {(t.total || 0) !== cashCollected(t) && ` · Total belanja ${formatRupiah(t.total)}`}
+                        {(t.total || 0) !== cashCollected(t) && ` · Nilai struk ${formatRupiah(t.total)}`}
                       </div>
                     </div>
                     <div className="text-right shrink-0">
                       <div className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(cashCollected(t))}</div>
+                      <div className="text-[10px] text-gray-500">uang masuk</div>
                       {(t.total || 0) !== cashCollected(t) && <div className="text-[10px] text-gray-500">dari {formatRupiah(t.total)}</div>}
                     </div>
                   </div>
@@ -256,7 +261,7 @@ export default function Keuangan() {
           <div className="divide-y divide-gray-100">
             {debts.length === 0 ? <div className="text-center py-10 text-gray-400 text-sm">Tidak ada bon</div> :
               debts.map((d) => {
-                const remaining = d.amount - (d.paid || 0);
+                const remaining = debtRemaining(d);
                 const isPaid = d.status === "paid";
                 const statusColor = isPaid ? "bg-emerald-100 text-emerald-700 border-emerald-200" : d.status === "partial" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-red-100 text-red-700 border-red-200";
                 const statusLabel = isPaid ? "LUNAS" : d.status === "partial" ? "SEBAGIAN" : "BELUM BAYAR";
@@ -275,7 +280,7 @@ export default function Keuangan() {
                       </div>
                     </div>
                     <div className="text-right shrink-0">
-                      <div className={`font-mono font-semibold ${isPaid ? "text-emerald-600 line-through opacity-60" : "text-[#f4a228]"}`}>{formatRupiah(remaining)}</div>
+                      <div className={`font-mono font-semibold ${isPaid ? "text-emerald-600" : "text-[#f4a228]"}`}>{isPaid ? "Lunas" : formatRupiah(remaining)}</div>
                       {!isPaid && (
                         <div className="flex gap-2 justify-end mt-0.5">
                           <button data-testid={`pay-debt-${d.id}`} onClick={() => payDebt(d.id)} className="text-xs text-[#1a6b3c] font-medium hover:underline">Bayar</button>

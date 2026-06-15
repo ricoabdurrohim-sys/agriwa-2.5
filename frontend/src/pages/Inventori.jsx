@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useMemo } from "react";
 import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { exportInventoryXLSX, exportInventoryPDF } from "@/lib/exports";
 import ImageUpload, { resolveImageUrl } from "@/components/ImageUpload";
 import { Button } from "@/components/ui/button";
@@ -148,7 +147,6 @@ export default function Inventori() {
           <p className="text-sm text-gray-500 mt-0.5">{items.length} barang · {lowCount} stok menipis</p>
         </div>
         <div className="flex items-center gap-2">
-          <ResetModuleButton module="inventori" label="Inventori" />
           <Button data-testid="add-inventory-btn" onClick={openNew} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Barang Baru
           </Button>

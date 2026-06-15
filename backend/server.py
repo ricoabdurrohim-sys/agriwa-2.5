@@ -1152,6 +1152,8 @@ def _normalize_debt_for_response(d: dict) -> dict:
 
     if out.get("original_total") is not None:
         out["remaining"] = max(0, raw_amount - raw_paid)
+        out["payment_due"] = out["remaining"]
+        out["settlement_due"] = out["remaining"]
         out["original_total"] = int(out.get("original_total") or raw_amount)
         out["initial_paid"] = int(out.get("initial_paid") or 0)
         return out
@@ -1164,11 +1166,15 @@ def _normalize_debt_for_response(d: dict) -> dict:
         out["amount"] = remaining
         out["paid"] = 0 if out.get("status") != "paid" else remaining
         out["remaining"] = 0 if out.get("status") == "paid" else remaining
+        out["payment_due"] = out["remaining"]
+        out["settlement_due"] = out["remaining"]
         return out
 
     out["original_total"] = int(out.get("original_total") or raw_amount)
     out["initial_paid"] = int(out.get("initial_paid") or 0)
     out["remaining"] = max(0, raw_amount - raw_paid)
+    out["payment_due"] = out["remaining"]
+    out["settlement_due"] = out["remaining"]
     return out
 
 
@@ -1246,6 +1252,8 @@ async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_curre
                     "settled_at": now_iso() if trx_debt == 0 else trx.get("settled_at"),
                     "last_debt_payment_at": now_iso(),
                     "last_debt_payment_amount": pay_amount,
+                    "initial_cash_received": int(trx.get("initial_cash_received", trx.get("cash_received", 0)) or 0),
+                    "cash_collected": trx_paid,
                 }, "$unset": {"cancel_reason": "", "cancelled_at": "", "cancelled_by": "", "replaced_by": ""}}
             )
     await write_audit(user, "update", "customer_debt", debt_id, {"amount": pay_amount, "status": status})
@@ -1313,6 +1321,8 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
                     "settled_at": now_iso() if trx_debt == 0 else trx.get("settled_at"),
                     "last_debt_payment_at": now_iso(),
                     "last_debt_payment_amount": remaining,
+                    "initial_cash_received": int(trx.get("initial_cash_received", trx.get("cash_received", 0)) or 0),
+                    "cash_collected": trx_paid,
                 }, "$unset": {"cancel_reason": "", "cancelled_at": "", "cancelled_by": "", "replaced_by": ""}}
             )
     await write_audit(user, "update", "customer_debt", debt_id, {"status": "paid", "full": True})
@@ -1394,7 +1404,7 @@ async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends
     if original_trx:
         new_paid = min(original_total, previous_paid + payment_amount)
         new_debt = max(0, original_total - new_paid)
-        inc_cash = cash_received if payment_method == "cash" else 0
+        original_cash_received = int(original_trx.get("initial_cash_received", original_trx.get("cash_received", 0)) or 0)
         await db.transactions.update_one(
             {"id": original_trx["id"]},
             {
@@ -1408,7 +1418,9 @@ async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends
                     "last_debt_payment_at": now_iso(),
                     "last_debt_payment_amount": payment_amount,
                     "last_debt_payment_method": payment_method,
-                    "cash_received": int(original_trx.get("cash_received") or 0) + inc_cash,
+                    "initial_cash_received": original_cash_received,
+                    "cash_collected": new_paid,
+                    # Jangan overwrite cash_received transaksi awal: itu harus tetap merepresentasikan DP/uang pertama di struk asli.
                 },
                 "$unset": {"cancel_reason": "", "cancelled_at": "", "cancelled_by": "", "replaced_by": ""},
             }
@@ -1968,7 +1980,7 @@ def _is_financial_sale_transaction(t: dict) -> bool:
         return False
     if _is_debt_settlement_document(t):
         return False
-    if t.get("cancelled"):
+    if t.get("cancelled") and t.get("cancel_reason") != "replaced_by_payment":
         return False
     return (t.get("transaction_type") or "SALE").upper() == "SALE"
 
@@ -2070,6 +2082,8 @@ def _enrich_transaction_financial_fields(t: dict, debt_ctx: Optional[dict] = Non
     debt = (debt_ctx.get("debt_by_trx") or {}).get(row.get("id"))
     collected = _canonical_cash_collected(row, debt_ctx)
     remaining = max(0, total - collected)
+    if row.get("cancel_reason") == "replaced_by_payment":
+        row["cancelled"] = False
     row["paid_amount"] = collected
     row["cash_collected"] = collected
     row["debt_amount"] = remaining
@@ -2730,6 +2744,8 @@ async def startup():
     await db.audit_logs.create_index("timestamp")
     await db.debt_payments.create_index([("transaction_id", 1), ("created_at", -1)])
     await db.debt_payments.create_index([("debt_id", 1), ("created_at", -1)])
+    await db.employee_leaves.create_index([("employee_id", 1), ("date_from", -1)])
+    await db.opname_sessions.create_index([("status", 1), ("created_at", -1)])
     # Repair data yang sempat dibuat versi lama: pelunasan bon jangan menjadi revenue baru Rp11.000.
     try:
         repaired = await _repair_legacy_bon_settlement_transactions()
@@ -3580,6 +3596,10 @@ class EmployeeIn(BaseModel):
     overtime_rate: int = 0
     bank_account: Optional[str] = ""
     phone: Optional[str] = ""
+    department: Optional[str] = ""
+    employment_status: Optional[str] = "tetap"  # tetap/kontrak/harian/magang
+    emergency_contact: Optional[str] = ""
+    leave_quota: int = 12
     start_date: Optional[str] = None
     active: bool = True
 
@@ -3607,6 +3627,84 @@ async def update_employee(emp_id: str, body: dict, user: dict = Depends(get_curr
 @api.delete("/employees/{emp_id}")
 async def delete_employee(emp_id: str, user: dict = Depends(get_current_user)):
     await db.employees.delete_one({"id": emp_id})
+    return {"ok": True}
+
+
+@api.get("/hr/summary")
+async def hr_summary(user: dict = Depends(get_current_user), month: Optional[int] = None, year: Optional[int] = None):
+    now = datetime.now(timezone.utc)
+    month = month or now.month
+    year = year or now.year
+    prefix = f"{year}-{month:02d}"
+    employees = await db.employees.find({}, {"_id": 0}).to_list(2000)
+    attendance = await db.attendance.find({"date": {"$regex": f"^{prefix}"}}, {"_id": 0}).to_list(5000)
+    payroll = await db.payroll.find({"month": month, "year": year}, {"_id": 0}).to_list(2000)
+    leaves = await db.employee_leaves.find({"date_from": {"$regex": f"^{year}"}}, {"_id": 0}).to_list(2000)
+    active = [e for e in employees if e.get("active", True)]
+    today = now.date().isoformat()
+    today_att = [a for a in attendance if a.get("date") == today]
+    checked_in = len([a for a in today_att if a.get("check_in") and not a.get("check_out")])
+    payroll_total = sum(_money(p.get("net_salary")) for p in payroll)
+    payroll_paid = sum(_money(p.get("paid_amount") or p.get("net_salary")) for p in payroll if p.get("paid"))
+    return {
+        "employees_total": len(employees),
+        "employees_active": len(active),
+        "checked_in_today": checked_in,
+        "attendance_records": len(attendance),
+        "payroll_total": payroll_total,
+        "payroll_paid": payroll_paid,
+        "payroll_unpaid": max(0, payroll_total - payroll_paid),
+        "leaves_pending": len([l for l in leaves if l.get("status") == "pending"]),
+    }
+
+
+class LeaveIn(BaseModel):
+    employee_id: str
+    date_from: str
+    date_to: str
+    leave_type: str = "izin"
+    reason: Optional[str] = ""
+
+
+@api.get("/employee-leaves")
+async def list_employee_leaves(user: dict = Depends(get_current_user), year: Optional[int] = None):
+    q = {}
+    if year:
+        q["date_from"] = {"$regex": f"^{year}"}
+    rows = await db.employee_leaves.find(q, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    emp_map = {e["id"]: e for e in await db.employees.find({}, {"_id": 0}).to_list(2000)}
+    for r in rows:
+        e = emp_map.get(r.get("employee_id"), {})
+        r["employee_name"] = e.get("name", r.get("employee_id"))
+    return rows
+
+
+@api.post("/employee-leaves")
+async def create_employee_leave(body: LeaveIn, user: dict = Depends(get_current_user)):
+    emp = await db.employees.find_one({"id": body.employee_id}, {"_id": 0})
+    if not emp:
+        raise HTTPException(404, "Karyawan tidak ditemukan")
+    doc = body.model_dump()
+    doc.update({
+        "id": gen_id(),
+        "employee_name": emp.get("name"),
+        "status": "pending",
+        "created_by": user["id"],
+        "created_at": now_iso(),
+    })
+    await db.employee_leaves.insert_one(doc)
+    doc.pop("_id", None)
+    await write_audit(user, "create", "employee_leave", doc["id"], {"employee": emp.get("name"), "type": doc["leave_type"]})
+    return doc
+
+
+@api.put("/employee-leaves/{leave_id}/status")
+async def update_employee_leave_status(leave_id: str, body: dict, user: dict = Depends(require_roles("super_admin", "manager"))):
+    status = body.get("status")
+    if status not in ("approved", "rejected", "pending"):
+        raise HTTPException(400, "Status tidak valid")
+    await db.employee_leaves.update_one({"id": leave_id}, {"$set": {"status": status, "reviewed_by": user["id"], "reviewed_at": now_iso()}})
+    await write_audit(user, "update", "employee_leave", leave_id, {"status": status})
     return {"ok": True}
 
 
@@ -4936,6 +5034,10 @@ async def audit_log_detail(log_id: str, user: dict = Depends(get_current_user)):
         "vineyard_input_usage": "vineyard_input_usages",
         "table": "tables",
         "user": "users",
+        "employee": "employees",
+        "employee_leave": "employee_leaves",
+        "payroll": "payroll",
+        "opname_session": "opname_sessions",
     }
     coll = collections.get(entity_type)
     if coll and entity_id:

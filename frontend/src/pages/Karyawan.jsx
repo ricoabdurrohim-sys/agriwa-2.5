@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { Plus, UserCircle, Clock, CheckCircle2, Trash2, Edit2, FileText, Wallet, RotateCcw } from "lucide-react";
+import { Plus, UserCircle, Clock, CheckCircle2, Trash2, Edit2, FileText, Wallet, RotateCcw, CalendarDays, Info, BriefcaseBusiness } from "lucide-react";
 import api, { formatRupiah, formatDate, formatDateTime } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,17 +13,21 @@ import { toast } from "sonner";
 const initEmp = {
   name: "", nik: "", role: "", unit: "warung",
   salary_type: "monthly", base_salary: 0, overtime_rate: 0,
-  bank_account: "", phone: "", active: true,
+  bank_account: "", phone: "", department: "", employment_status: "tetap", emergency_contact: "", leave_quota: 12, active: true,
 };
 
 export default function Karyawan() {
   const [employees, setEmployees] = useState([]);
   const [attendance, setAttendance] = useState([]);
   const [payroll, setPayroll] = useState([]);
+  const [leaves, setLeaves] = useState([]);
+  const [summary, setSummary] = useState(null);
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(initEmp);
   const [payTarget, setPayTarget] = useState(null);
+  const [showLeave, setShowLeave] = useState(false);
+  const [leaveForm, setLeaveForm] = useState({ employee_id: "", date_from: "", date_to: "", leave_type: "izin", reason: "" });
   const [payForm, setPayForm] = useState({ amount: 0, payment_method: "cash", notes: "" });
   const [bizUnits, setBizUnits] = useState([]);
   const now = new Date();
@@ -32,12 +35,14 @@ export default function Karyawan() {
   const [year, setYear] = useState(now.getFullYear());
 
   const load = async () => {
-    const [e, a, p] = await Promise.all([
+    const [e, a, p, l, h] = await Promise.all([
       api.get("/employees"),
       api.get(`/attendance?month=${month}&year=${year}`),
       api.get(`/payroll?month=${month}&year=${year}`),
+      api.get(`/employee-leaves?year=${year}`),
+      api.get(`/hr/summary?month=${month}&year=${year}`),
     ]);
-    setEmployees(e.data); setAttendance(a.data); setPayroll(p.data);
+    setEmployees(e.data); setAttendance(a.data); setPayroll(p.data); setLeaves(l.data); setSummary(h.data);
   };
   useEffect(() => { load(); }, [month, year]);
   useEffect(() => {
@@ -109,6 +114,25 @@ export default function Karyawan() {
     } catch (e) { toast.error(e?.response?.data?.detail || "Gagal"); }
   };
 
+  const saveLeave = async () => {
+    if (!leaveForm.employee_id || !leaveForm.date_from || !leaveForm.date_to) return toast.error("Lengkapi karyawan dan tanggal cuti/izin");
+    try {
+      await api.post("/employee-leaves", leaveForm);
+      setShowLeave(false);
+      setLeaveForm({ employee_id: "", date_from: "", date_to: "", leave_type: "izin", reason: "" });
+      load();
+      toast.success("Cuti/izin dicatat");
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal menyimpan cuti"); }
+  };
+
+  const updateLeaveStatus = async (id, status) => {
+    try {
+      await api.put(`/employee-leaves/${id}/status`, { status });
+      load();
+      toast.success(status === "approved" ? "Cuti disetujui" : "Cuti ditolak");
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal update status"); }
+  };
+
   const today = new Date().toISOString().slice(0, 10);
   const todayAttendance = attendance.filter((a) => a.date === today);
   const isCheckedIn = (emp_id) => todayAttendance.find((a) => a.employee_id === emp_id && !a.check_out);
@@ -131,11 +155,22 @@ export default function Karyawan() {
             </SelectContent>
           </Select>
           <Input type="number" value={year} onChange={(e) => setYear(parseInt(e.target.value))} className="w-24 font-mono" />
-          <ResetModuleButton module="karyawan" label="Karyawan" />
           <Button data-testid="add-employee-btn" onClick={() => { setEditing(null); setForm(initEmp); setShowForm(true); }} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Karyawan
           </Button>
         </div>
+      </div>
+
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="bg-white rounded-xl border border-gray-100 p-4"><div className="text-xs text-gray-500 uppercase font-semibold">Karyawan Aktif</div><div className="text-2xl font-bold text-[#1a6b3c]">{summary?.employees_active ?? employees.filter(e => e.active).length}</div></div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4"><div className="text-xs text-gray-500 uppercase font-semibold">Sedang Check-in</div><div className="text-2xl font-bold text-blue-700">{summary?.checked_in_today ?? todayAttendance.length}</div></div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4"><div className="text-xs text-gray-500 uppercase font-semibold">Gaji Belum Dibayar</div><div className="text-2xl font-bold text-amber-700">{formatRupiah(summary?.payroll_unpaid ?? payroll.filter(p=>!p.paid).reduce((a,p)=>a+(p.net_salary||0),0))}</div></div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4"><div className="text-xs text-gray-500 uppercase font-semibold">Cuti/Izin Pending</div><div className="text-2xl font-bold text-purple-700">{summary?.leaves_pending ?? leaves.filter(l=>l.status==='pending').length}</div></div>
+      </div>
+
+      <div className="bg-blue-50 border border-blue-100 text-blue-800 rounded-xl p-3 text-xs flex gap-2">
+        <Info className="w-4 h-4 shrink-0 mt-0.5" />
+        <div>HR mengikuti pola ERP ringan: data karyawan → absensi → payroll → pengeluaran otomatis. Cuti/izin dicatat agar riwayat SDM tidak bercampur dengan catatan kasir.</div>
       </div>
 
       <Tabs defaultValue="emp" className="bg-white rounded-xl border border-gray-100">
@@ -143,6 +178,7 @@ export default function Karyawan() {
           <TabsTrigger value="emp" data-testid="tab-employees">Daftar Karyawan</TabsTrigger>
           <TabsTrigger value="att" data-testid="tab-attendance">Absensi Hari Ini</TabsTrigger>
           <TabsTrigger value="pay" data-testid="tab-payroll">Penggajian</TabsTrigger>
+          <TabsTrigger value="leave" data-testid="tab-leave">Cuti/Izin</TabsTrigger>
         </TabsList>
 
         <TabsContent value="emp" className="p-2">
@@ -249,6 +285,29 @@ export default function Karyawan() {
             </div>
           )}
         </TabsContent>
+
+        <TabsContent value="leave" className="p-4 space-y-3">
+          <div className="flex justify-between items-center gap-3 flex-wrap">
+            <div className="text-sm text-gray-600">Catat cuti, izin, sakit, atau libur khusus. Status bisa disetujui/ditolak oleh manager/super admin.</div>
+            <Button data-testid="add-leave-btn" onClick={() => setShowLeave(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><CalendarDays className="w-4 h-4 mr-1.5" /> Cuti/Izin</Button>
+          </div>
+          <div className="divide-y divide-gray-100 border border-gray-100 rounded-lg">
+            {leaves.length === 0 ? <div className="py-10 text-center text-gray-400 text-sm">Belum ada cuti/izin</div> : leaves.map((l) => (
+              <div key={l.id} className="p-3 flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-purple-50"><CalendarDays className="w-4 h-4 text-purple-700" /></div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-sm">{l.employee_name}</div>
+                  <div className="text-xs text-gray-500">{l.leave_type} · {l.date_from} s/d {l.date_to}{l.reason && ` · ${l.reason}`}</div>
+                </div>
+                <Badge className={l.status === "approved" ? "bg-emerald-100 text-emerald-700" : l.status === "rejected" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}>{l.status}</Badge>
+                {l.status === "pending" && <div className="flex gap-1">
+                  <Button size="sm" variant="outline" onClick={() => updateLeaveStatus(l.id, "approved")}>Setujui</Button>
+                  <Button size="sm" variant="outline" onClick={() => updateLeaveStatus(l.id, "rejected")}>Tolak</Button>
+                </div>}
+              </div>
+            ))}
+          </div>
+        </TabsContent>
       </Tabs>
 
       <Dialog open={showForm} onOpenChange={setShowForm}>
@@ -259,6 +318,7 @@ export default function Karyawan() {
             <div><Label>NIK / ID</Label><Input value={form.nik} onChange={(e) => setForm({ ...form, nik: e.target.value })} /></div>
             <div><Label>No. HP</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
             <div><Label>Posisi/Jabatan</Label><Input data-testid="emp-role" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })} placeholder="Koki, Pelayan, Penjaga Kebun" /></div>
+            <div><Label>Departemen</Label><Input value={form.department || ""} onChange={(e) => setForm({ ...form, department: e.target.value })} placeholder="Operasional, Kebun, Gudang" /></div>
             <div>
               <Label>Unit</Label>
               <Select value={form.unit} onValueChange={(v) => setForm({ ...form, unit: v })}>
@@ -281,7 +341,21 @@ export default function Karyawan() {
             </div>
             <div><Label>Gaji Pokok (Rp)</Label><Input data-testid="emp-salary" type="number" value={form.base_salary || ""} onChange={(e) => setForm({ ...form, base_salary: parseInt(e.target.value) || 0 })} /></div>
             <div><Label>Tarif Lembur/jam</Label><Input type="number" value={form.overtime_rate || ""} onChange={(e) => setForm({ ...form, overtime_rate: parseInt(e.target.value) || 0 })} /></div>
+            <div>
+              <Label>Status Kerja</Label>
+              <Select value={form.employment_status || "tetap"} onValueChange={(v) => setForm({ ...form, employment_status: v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="tetap">Tetap</SelectItem>
+                  <SelectItem value="kontrak">Kontrak</SelectItem>
+                  <SelectItem value="harian">Harian</SelectItem>
+                  <SelectItem value="magang">Magang</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div><Label>Kuota Cuti/Tahun</Label><Input type="number" value={form.leave_quota || ""} onChange={(e) => setForm({ ...form, leave_quota: parseInt(e.target.value) || 0 })} /></div>
             <div className="col-span-2"><Label>Rekening Bank</Label><Input value={form.bank_account} onChange={(e) => setForm({ ...form, bank_account: e.target.value })} placeholder="BCA 1234567890" /></div>
+            <div className="col-span-2"><Label>Kontak Darurat</Label><Input value={form.emergency_contact || ""} onChange={(e) => setForm({ ...form, emergency_contact: e.target.value })} placeholder="Nama/No HP keluarga" /></div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowForm(false)}>Batal</Button>
@@ -336,6 +410,42 @@ export default function Karyawan() {
             <Button data-testid="confirm-pay-btn" onClick={confirmPay} className="bg-[#1a6b3c] hover:bg-[#14522d]">
               <Wallet className="w-4 h-4 mr-1.5" /> Bayar Sekarang
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showLeave} onOpenChange={setShowLeave}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle className="flex items-center gap-2"><CalendarDays className="w-5 h-5 text-[#1a6b3c]" /> Catat Cuti/Izin</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label>Karyawan</Label>
+              <Select value={leaveForm.employee_id} onValueChange={(v) => setLeaveForm({ ...leaveForm, employee_id: v })}>
+                <SelectTrigger><SelectValue placeholder="Pilih karyawan" /></SelectTrigger>
+                <SelectContent>{employees.filter(e => e.active).map(e => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div><Label>Dari</Label><Input type="date" value={leaveForm.date_from} onChange={(e) => setLeaveForm({ ...leaveForm, date_from: e.target.value })} /></div>
+              <div><Label>Sampai</Label><Input type="date" value={leaveForm.date_to} onChange={(e) => setLeaveForm({ ...leaveForm, date_to: e.target.value })} /></div>
+            </div>
+            <div>
+              <Label>Jenis</Label>
+              <Select value={leaveForm.leave_type} onValueChange={(v) => setLeaveForm({ ...leaveForm, leave_type: v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="izin">Izin</SelectItem>
+                  <SelectItem value="sakit">Sakit</SelectItem>
+                  <SelectItem value="cuti">Cuti Tahunan</SelectItem>
+                  <SelectItem value="libur_khusus">Libur Khusus</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div><Label>Alasan</Label><Input value={leaveForm.reason} onChange={(e) => setLeaveForm({ ...leaveForm, reason: e.target.value })} /></div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowLeave(false)}>Batal</Button>
+            <Button onClick={saveLeave} className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

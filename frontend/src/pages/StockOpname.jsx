@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { ClipboardCheck, Plus, Save, CheckCircle2, AlertTriangle, FileSpreadsheet } from "lucide-react";
+import { ClipboardCheck, Plus, Save, CheckCircle2, AlertTriangle, FileSpreadsheet, Info, Search } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,8 @@ export default function StockOpname() {
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [counts, setCounts] = useState({});
+  const [q, setQ] = useState("");
+  const [onlyDiff, setOnlyDiff] = useState(false);
 
   const load = async () => {
     const { data } = await api.get("/opname/sessions");
@@ -75,8 +77,35 @@ export default function StockOpname() {
     a.click();
   };
 
+  const fillMissingWithSystem = () => {
+    if (!active) return;
+    const next = { ...counts };
+    active.items.forEach((it) => { if (next[it.item_id] === undefined || next[it.item_id] === "") next[it.item_id] = it.system_qty; });
+    setCounts(next);
+    toast.info("Item kosong diisi dengan stok sistem. Tetap klik Simpan/Finalisasi untuk menerapkan.");
+  };
+
+  const clearEmptyToZero = () => {
+    if (!active || !window.confirm("Isi item yang belum dihitung menjadi 0? Ini hanya draft sampai Anda klik Simpan/Finalisasi.")) return;
+    const next = { ...counts };
+    active.items.forEach((it) => { if (next[it.item_id] === undefined || next[it.item_id] === "") next[it.item_id] = 0; });
+    setCounts(next);
+  };
+
   if (active) {
     const isDraft = active.status === "draft";
+    const filteredItems = active.items.filter((it) => {
+      const physical = counts[it.item_id] ?? it.physical_qty ?? "";
+      const diff = physical !== "" ? Number(physical) - it.system_qty : null;
+      const matches = !q || it.name.toLowerCase().includes(q.toLowerCase());
+      return matches && (!onlyDiff || (diff !== null && diff !== 0));
+    });
+    const countedCount = active.items.filter((it) => (counts[it.item_id] ?? it.physical_qty ?? "") !== "").length;
+    const varianceValue = active.items.reduce((sum, it) => {
+      const physical = counts[it.item_id] ?? it.physical_qty ?? "";
+      if (physical === "") return sum;
+      return sum + ((Number(physical) - it.system_qty) * (it.cost_price || 0));
+    }, 0);
     return (
       <div className="space-y-4 fade-in">
         <div className="flex items-end justify-between flex-wrap gap-3">
@@ -94,6 +123,19 @@ export default function StockOpname() {
           </div>
         </div>
 
+        <div className="grid sm:grid-cols-3 gap-3">
+          <div className="bg-white border border-gray-100 rounded-xl p-3"><div className="text-xs text-gray-500 uppercase font-semibold">Progress Hitung</div><div className="text-xl font-bold text-[#1a6b3c]">{countedCount}/{active.items.length}</div></div>
+          <div className="bg-white border border-gray-100 rounded-xl p-3"><div className="text-xs text-gray-500 uppercase font-semibold">Estimasi Selisih Nilai</div><div className={`text-xl font-bold ${varianceValue < 0 ? "text-red-600" : "text-emerald-700"}`}>{formatRupiah(varianceValue)}</div></div>
+          <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-800 flex gap-2"><Info className="w-4 h-4 shrink-0 mt-0.5" /> Opname mengikuti konsep ERP: hitung fisik dulu, simpan draft, baru finalisasi untuk membuat stock movement penyesuaian.</div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-gray-100 p-3 flex flex-wrap gap-2 items-center">
+          <div className="relative flex-1 min-w-[200px]"><Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" /><Input value={q} onChange={(e)=>setQ(e.target.value)} placeholder="Cari item opname" className="pl-9" /></div>
+          <Button variant="outline" onClick={() => setOnlyDiff(v => !v)}>{onlyDiff ? "Tampilkan Semua" : "Hanya Selisih"}</Button>
+          {isDraft && <Button variant="outline" onClick={fillMissingWithSystem}>Isi Kosong = Sistem</Button>}
+          {isDraft && <Button variant="outline" onClick={clearEmptyToZero}>Kosong = 0</Button>}
+        </div>
+
         <div className="bg-white rounded-xl border border-gray-100 overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-xs uppercase text-gray-600">
@@ -106,7 +148,7 @@ export default function StockOpname() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {active.items.map((it) => {
+              {filteredItems.map((it) => {
                 const physical = counts[it.item_id] ?? it.physical_qty ?? "";
                 const diff = physical !== "" ? Number(physical) - it.system_qty : null;
                 return (
@@ -146,6 +188,11 @@ export default function StockOpname() {
         <Button data-testid="start-opname-btn" onClick={() => setShow(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]">
           <Plus className="w-4 h-4 mr-1.5" /> Sesi Baru
         </Button>
+      </div>
+
+      <div className="bg-blue-50 border border-blue-100 text-blue-800 rounded-xl p-3 text-xs flex gap-2">
+        <Info className="w-4 h-4 shrink-0 mt-0.5" />
+        <div>Gunakan stock opname untuk mencocokkan stok sistem dengan hitungan fisik gudang. Selisih akan otomatis masuk kartu stok saat sesi difinalisasi.</div>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100">

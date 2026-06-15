@@ -206,74 +206,11 @@ export default function Pengaturan() {
         )}
       </div>
 
-      {/* Reset Data — Super Admin only */}
-      {false && isSuperAdmin && (
-        <div className="bg-red-50 border-2 border-red-200 rounded-xl p-5 space-y-3">
-          <h2 className="font-semibold text-red-900 flex items-center gap-2"><ShieldAlert className="w-5 h-5" /> Zona Berbahaya</h2>
-          <p className="text-sm text-red-800">
-            Hapus seluruh <strong>data demo</strong> (transaksi, pesanan, PO, pembelian, pemasukan/pengeluaran,
-            inventori, BOM, karyawan, member, dll) agar Anda bisa mulai dari nol dengan data bisnis Anda sendiri.
-          </p>
-          <p className="text-xs text-red-700">
-            ✅ Yang dipertahankan: akun pengguna, pengaturan, template WA, (opsional) unit bisnis &amp; cabang &amp; profil bisnis.
-          </p>
-          <Button data-testid="open-reset-data-btn" onClick={() => setShowReset(true)} variant="outline" className="border-red-300 text-red-700 hover:bg-red-100">
-            <Trash2 className="w-4 h-4 mr-1.5" /> Reset Data Demo
-          </Button>
-        </div>
-      )}
-
       <div className="bg-white rounded-xl border border-gray-100 p-5 space-y-2">
         <h2 className="font-semibold text-gray-900">Tentang Aplikasi</h2>
         <p className="text-sm text-gray-600">AgriWarung Manager v1.1 — platform manajemen multi-bisnis untuk grup agribisnis.</p>
       </div>
 
-      {/* Reset confirmation dialog */}
-      <Dialog open={showReset} onOpenChange={(o) => { setShowReset(o); if (!o) setResetConfirm(""); }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-red-700"><AlertTriangle className="w-5 h-5" /> Reset Data Demo</DialogTitle>
-            <DialogDescription>
-              Tindakan ini <strong>tidak bisa dibatalkan</strong>. Seluruh data transaksi dan inventori akan hilang.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="rounded-lg border border-gray-200 p-3 space-y-2 text-sm">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium">Pertahankan Unit Bisnis</div>
-                  <div className="text-xs text-gray-500">Warung, Anggur, Pupuk, dll</div>
-                </div>
-                <Switch checked={resetOpts.keep_business_units} onCheckedChange={(c) => setResetOpts({ ...resetOpts, keep_business_units: c })} />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium">Pertahankan Cabang</div>
-                  <div className="text-xs text-gray-500">Daftar cabang yang sudah Anda input</div>
-                </div>
-                <Switch checked={resetOpts.keep_branches} onCheckedChange={(c) => setResetOpts({ ...resetOpts, keep_branches: c })} />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium">Pertahankan Profil Bisnis</div>
-                  <div className="text-xs text-gray-500">Nama, alamat, logo</div>
-                </div>
-                <Switch checked={resetOpts.keep_business_profile} onCheckedChange={(c) => setResetOpts({ ...resetOpts, keep_business_profile: c })} />
-              </div>
-            </div>
-            <div>
-              <Label>Ketik <code className="bg-red-100 text-red-700 px-1.5 py-0.5 rounded">RESET</code> untuk konfirmasi</Label>
-              <Input data-testid="reset-confirm-input" value={resetConfirm} onChange={(e) => setResetConfirm(e.target.value)} placeholder="RESET" />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowReset(false)}>Batal</Button>
-            <Button data-testid="confirm-reset-data-btn" disabled={resetConfirm !== "RESET" || resetting} onClick={doReset} className="bg-red-600 hover:bg-red-700">
-              {resetting ? "Menghapus..." : "Hapus Semua Data"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

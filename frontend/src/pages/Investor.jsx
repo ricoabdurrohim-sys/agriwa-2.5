@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Plus, HandCoins, TrendingUp, Users, Briefcase } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -76,7 +75,6 @@ export default function Investor() {
           <p className="text-sm text-gray-500 mt-0.5">Kelola investor, modal disetor, dan dividen</p>
         </div>
         <div className="flex gap-2">
-          <ResetModuleButton module="investor" label="Investor" />
           <Button variant="outline" data-testid="add-investor-btn" onClick={() => setShowInvForm(true)}>
             <Users className="w-4 h-4 mr-1.5" /> Investor
           </Button>

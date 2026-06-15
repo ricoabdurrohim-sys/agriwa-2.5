@@ -3,7 +3,6 @@ import { useNavigate } from "react-router-dom";
 import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone, Edit2 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
 import api, { formatRupiah } from "@/lib/api";
-import ResetModuleButton from "@/components/ResetModuleButton";
 import { printViaIframe } from "@/lib/safePrint";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -233,7 +232,6 @@ export default function Warung() {
           <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · refresh otomatis tiap 8 detik</p>
         </div>
         <div className="flex gap-2">
-          <ResetModuleButton module="warung" label="Warung" />
           <Button data-testid="add-table-btn" onClick={() => setShowAdd(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Meja Baru
           </Button>
