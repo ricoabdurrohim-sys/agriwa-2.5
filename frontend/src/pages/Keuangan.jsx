@@ -113,7 +113,7 @@ export default function Keuangan() {
   const isFinancialSale = (t) => {
     if (!t) return false;
     if (t.financial_exclude || t.receipt_kind === "DEBT_SETTLEMENT" || t.settled_from_debt) return false;
-    if (t.cancelled) return false;
+    if (t.cancelled && !(t.legacy_bon_repaired || t.debt_id || t.finance_note)) return false;
     return String(t.transaction_type || "SALE").toUpperCase() === "SALE";
   };
   const debtRemaining = (d) => Math.max(0, Number(d.remaining ?? d.payment_due ?? ((d.amount || 0) - (d.paid || 0))) || 0);
@@ -123,7 +123,7 @@ export default function Keuangan() {
     const paid = Number(paidRaw || 0);
     return total > 0 ? Math.max(0, Math.min(total, paid)) : Math.max(0, paid);
   };
-  const validTrx = (finance?.pos_transactions || trx).filter(isFinancialSale);
+  const validTrx = (finance?.cashier_ledger || finance?.pos_transactions || trx).filter(isFinancialSale);
   // Sumber kebenaran dari backend /finance/summary agar Keuangan, Dashboard, dan Laporan tidak beda rumus.
   const totalKasir = finance?.total_pos_income ?? validTrx.reduce((s, t) => s + cashCollected(t), 0);
   const totalNet = totalKasir + totalIncome - totalExpense;
@@ -207,7 +207,7 @@ export default function Keuangan() {
                         {formatDate(t.created_at)} · {t.unit}{t.customer_name && ` · ${t.customer_name}`}
                         {t.initial_paid > 0 && ` · DP awal ${formatRupiah(t.initial_paid)}`}
                         {t.debt_payments_total > 0 && ` · Pelunasan ${formatRupiah(t.debt_payments_total)}`}
-                        {t.debt_amount > 0 && ` · Sisa bon ${formatRupiah(t.debt_amount)}`}
+                        {t.debt_amount > 0 && ` · Sisa bon ${formatRupiah(t.debt_amount)}`}{t.finance_note && ` · ${t.finance_note}`}
                         {(t.total || 0) !== cashCollected(t) && ` · Nilai struk ${formatRupiah(t.total)}`}
                       </div>
                     </div>

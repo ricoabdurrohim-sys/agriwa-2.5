@@ -6,6 +6,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import os
+import re
 import asyncio
 import uuid
 import logging
@@ -131,17 +132,18 @@ def payment_account(payment_method: str) -> str:
 
 
 async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
-    settings = await db.settings.find_one({}, {"_id": 0}) or {}
+    # v2.5.7: struk harus mengikuti Lini Bisnis, bukan Pengaturan global.
+    # Pengaturan global tidak lagi dijadikan fallback alamat/telepon/footer agar struk antar unit tidak bentrok.
     unit = await db.business_units.find_one({"code": unit_code}, {"_id": 0}) or {}
-    name = (unit.get("receipt_name") or unit.get("name") or settings.get("business_name") or "AgriWarung").strip()
+    name = (unit.get("receipt_name") or unit.get("name") or "AgriWarung").strip()
     return {
         "unit": unit_code,
         "business_name": name,
-        "address": unit.get("receipt_address") or settings.get("address", ""),
-        "phone": unit.get("receipt_phone") or settings.get("phone", ""),
-        "footer": unit.get("receipt_footer") or settings.get("receipt_footer") or "Terima kasih! 🙏",
+        "address": unit.get("receipt_address") or "",
+        "phone": unit.get("receipt_phone") or "",
+        "footer": unit.get("receipt_footer") or "Terima kasih! 🙏",
         "note": unit.get("receipt_note") or "",
-        "logo_url": unit.get("receipt_logo") or settings.get("receipt_logo", ""),
+        "logo_url": unit.get("receipt_logo") or "",
     }
 
 
@@ -661,25 +663,121 @@ class InventoryIn(BaseModel):
     location: Optional[str] = ""
     notes: Optional[str] = ""
     image_url: Optional[str] = ""
+    supplier_name: Optional[str] = ""
+    batch_no: Optional[str] = ""
+    purchase_ref: Optional[str] = ""
+    purchase_url: Optional[str] = ""
+    expiry_date: Optional[str] = ""
+
+
+def _inventory_name_key(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+async def _record_inventory_batch(item: dict, qty: float, body: dict, source: str = "manual"):
+    if qty == 0:
+        return None
+    batch = {
+        "id": gen_id(),
+        "item_id": item.get("id"),
+        "item_name": item.get("name"),
+        "quantity": float(qty),
+        "unit": item.get("unit", body.get("unit", "pcs")),
+        "supplier_name": body.get("supplier_name") or "",
+        "batch_no": body.get("batch_no") or f"BATCH-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}",
+        "purchase_ref": body.get("purchase_ref") or "",
+        "purchase_url": body.get("purchase_url") or "",
+        "expiry_date": body.get("expiry_date") or "",
+        "notes": body.get("notes") or "",
+        "source": source,
+        "created_at": now_iso(),
+    }
+    await db.inventory_batches.insert_one(batch)
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": item.get("id"), "type": "stock_in_batch",
+        "quantity": float(qty), "qty_in": float(qty), "qty_out": 0,
+        "reason": f"Stok masuk {batch['batch_no']} dari {batch['supplier_name'] or 'manual'}",
+        "reference": "inventory_batch", "reference_id": batch["id"],
+        "supplier_name": batch["supplier_name"], "batch_no": batch["batch_no"],
+        "created_at": now_iso(),
+    })
+    return batch
 
 
 @api.get("/inventory")
 async def list_inventory(user: dict = Depends(get_current_user)):
-    return await list_collection("inventory_items")
+    items = await db.inventory_items.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    batches = await db.inventory_batches.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    by_item = {}
+    for b in batches:
+        by_item.setdefault(b.get("item_id"), []).append(b)
+    for item in items:
+        recent = by_item.get(item.get("id"), [])[:5]
+        item["recent_batches"] = recent
+        if recent:
+            item["last_supplier_name"] = recent[0].get("supplier_name", "")
+            item["last_batch_no"] = recent[0].get("batch_no", "")
+            item["last_stock_in_at"] = recent[0].get("created_at", "")
+    return items
 
 
 @api.post("/inventory")
 async def create_inventory(body: InventoryIn, user: dict = Depends(get_current_user)):
-    return await insert_doc("inventory_items", body.model_dump())
+    data = body.model_dump()
+    name_key = _inventory_name_key(data.get("name"))
+    # v2.5.7: jika nama+unit+unit bisnis sama, jangan bikin duplikat.
+    # Tambahkan stok ke item lama dan simpan batch/supplier agar bisa trace retur.
+    existing = await db.inventory_items.find_one({
+        "name_key": name_key,
+        "unit": data.get("unit", "pcs"),
+        "business_unit": data.get("business_unit", "warung"),
+    }, {"_id": 0})
+    if not existing:
+        existing = await db.inventory_items.find_one({
+            "name": {"$regex": f"^{re.escape(data.get('name','').strip())}$", "$options": "i"},
+            "unit": data.get("unit", "pcs"),
+            "business_unit": data.get("business_unit", "warung"),
+        }, {"_id": 0})
+    if existing:
+        qty = float(data.get("current_stock") or 0)
+        update = {
+            "category": data.get("category", existing.get("category")),
+            "min_stock": data.get("min_stock", existing.get("min_stock", 0)),
+            "cost_price": data.get("cost_price", existing.get("cost_price", 0)),
+            "sell_price": data.get("sell_price", existing.get("sell_price", 0)),
+            "location": data.get("location", existing.get("location", "")),
+            "notes": data.get("notes", existing.get("notes", "")),
+            "image_url": data.get("image_url", existing.get("image_url", "")),
+            "updated_at": now_iso(),
+            "name_key": name_key,
+        }
+        await db.inventory_items.update_one({"id": existing["id"]}, {"$set": update, "$inc": {"current_stock": qty}})
+        doc = await db.inventory_items.find_one({"id": existing["id"]}, {"_id": 0})
+        await _record_inventory_batch(doc, qty, data, source="merge_duplicate_item")
+        await write_audit(user, "update", "inventory", existing["id"], {"action": "merge_duplicate_stock", "qty": qty, "supplier": data.get("supplier_name")})
+        return {**doc, "merged_existing": True}
+    data["name_key"] = name_key
+    doc = await insert_doc("inventory_items", data)
+    await _record_inventory_batch(doc, float(data.get("current_stock") or 0), data, source="new_item")
+    await write_audit(user, "create", "inventory", doc["id"], {"name": doc.get("name"), "qty": doc.get("current_stock")})
+    return doc
 
 
 @api.put("/inventory/{item_id}")
 async def update_inventory(item_id: str, body: dict, user: dict = Depends(get_current_user)):
     body.pop("_id", None)
     body.pop("id", None)
+    if body.get("name"):
+        body["name_key"] = _inventory_name_key(body.get("name"))
+    body["updated_at"] = now_iso()
     await db.inventory_items.update_one({"id": item_id}, {"$set": body})
     doc = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
     return doc
+
+
+@api.get("/inventory/{item_id}/batches")
+async def list_inventory_batches(item_id: str, user: dict = Depends(get_current_user)):
+    return await db.inventory_batches.find({"item_id": item_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
 @api.delete("/inventory/{item_id}")
@@ -1975,14 +2073,22 @@ def _is_debt_settlement_document(t: dict) -> bool:
 
 
 def _is_financial_sale_transaction(t: dict) -> bool:
-    """True untuk transaksi penjualan asli yang boleh masuk pendapatan/kas."""
+    """True untuk transaksi penjualan asli yang boleh masuk pendapatan/kas.
+
+    Legacy fix: beberapa transaksi bon lama pernah ditandai cancelled saat dibuat
+    receipt pelunasan. Jika transaksi itu sudah/akan direpair sebagai transaksi asli
+    bon, tetap perlakukan sebagai sale supaya Kasir, Keuangan, Dashboard, dan
+    Laporan memakai baris yang sama.
+    """
     if not t:
         return False
     if _is_debt_settlement_document(t):
         return False
-    if t.get("cancelled") and t.get("cancel_reason") != "replaced_by_payment":
+    if (t.get("transaction_type") or "SALE").upper() != "SALE":
         return False
-    return (t.get("transaction_type") or "SALE").upper() == "SALE"
+    if t.get("cancelled") and not (t.get("legacy_bon_repaired") or t.get("debt_id") or t.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy")):
+        return False
+    return True
 
 
 async def _load_debt_financial_context() -> dict:
@@ -2042,12 +2148,14 @@ def _canonical_cash_collected(t: dict, debt_ctx: Optional[dict] = None) -> int:
     if not _is_financial_sale_transaction(t):
         return 0
     total = _money(t.get("total"))
-    if total <= 0:
-        return 0
     debt_ctx = debt_ctx or {}
     debt = (debt_ctx.get("debt_by_trx") or {}).get(t.get("id"))
+    if debt and debt.get("original_total") is not None:
+        total = max(total, _money(debt.get("original_total")))
+    if total <= 0:
+        return 0
     if debt:
-        initial_paid = _initial_paid_for_transaction(t, debt)
+        initial_paid = _initial_paid_for_transaction({**t, "total": total}, debt)
         payments_by_trx = debt_ctx.get("payments_by_trx") or {}
         payments_by_debt = debt_ctx.get("payments_by_debt") or {}
         payment_sum = sum(_money(p.get("amount")) for p in payments_by_trx.get(t.get("id"), []))
@@ -2080,10 +2188,15 @@ def _enrich_transaction_financial_fields(t: dict, debt_ctx: Optional[dict] = Non
     total = _money(row.get("total"))
     debt_ctx = debt_ctx or {}
     debt = (debt_ctx.get("debt_by_trx") or {}).get(row.get("id"))
-    collected = _canonical_cash_collected(row, debt_ctx)
+    if debt and debt.get("original_total") is not None:
+        total = max(total, _money(debt.get("original_total")))
+    collected = _canonical_cash_collected({**row, "total": total}, debt_ctx)
     remaining = max(0, total - collected)
-    if row.get("cancel_reason") == "replaced_by_payment":
+    if row.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy") or debt or row.get("legacy_bon_repaired"):
         row["cancelled"] = False
+        row.pop("cancel_reason", None)
+    row["total"] = total
+    row["transaction_total"] = total
     row["paid_amount"] = collected
     row["cash_collected"] = collected
     row["debt_amount"] = remaining
@@ -2231,6 +2344,10 @@ def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None)
 # ---------- Reports ----------
 @api.get("/reports/profit-loss")
 async def profit_loss(user: dict = Depends(get_current_user)):
+    try:
+        await _repair_legacy_bon_settlement_transactions()
+    except Exception:
+        pass
     transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
@@ -2433,6 +2550,11 @@ async def cash_balance(user: dict = Depends(get_current_user)):
 
 @api.get("/finance/summary")
 async def finance_summary(user: dict = Depends(get_current_user), limit: int = 500):
+    # Repair ringan tiap dibuka agar data bon lama tidak membuat menu saling beda.
+    try:
+        await _repair_legacy_bon_settlement_transactions()
+    except Exception:
+        pass
     """Ringkasan keuangan kanonis untuk halaman Keuangan.
 
     Endpoint ini menjadi sumber kebenaran yang sama untuk Keuangan, Dashboard,
@@ -2444,13 +2566,15 @@ async def finance_summary(user: dict = Depends(get_current_user), limit: int = 5
     transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     pos_transactions = []
     for t in transactions:
-        if not _is_financial_sale_transaction(t):
-            continue
         row = _enrich_transaction_financial_fields(t, debt_ctx)
+        if not _is_financial_sale_transaction(row):
+            continue
         # transaction_total = nilai struk asli; cash_collected = uang yang benar-benar sudah masuk
-        row["transaction_total"] = _money(row.get("total"))
+        row["transaction_total"] = _money(row.get("transaction_total") or row.get("total"))
         row["cash_collected"] = _canonical_cash_collected(row, debt_ctx)
         row["open_receivable"] = max(0, row["transaction_total"] - row["cash_collected"])
+        row["ledger_label"] = "Lunas" if row["open_receivable"] == 0 else ("Bon Sebagian" if row["cash_collected"] > 0 else "Bon")
+        row["finance_note"] = f"Struk {format_rp_short(row['transaction_total'])}; masuk {format_rp_short(row['cash_collected'])}; sisa {format_rp_short(row['open_receivable'])}"
         pos_transactions.append(row)
 
     expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
@@ -2481,6 +2605,7 @@ async def finance_summary(user: dict = Depends(get_current_user), limit: int = 5
         "by_unit": by_unit,
         "by_method": by_method,
         "pos_transactions": pos_transactions[: max(1, min(int(limit or 500), 2000))],
+        "cashier_ledger": pos_transactions[: max(1, min(int(limit or 500), 2000))],
         "incomes": incomes,
         "expenses": expenses,
         "debts": [_normalize_debt_for_response(d) for d in debts],
@@ -2488,6 +2613,10 @@ async def finance_summary(user: dict = Depends(get_current_user), limit: int = 5
 
 @api.get("/dashboard/summary")
 async def dashboard_summary(user: dict = Depends(get_current_user)):
+    try:
+        await _repair_legacy_bon_settlement_transactions()
+    except Exception:
+        pass
     today = datetime.now(timezone.utc).date().isoformat()
     transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
@@ -2740,6 +2869,8 @@ async def startup():
     await db.transactions.create_index([("unit", 1), ("created_at", -1)])
     await db.transactions.create_index("payment_status")
     await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
+    await db.inventory_items.create_index([("name_key", 1), ("unit", 1), ("business_unit", 1)])
+    await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
     await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
     await db.audit_logs.create_index("timestamp")
     await db.debt_payments.create_index([("transaction_id", 1), ("created_at", -1)])
@@ -2898,6 +3029,56 @@ class PlotIn(BaseModel):
     planted_count: Optional[int] = 0
     planted_date: Optional[str] = None
     notes: Optional[str] = ""
+    inventory_item_id: Optional[str] = ""
+    inventory_mode: Optional[str] = "auto"  # auto | existing | none
+    inventory_item_name: Optional[str] = ""
+
+
+async def _attach_plot_to_inventory(plot: dict, previous: Optional[dict] = None):
+    """Sambungkan jumlah tanaman plot ke inventory sebagai aset pohon/bibit.
+
+    Jika user memilih item inventori, jumlah pohon ditambahkan ke item itu. Jika belum
+    punya item, sistem membuat item baru otomatis. Saat edit, hanya selisih jumlah yang
+    disesuaikan agar stok tidak dobel.
+    """
+    mode = (plot.get("inventory_mode") or "auto").lower()
+    if mode == "none":
+        return plot
+    qty = int(float(plot.get("planted_count") or 0))
+    prev_qty = int(float((previous or {}).get("inventory_qty_recorded") or 0))
+    delta = qty - prev_qty if previous else qty
+    if qty <= 0 and not previous:
+        return plot
+
+    item = None
+    item_id = plot.get("inventory_item_id") or (previous or {}).get("inventory_item_id")
+    if item_id:
+        item = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
+    if not item:
+        name = (plot.get("inventory_item_name") or f"Tanaman Anggur - {plot.get('name') or plot.get('variety') or 'Plot'}").strip()
+        item = await db.inventory_items.find_one({"name_key": _inventory_name_key(name), "business_unit": "anggur"}, {"_id": 0})
+        if not item:
+            doc = {
+                "id": gen_id(), "name": name, "name_key": _inventory_name_key(name),
+                "category": "Tanaman Kebun", "unit": "pohon", "current_stock": 0, "min_stock": 0,
+                "cost_price": 0, "sell_price": 0, "business_unit": "anggur",
+                "location": plot.get("location") or "Kebun Anggur",
+                "notes": f"Dibuat otomatis dari plot {plot.get('name')}", "created_at": now_iso(),
+            }
+            await db.inventory_items.insert_one(doc)
+            item = doc
+    if delta != 0 and item:
+        await db.inventory_items.update_one({"id": item["id"]}, {"$inc": {"current_stock": delta}})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": item["id"], "type": "vineyard_plot_planted",
+            "quantity": delta, "qty_in": delta if delta > 0 else 0, "qty_out": abs(delta) if delta < 0 else 0,
+            "reason": f"Update jumlah tanaman plot {plot.get('name')}",
+            "reference": "vineyard_plot", "reference_id": plot.get("id"), "created_at": now_iso(),
+        })
+    plot["inventory_item_id"] = item.get("id") if item else plot.get("inventory_item_id", "")
+    plot["inventory_item_name"] = item.get("name") if item else plot.get("inventory_item_name", "")
+    plot["inventory_qty_recorded"] = qty
+    return plot
 
 
 @api.get("/vineyard/plots")
@@ -2907,18 +3088,26 @@ async def list_plots(user: dict = Depends(get_current_user)):
 
 @api.post("/vineyard/plots")
 async def create_plot(body: PlotIn, user: dict = Depends(get_current_user)):
-    return await insert_doc("vineyard_plots", body.model_dump())
+    data = body.model_dump()
+    data["id"] = gen_id()
+    data["created_at"] = now_iso()
+    data = await _attach_plot_to_inventory(data)
+    await db.vineyard_plots.insert_one(data)
+    data.pop("_id", None)
+    await write_audit(user, "create", "vineyard_plot", data["id"], {"name": data.get("name"), "planted_count": data.get("planted_count")})
+    return data
 
 
 @api.put("/vineyard/plots/{plot_id}")
 async def update_plot(plot_id: str, body: PlotIn, user: dict = Depends(get_current_user)):
-    data = body.model_dump()
-    data["updated_at"] = now_iso()
+    previous = await db.vineyard_plots.find_one({"id": plot_id}, {"_id": 0})
+    if not previous:
+        raise HTTPException(404, "Plot tidak ditemukan")
+    data = {**body.model_dump(), "id": plot_id, "updated_at": now_iso()}
+    data = await _attach_plot_to_inventory(data, previous)
     await db.vineyard_plots.update_one({"id": plot_id}, {"$set": data})
     doc = await db.vineyard_plots.find_one({"id": plot_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(404, "Plot tidak ditemukan")
-    await write_audit(user, "update", "vineyard_plot", plot_id, {"name": data.get("name")})
+    await write_audit(user, "update", "vineyard_plot", plot_id, {"name": data.get("name"), "planted_count": data.get("planted_count")})
     return doc
 
 

@@ -5,13 +5,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
-import { AlertTriangle, KeyRound, User as UserIcon, Trash2, ShieldAlert } from "lucide-react";
+import { KeyRound, User as UserIcon, CreditCard } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 
 export default function Pengaturan() {
   const { user, refreshUser } = useAuth();
-  const [s, setS] = useState({ business_name: "", address: "", phone: "", receipt_footer: "", tax_rate: 11 });
+  const [s, setS] = useState({ tax_rate: 11 });
   const [profile, setProfile] = useState({ name: "", email: "" });
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "", confirm: "" });
   const [showReset, setShowReset] = useState(false);
@@ -31,8 +31,8 @@ export default function Pengaturan() {
   }, [user]);
 
   const save = async () => {
-    await api.put("/settings", s);
-    toast.success("Pengaturan disimpan");
+    await api.put("/settings", { tax_rate: Number(s.tax_rate || 0) });
+    toast.success("Pengaturan umum disimpan. Pengaturan struk dikelola per Lini Bisnis.");
   };
 
   const loadGateways = async () => {
@@ -126,38 +126,17 @@ export default function Pengaturan() {
         <Button onClick={changePassword} data-testid="change-pw-btn" className="bg-amber-500 hover:bg-amber-600">Ganti Password</Button>
       </div>
 
-      {/* Profil Bisnis */}
+      {/* Pengaturan Umum */}
       <div className="bg-white rounded-xl border border-gray-100 p-5 space-y-4">
-        <h2 className="font-semibold text-gray-900">Profil Bisnis</h2>
-        <div>
-          <Label>Nama Bisnis</Label>
-          <Input data-testid="settings-name" value={s.business_name || ""} onChange={(e) => setS({ ...s, business_name: e.target.value })} />
-        </div>
-        <div>
-          <Label>Alamat</Label>
-          <Input value={s.address || ""} onChange={(e) => setS({ ...s, address: e.target.value })} />
-        </div>
-        <div>
-          <Label>No. Telepon</Label>
-          <Input value={s.phone || ""} onChange={(e) => setS({ ...s, phone: e.target.value })} />
-        </div>
-        <div>
-          <Label>Catatan / Deskripsi Struk</Label>
-          <textarea
-            data-testid="settings-receipt-footer"
-            value={s.receipt_footer || ""}
-            onChange={(e) => setS({ ...s, receipt_footer: e.target.value })}
-            placeholder="Mis: Terima kasih atas kunjungan Anda. WA: 0812-3456-7890 · IG: @agriwarung"
-            rows={3}
-            className="w-full mt-1 rounded-md border border-gray-200 px-3 py-2 text-sm font-sans focus:outline-none focus:ring-2 focus:ring-emerald-400"
-          />
-          <p className="text-xs text-gray-500 mt-1">Tampil di bagian bawah struk cetak & WhatsApp. Bisa multi-baris.</p>
+        <h2 className="font-semibold text-gray-900">Pengaturan Umum</h2>
+        <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs text-emerald-800 leading-relaxed">
+          Nama, alamat, nomor telepon, footer, dan catatan struk sekarang diatur dari menu <b>Lini Bisnis</b> supaya struk Warung, Pupuk, Kebun Anggur, dan unit lain tidak saling menimpa.
         </div>
         <div>
           <Label>Pajak PPN (%)</Label>
           <Input type="number" value={s.tax_rate || 0} onChange={(e) => setS({ ...s, tax_rate: parseFloat(e.target.value) })} />
         </div>
-        <Button onClick={save} data-testid="save-settings-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan Pengaturan</Button>
+        <Button onClick={save} data-testid="save-settings-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan Pengaturan Umum</Button>
       </div>
 
       {/* Payment Gateway */}

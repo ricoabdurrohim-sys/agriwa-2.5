@@ -22,6 +22,7 @@ const initial = {
   name: "", category: CATEGORIES[0], unit: "pcs",
   current_stock: "", min_stock: "", cost_price: "", sell_price: "",
   business_unit: "warung", location: "", notes: "",
+  supplier_name: "", batch_no: "", purchase_ref: "", purchase_url: "", expiry_date: "",
 };
 
 export default function Inventori() {
@@ -104,9 +105,11 @@ export default function Inventori() {
         cost_price: parseInt(form.cost_price) || 0,
         sell_price: parseInt(form.sell_price) || 0,
       };
+      const same = !editing && items.find((i) => String(i.name || '').toLowerCase().trim() === String(form.name || '').toLowerCase().trim() && i.unit === form.unit && i.business_unit === form.business_unit);
+      if (same && !window.confirm(`Barang "${form.name}" sudah ada. Sistem akan menambah stok ke item lama dan mencatat batch/supplier baru. Lanjut?`)) return;
       if (editing) await api.put(`/inventory/${editing.id}`, payload);
       else await api.post("/inventory", payload);
-      toast.success("Tersimpan");
+      toast.success(editing ? "Tersimpan" : "Tersimpan. Jika barang sama, stok digabung dan batch supplier dicatat.");
       setShowForm(false); load();
     } catch (e) { toast.error("Gagal menyimpan"); }
   };
@@ -208,6 +211,11 @@ export default function Inventori() {
                     <div className="text-xs text-gray-500 mt-0.5">
                       {i.category} · {i.business_unit} {i.location && `· ${i.location}`}
                     </div>
+                    {(i.last_supplier_name || i.last_batch_no) && (
+                      <div className="text-[10px] text-blue-700 mt-0.5 truncate">
+                        Batch terakhir: {i.last_batch_no || "—"}{i.last_supplier_name && ` · ${i.last_supplier_name}`}{i.last_stock_in_at && ` · ${new Date(i.last_stock_in_at).toLocaleDateString('id-ID')}`}
+                      </div>
+                    )}
                   </div>
                   <div className="text-right">
                     <div className={`font-mono font-semibold text-sm ${low ? "text-red-600" : "text-gray-900"}`}>
@@ -232,7 +240,7 @@ export default function Inventori() {
       </div>
 
       <Dialog open={showForm} onOpenChange={setShowForm}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{editing ? "Edit Barang" : "Tambah Barang"}</DialogTitle>
           </DialogHeader>
@@ -277,6 +285,18 @@ export default function Inventori() {
               <Label>Lokasi</Label>
               <Input value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Rak A2" />
             </div>
+            {!editing && (
+              <div className="col-span-2 rounded-lg border border-blue-100 bg-blue-50 p-3 grid sm:grid-cols-2 gap-3">
+                <div className="sm:col-span-2 text-xs text-blue-800 leading-relaxed">
+                  Jika nama barang sudah ada, stok akan otomatis ditambahkan ke item lama dan dicatat sebagai batch baru. Ini membantu trace supplier kalau ada retur/komplain.
+                </div>
+                <div><Label>Supplier / Sumber</Label><Input value={form.supplier_name || ""} onChange={(e) => setForm({ ...form, supplier_name: e.target.value })} placeholder="Nama supplier" /></div>
+                <div><Label>No Batch / Invoice</Label><Input value={form.batch_no || ""} onChange={(e) => setForm({ ...form, batch_no: e.target.value })} placeholder="INV-001 / Batch A" /></div>
+                <div><Label>Ref Pembelian</Label><Input value={form.purchase_ref || ""} onChange={(e) => setForm({ ...form, purchase_ref: e.target.value })} placeholder="PO/Marketplace" /></div>
+                <div><Label>Link Pembelian</Label><Input value={form.purchase_url || ""} onChange={(e) => setForm({ ...form, purchase_url: e.target.value })} placeholder="https://..." /></div>
+                <div><Label>Kadaluarsa / Evaluasi</Label><Input type="date" value={form.expiry_date || ""} onChange={(e) => setForm({ ...form, expiry_date: e.target.value })} /></div>
+              </div>
+            )}
             <div>
               <Label>Harga Pokok (Rp)</Label>
               <Input type="number" inputMode="numeric" value={form.cost_price ?? ""} onChange={(e) => setForm({ ...form, cost_price: e.target.value })} />

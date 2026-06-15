@@ -12,7 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 
-const initPlot = { name: "", location: "", area_sqm: 0, variety: "", planted_count: 0, planted_date: "", notes: "" };
+const initPlot = { name: "", location: "", area_sqm: "", variety: "", planted_count: "", planted_date: "", notes: "", inventory_mode: "auto", inventory_item_id: "", inventory_item_name: "" };
 const initHarv = { plot_id: "", inventory_item_id: "", quantity_kg: 0, quality_grade: "A", notes: "" };
 const initCust = { name: "", contact: "", address: "", payment_terms: "COD" };
 const initInv = { customer_id: "", items: [{ name: "", quantity: 0, unit_price: 0 }], notes: "" };
@@ -65,9 +65,17 @@ export default function Anggur() {
 
   const savePlot = async () => {
     if (!plotForm.name) return toast.error("Nama plot wajib");
-    if (editPlot) await api.put(`/vineyard/plots/${editPlot.id}`, plotForm);
-    else await api.post("/vineyard/plots", plotForm);
-    setPlotForm(initPlot); setEditPlot(null); setShowPlot(false); load(); toast.success(editPlot ? "Plot diperbarui" : "Plot tersimpan");
+    const payload = {
+      ...plotForm,
+      area_sqm: parseFloat(plotForm.area_sqm) || 0,
+      planted_count: parseInt(plotForm.planted_count) || 0,
+      inventory_item_id: plotForm.inventory_mode === "existing" ? plotForm.inventory_item_id : "",
+      inventory_item_name: plotForm.inventory_item_name || `Tanaman Anggur - ${plotForm.name}`,
+    };
+    if (payload.inventory_mode === "existing" && !payload.inventory_item_id) return toast.error("Pilih item inventori untuk jumlah tanaman");
+    if (editPlot) await api.put(`/vineyard/plots/${editPlot.id}`, payload);
+    else await api.post("/vineyard/plots", payload);
+    setPlotForm(initPlot); setEditPlot(null); setShowPlot(false); load(); toast.success(editPlot ? "Plot diperbarui" : "Plot tersimpan dan inventori tanaman disesuaikan");
   };
   const deletePlot = async (p) => {
     if (!window.confirm(`Hapus plot ${p.name}?`)) return;
@@ -195,7 +203,29 @@ export default function Anggur() {
         </TabsContent>
       </Tabs>
 
-      <Dialog open={showPlot} onOpenChange={setShowPlot}><DialogContent><DialogHeader><DialogTitle>{editPlot ? 'Edit Plot' : 'Plot Baru'}</DialogTitle></DialogHeader><div className="grid grid-cols-2 gap-3"><Field label="Nama" value={plotForm.name} onChange={(v)=>setPlotForm({...plotForm,name:v})}/><Field label="Lokasi" value={plotForm.location} onChange={(v)=>setPlotForm({...plotForm,location:v})}/><Field label="Varietas" value={plotForm.variety} onChange={(v)=>setPlotForm({...plotForm,variety:v})}/><Field label="Jumlah Tanaman" type="number" value={plotForm.planted_count || ''} onChange={(v)=>setPlotForm({...plotForm,planted_count:v})}/><Field label="Luas m²" type="number" value={plotForm.area_sqm || ''} onChange={(v)=>setPlotForm({...plotForm,area_sqm:v})}/><Field label="Tanggal Tanam" type="date" value={plotForm.planted_date || ''} onChange={(v)=>setPlotForm({...plotForm,planted_date:v})}/></div><Label>Catatan</Label><Textarea value={plotForm.notes} onChange={(e)=>setPlotForm({...plotForm,notes:e.target.value})}/><DialogFooter><Button variant="outline" onClick={()=>setShowPlot(false)}>Batal</Button><Button onClick={savePlot}>Simpan</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={showPlot} onOpenChange={setShowPlot}>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>{editPlot ? 'Edit Plot' : 'Plot Baru'}</DialogTitle></DialogHeader>
+          <div className="grid sm:grid-cols-2 gap-3">
+            <Field label="Nama" value={plotForm.name} onChange={(v)=>setPlotForm({...plotForm,name:v})}/>
+            <Field label="Lokasi" value={plotForm.location} onChange={(v)=>setPlotForm({...plotForm,location:v})}/>
+            <Field label="Varietas" value={plotForm.variety} onChange={(v)=>setPlotForm({...plotForm,variety:v})}/>
+            <Field label="Jumlah Tanaman / Pohon" type="number" value={plotForm.planted_count || ''} onChange={(v)=>setPlotForm({...plotForm,planted_count:v})}/>
+            <Field label="Luas m²" type="number" value={plotForm.area_sqm || ''} onChange={(v)=>setPlotForm({...plotForm,area_sqm:v})}/>
+            <Field label="Tanggal Tanam" type="date" value={plotForm.planted_date || ''} onChange={(v)=>setPlotForm({...plotForm,planted_date:v})}/>
+          </div>
+          <div className="rounded-lg border border-purple-100 bg-purple-50 p-3 space-y-3">
+            <div className="text-xs font-semibold text-purple-900">Integrasi Inventori Tanaman</div>
+            <SelectField label="Catat jumlah tanaman ke inventori?" value={plotForm.inventory_mode || 'auto'} onChange={(v)=>setPlotForm({...plotForm,inventory_mode:v})} items={[{value:'auto',label:'Belum punya item — buat otomatis'}, {value:'existing',label:'Sudah punya item — pilih dari inventori'}, {value:'none',label:'Jangan catat ke inventori'}]} />
+            {plotForm.inventory_mode === 'existing' && <SelectField label="Item Inventori Tanaman" value={plotForm.inventory_item_id || ''} onChange={(v)=>setPlotForm({...plotForm,inventory_item_id:v})} items={inventory.filter(i => (i.business_unit === 'anggur') && ['pohon','batang','pcs'].includes(String(i.unit || '').toLowerCase())).map(i=>({value:i.id,label:`${i.name} · stok ${i.current_stock || 0} ${i.unit}`}))} />}
+            {plotForm.inventory_mode === 'auto' && <Field label="Nama item inventori otomatis" value={plotForm.inventory_item_name || `Tanaman Anggur - ${plotForm.name || 'Plot'}`} onChange={(v)=>setPlotForm({...plotForm,inventory_item_name:v})}/>} 
+            <div className="text-[11px] text-purple-800">Saat disimpan, jumlah tanaman akan masuk Inventori & Gudang sebagai stok aset tanaman. Saat jumlah tanaman diedit, sistem hanya menyesuaikan selisihnya.</div>
+          </div>
+          <Label>Catatan</Label>
+          <Textarea value={plotForm.notes} onChange={(e)=>setPlotForm({...plotForm,notes:e.target.value})}/>
+          <DialogFooter><Button variant="outline" onClick={()=>setShowPlot(false)}>Batal</Button><Button onClick={savePlot}>Simpan</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={showHarv} onOpenChange={setShowHarv}><DialogContent><DialogHeader><DialogTitle>Catat Panen</DialogTitle></DialogHeader><SelectField label="Plot" value={harvForm.plot_id} onChange={(v)=>setHarvForm({...harvForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><Field label="Jumlah kg" type="number" value={harvForm.quantity_kg || ''} onChange={(v)=>setHarvForm({...harvForm,quantity_kg:v})}/><SelectField label="Kualitas" value={harvForm.quality_grade} onChange={(v)=>setHarvForm({...harvForm,quality_grade:v})} items={[{value:'A',label:'A Premium'},{value:'B',label:'B Standard'},{value:'C',label:'C Olahan'}]}/><SelectField label="Masukkan ke Item Inventori (opsional, kosong = otomatis)" value={harvForm.inventory_item_id || 'auto'} onChange={(v)=>setHarvForm({...harvForm,inventory_item_id:v === 'auto' ? '' : v})} items={[{value:'auto',label:'Otomatis per Grade'},...grapeItems.map(i=>({value:i.id,label:`${i.name} (${i.current_stock || 0} ${i.unit})`}))]}/><DialogFooter><Button variant="outline" onClick={()=>setShowHarv(false)}>Batal</Button><Button onClick={saveHarv}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 

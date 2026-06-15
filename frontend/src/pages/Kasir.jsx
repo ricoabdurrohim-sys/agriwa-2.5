@@ -209,14 +209,23 @@ export default function Kasir() {
 
   const currentUnitInfo = useMemo(() => bizUnits.find((u) => u.code === unit) || { code: unit, name: unit, receipt_name: "" }, [bizUnits, unit]);
 
+  useEffect(() => {
+    if (bonInfo && payment === "cash") {
+      const due = getBonRemaining(bonInfo);
+      if (due > 0 && (!cashReceived || Number(cashReceived) <= 0 || Number(cashReceived) !== due)) {
+        setCashReceived(String(due));
+      }
+    }
+  }, [bonInfo?.id, bonInfo?.remaining, bonInfo?.paid, payment]);
+
   const getReceiptConfig = (trx) => {
     const snap = trx?.receipt_snapshot || {};
     const trxUnit = bizUnits.find((u) => u.code === trx?.unit) || currentUnitInfo;
     return {
-      business_name: snap.business_name || snap.name || (trxUnit.receipt_name && trxUnit.receipt_name.trim()) || trxUnit.name || settings.business_name || "AGRIWARUNG",
-      address: snap.address || trxUnit.receipt_address || settings.address || "",
-      phone: snap.phone || trxUnit.receipt_phone || settings.phone || "",
-      footer: snap.footer || trxUnit.receipt_footer || settings.receipt_footer || "Terima kasih! 🙏",
+      business_name: snap.business_name || snap.name || (trxUnit.receipt_name && trxUnit.receipt_name.trim()) || trxUnit.name || "AGRIWARUNG",
+      address: snap.address || trxUnit.receipt_address || "",
+      phone: snap.phone || trxUnit.receipt_phone || "",
+      footer: snap.footer || trxUnit.receipt_footer || "Terima kasih! 🙏",
       note: snap.note || trxUnit.receipt_note || "",
     };
   };
@@ -283,7 +292,8 @@ export default function Kasir() {
   const paymentDue = bonInfo ? bonRemaining : total;
   const cashReceivedNum = parseInt(cashReceived) || 0;
   const change = payment === "cash" ? (cashReceivedNum - paymentDue) : 0;
-  const isUnderpaid = change < 0;
+  const isBonUnderpaid = !!bonInfo && payment === "cash" && cashReceivedNum > 0 && cashReceivedNum < paymentDue;
+  const isUnderpaid = !bonInfo && change < 0;
 
   const checkout = async () => {
     if (cart.length === 0) return toast.error("Keranjang kosong");
@@ -295,7 +305,7 @@ export default function Kasir() {
         // Settle bon: bayar hanya sisa bon, tidak membuat penjualan baru dan tidak mengurangi stok lagi.
         const remaining = paymentDue;
         const receivedForDebt = payment === "cash" ? (cashReceivedNum || remaining) : remaining;
-        if (payment === "cash" && receivedForDebt < remaining) {
+        if (payment === "cash" && Number(receivedForDebt) < Number(remaining)) {
           setCashReceived(String(remaining));
           return toast.error(`Nominal pelunasan bon harus minimal ${formatRupiah(remaining)}. Kolom sudah diisi otomatis.`);
         }
@@ -577,12 +587,12 @@ export default function Kasir() {
                   className="h-11 mt-1 font-mono text-right" placeholder={bonInfo ? String(paymentDue) : "0"} />
               </div>
               {cashReceivedNum > 0 && (
-                <div className={`flex justify-between text-sm rounded-lg px-2.5 py-1.5 ${isUnderpaid ? "bg-red-50 border border-red-200" : ""}`}>
-                  <span className={isUnderpaid ? "text-red-700 font-medium" : "text-gray-600"}>
-                    {isUnderpaid ? "Kurang Bayar" : "Kembalian"}
+                <div className={`flex justify-between text-sm rounded-lg px-2.5 py-1.5 ${(isUnderpaid || isBonUnderpaid) ? "bg-red-50 border border-red-200" : ""}`}>
+                  <span className={(isUnderpaid || isBonUnderpaid) ? "text-red-700 font-medium" : "text-gray-600"}>
+                    {(isUnderpaid || isBonUnderpaid) ? "Kurang Bayar" : (bonInfo ? "Kembalian Pelunasan" : "Kembalian")}
                   </span>
-                  <span className={`font-mono font-semibold ${isUnderpaid ? "text-red-600" : "text-[#f4a228]"}`}>
-                    {isUnderpaid ? `-${formatRupiah(Math.abs(change))}` : formatRupiah(change)}
+                  <span className={`font-mono font-semibold ${(isUnderpaid || isBonUnderpaid) ? "text-red-600" : "text-[#f4a228]"}`}>
+                    {(isUnderpaid || isBonUnderpaid) ? `-${formatRupiah(Math.abs(change))}` : formatRupiah(change)}
                   </span>
                 </div>
               )}

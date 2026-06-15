@@ -129,10 +129,10 @@ export default function Layout() {
         end={m.to === "/"}
         onClick={() => setOpen(false)}
         data-testid={`drawer-${m.to.replace("/", "") || "dashboard"}`}
-        className={({ isActive }) => `flex items-center gap-3 px-3 py-2.5 rounded-lg mb-1 text-sm transition-colors ${isActive ? "bg-[#f4a228] text-white font-medium" : "text-white/85 hover:bg-white/10"}`}
+        className={({ isActive }) => `flex items-center gap-3 px-3 py-2.5 rounded-xl mb-1.5 text-sm transition-all ${isActive ? "bg-white text-[#155f38] font-semibold shadow-md" : "text-white/86 hover:bg-white/10 hover:translate-x-0.5"}`}
       >
-        <m.icon className="w-5 h-5" />
-        <span>{m.label}</span>
+        <m.icon className="w-5 h-5 shrink-0" />
+        <span className="truncate">{m.label}</span>
       </NavLink>
     );
   };
@@ -148,35 +148,46 @@ export default function Layout() {
                   <Menu className="w-5 h-5 text-gray-700" />
                 </button>
               </SheetTrigger>
-              <SheetContent side="left" className="p-0 w-80 bg-[#1a6b3c] border-0">
+              <SheetContent side="left" className="p-0 w-[22rem] bg-gradient-to-b from-[#0f5130] via-[#155f38] to-[#0b2f1d] border-0">
                 <div className="flex flex-col h-full text-white">
-                  <div className="px-6 py-5 border-b border-white/10 flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Grape className="w-7 h-7 text-[#f4a228] shrink-0" />
-                      <div className="min-w-0">
-                        <div className="font-semibold tracking-tight truncate" style={{ fontFamily: 'Poppins' }}>AgriWarung</div>
-                        <div className="text-xs text-white/60">Mini ERP UMKM</div>
+                  <div className="px-5 py-5 border-b border-white/10">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-10 h-10 rounded-2xl bg-white/10 border border-white/15 flex items-center justify-center shadow-inner">
+                          <Grape className="w-6 h-6 text-[#f4a228] shrink-0" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-semibold tracking-tight truncate text-lg" style={{ fontFamily: 'Poppins' }}>AgriWarung</div>
+                          <div className="text-xs text-white/65">Mini ERP · POS · Kebun · Akuntansi</div>
+                        </div>
                       </div>
+                      <button data-testid="edit-drawer-btn" onClick={() => setEditMode((v) => !v)} className={`p-2 rounded-xl transition-colors ${editMode ? "bg-[#f4a228] text-white" : "bg-white/10 text-white/80 hover:bg-white/20"}`} title="Atur tampilan menu">
+                        <Sliders className="w-4 h-4" />
+                      </button>
                     </div>
-                    <button data-testid="edit-drawer-btn" onClick={() => setEditMode((v) => !v)} className={`p-1.5 rounded-md transition-colors ${editMode ? "bg-[#f4a228] text-white" : "bg-white/10 text-white/80 hover:bg-white/20"}`} title="Atur tampilan menu">
-                      <Sliders className="w-4 h-4" />
-                    </button>
+                    <div className="grid grid-cols-3 gap-2 mt-4">
+                      {[allModules[0], allModules[3], allModules[4]].map((m) => (
+                        <NavLink key={m.to} to={m.to} end={m.to === "/"} onClick={() => setOpen(false)} className="rounded-xl bg-white/10 hover:bg-white/15 border border-white/10 px-2 py-2 text-center text-[11px] font-semibold text-white/90">
+                          <m.icon className="w-4 h-4 mx-auto mb-1 text-[#f4a228]" />{m.label.split(' ')[0]}
+                        </NavLink>
+                      ))}
+                    </div>
                   </div>
-                  <div className="px-3 pt-3 pb-1 border-b border-white/5">
-                    <button data-testid="toggle-fullview-btn" onClick={toggleFullView} className="w-full flex items-center gap-2 text-xs px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/85">
+                  <div className="px-4 pt-3 pb-2 border-b border-white/5">
+                    <button data-testid="toggle-fullview-btn" onClick={toggleFullView} className="w-full flex items-center gap-2 text-xs px-3 py-2.5 rounded-xl bg-white/8 hover:bg-white/12 border border-white/10 text-white/90">
                       {fullView ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-                      <span className="font-medium">{fullView ? "Tampilkan Semua Modul" : "Tampilan Sederhana"}</span>
+                      <span className="font-medium">{fullView ? "Mode Lengkap" : "Mode Ringkas"}</span>
                       <span className="ml-auto text-[10px] text-white/60">{visibleModules.length}/{allModules.length}</span>
                     </button>
-                    {editMode && <div className="text-[11px] text-white/60 mt-2 px-1">Centang modul yang ingin tampil. Tidak ada tombol hapus/reset data di drawer.</div>}
+                    {editMode && <div className="text-[11px] text-white/65 mt-2 px-1 leading-relaxed">Pilih menu yang ingin tampil. Reset/hapus data massal tidak tersedia; data dihapus satu per satu dari detail masing-masing.</div>}
                   </div>
-                  <nav className="flex-1 px-3 py-2 overflow-y-auto">
+                  <nav className="flex-1 px-3 py-3 overflow-y-auto">
                     {GROUP_ORDER.map((g) => grouped[g]?.length ? (
-                      <details key={g} open={editMode || g === "Ringkasan" || g === "Operasional"} className="mb-2 group">
-                        <summary className="cursor-pointer list-none px-2 py-2 text-[11px] uppercase font-bold tracking-wider text-white/55 hover:text-white/80">
-                          {g}
+                      <details key={g} open={editMode || g === "Ringkasan" || g === "Operasional" || g === "Keuangan & Akuntansi"} className="mb-2 group rounded-2xl bg-black/5 border border-white/5 px-1 py-1">
+                        <summary className="cursor-pointer list-none px-3 py-2 text-[11px] uppercase font-bold tracking-wider text-white/65 hover:text-white/90 flex items-center justify-between">
+                          <span>{g}</span><span className="text-[10px] font-mono text-white/40">{grouped[g].length}</span>
                         </summary>
-                        <div>{grouped[g].map(renderModule)}</div>
+                        <div className="pb-1">{grouped[g].map(renderModule)}</div>
                       </details>
                     ) : null)}
                   </nav>

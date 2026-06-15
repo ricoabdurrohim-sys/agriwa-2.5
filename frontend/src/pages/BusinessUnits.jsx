@@ -80,9 +80,9 @@ export default function BusinessUnits() {
       </div>
 
       <Dialog open={show} onOpenChange={setShow}>
-        <DialogContent>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader><DialogTitle>{editing ? "Edit Lini Bisnis" : "Lini Bisnis Baru"}</DialogTitle></DialogHeader>
-          <div className="space-y-3">
+          <div className="space-y-3 pb-2">
             <div><Label>Nama</Label><Input data-testid="unit-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value, code: editing ? form.code : e.target.value.toLowerCase().replace(/\s+/g, "_") })} placeholder="Bisnis Catering" /></div>
             <div><Label>Kode (slug)</Label><Input data-testid="unit-code-input" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value.toLowerCase().replace(/\s+/g, "_") })} disabled={editing} className="font-mono" /></div>
             <div>
