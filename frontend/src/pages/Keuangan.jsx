@@ -100,9 +100,22 @@ export default function Keuangan() {
   const totalDebt = debts.filter(d => d.status !== "paid").reduce((s, d) => s + (d.amount - (d.paid || 0)), 0);
   const totalExpense = expenses.reduce((s, e) => s + e.amount, 0);
   const totalIncome = incomes.reduce((s, i) => s + i.amount, 0);
-  const validTrx = trx.filter((t) => !t.cancelled && (t.transaction_type || "SALE") === "SALE");
-  // Cash-basis: bon parsial tetap menghitung uang yang benar-benar diterima (paid_amount).
-  const totalKasir = validTrx.reduce((s, t) => s + (t.paid_amount ?? t.total ?? 0), 0);
+  const isFinancialSale = (t) => {
+    if (!t) return false;
+    if (t.financial_exclude || t.receipt_kind === "DEBT_SETTLEMENT" || t.settled_from_debt) return false;
+    if (t.cancelled) return false;
+    return (t.transaction_type || "SALE") === "SALE";
+  };
+  const cashCollected = (t) => {
+    const total = Number(t.total || 0);
+    const paidRaw = t.paid_amount ?? t.cash_received ?? t.total ?? 0;
+    const paid = Number(paidRaw || 0);
+    return total > 0 ? Math.max(0, Math.min(total, paid)) : Math.max(0, paid);
+  };
+  const validTrx = trx.filter(isFinancialSale);
+  // Cash-basis: DP bon + pelunasan bon harus tergabung di transaksi asal.
+  // Contoh total 21.000, DP 10.000, bayar bon 11.000 => setelah lunas menjadi 21.000, bukan 11.000.
+  const totalKasir = validTrx.reduce((s, t) => s + cashCollected(t), 0);
   const totalNet = totalKasir + totalIncome - totalExpense;
 
   return (
@@ -178,11 +191,18 @@ export default function Keuangan() {
                         <span className="text-sm font-medium">{t.trx_no}</span>
                         <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${tag}`}>{label}</span>
                         {t.is_bon && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-amber-100 text-amber-800 border-amber-300">BON</span>}
-                        {t.cancelled && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-red-100 text-red-700 border-red-300">DIBATALKAN</span>}
+                        {t.payment_status === "PAID" && t.debt_amount === 0 && (t.paid_amount || 0) >= (t.total || 0) && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-emerald-100 text-emerald-700 border-emerald-300">LUNAS</span>}
                       </div>
-                      <div className="text-xs text-gray-500 mt-0.5">{formatDate(t.created_at)} · {t.unit}{t.customer_name && ` · ${t.customer_name}`}</div>
+                      <div className="text-xs text-gray-500 mt-0.5">
+                        {formatDate(t.created_at)} · {t.unit}{t.customer_name && ` · ${t.customer_name}`}
+                        {t.debt_amount > 0 && ` · Sisa bon ${formatRupiah(t.debt_amount)}`}
+                        {(t.total || 0) !== cashCollected(t) && ` · Total belanja ${formatRupiah(t.total)}`}
+                      </div>
                     </div>
-                    <div className={`font-mono font-semibold ${t.cancelled ? "text-gray-400 line-through" : "text-[#1a6b3c]"}`}>{formatRupiah(t.total)}</div>
+                    <div className="text-right shrink-0">
+                      <div className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(cashCollected(t))}</div>
+                      {(t.total || 0) !== cashCollected(t) && <div className="text-[10px] text-gray-500">dari {formatRupiah(t.total)}</div>}
+                    </div>
                   </div>
                 );
               })}
