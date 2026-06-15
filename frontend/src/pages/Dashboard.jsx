@@ -75,7 +75,7 @@ export default function Dashboard() {
   useEffect(() => {
     const h = (e) => {
       const k = e.detail?.type;
-      if (["transaction_created", "transaction_cancelled", "order_created", "order_updated"].includes(k)) {
+      if (["transaction_created", "transaction_cancelled", "transaction_updated", "order_created", "order_updated"].includes(k)) {
         load();
       }
     };
@@ -86,7 +86,7 @@ export default function Dashboard() {
   useEffect(() => {
     const handler = (e) => {
       const t = e.detail?.type;
-      if (t === "transaction_created" || t === "order_created" || t === "order_updated") {
+      if (t === "transaction_created" || t === "transaction_cancelled" || t === "transaction_updated" || t === "order_created" || t === "order_updated") {
         load();
       }
     };

@@ -816,9 +816,25 @@ async def create_table(body: TableIn, user: dict = Depends(get_current_user)):
     return await insert_doc("tables", body.model_dump())
 
 
+@api.put("/tables/{table_id}")
+async def update_table(table_id: str, body: TableIn, user: dict = Depends(get_current_user)):
+    if not body.name.strip():
+        raise HTTPException(400, "Nama meja wajib")
+    await db.tables.update_one({"id": table_id}, {"$set": {"name": body.name.strip(), "updated_at": now_iso()}})
+    doc = await db.tables.find_one({"id": table_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Meja tidak ditemukan")
+    await write_audit(user, "update", "table", table_id, {"name": body.name.strip()})
+    return doc
+
+
 @api.delete("/tables/{table_id}")
 async def delete_table(table_id: str, user: dict = Depends(get_current_user)):
+    active = await db.orders.find_one({"table_id": table_id, "status": {"$nin": ["paid", "cancelled"]}})
+    if active:
+        raise HTTPException(400, "Meja masih memiliki order aktif. Selesaikan/batalkan order dulu.")
     await db.tables.delete_one({"id": table_id})
+    await write_audit(user, "delete", "table", table_id, {})
     return {"ok": True}
 
 
@@ -1070,12 +1086,22 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
 
 
 @api.get("/transactions")
-async def list_transactions(user: dict = Depends(get_current_user), limit: int = 500, unit: Optional[str] = None):
+async def list_transactions(user: dict = Depends(get_current_user), limit: int = 500, unit: Optional[str] = None, include_receipts: bool = False):
     q = {}
     if unit:
         q["unit"] = unit
     limit = max(1, min(int(limit or 500), 2000))
-    return await db.transactions.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    rows = await db.transactions.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit * 2)
+    debt_ctx = await _load_debt_financial_context()
+    enriched = []
+    for row in rows:
+        # Dokumen pelunasan bon legacy hanya untuk audit/struk, bukan transaksi kasir utama.
+        if _is_debt_settlement_document(row) and not include_receipts:
+            continue
+        enriched.append(_enrich_transaction_financial_fields(row, debt_ctx))
+        if len(enriched) >= limit:
+            break
+    return enriched
 
 
 @api.get("/transactions/{trx_id}")
@@ -1083,7 +1109,8 @@ async def get_transaction(trx_id: str, user: dict = Depends(get_current_user)):
     trx = await db.transactions.find_one({"id": trx_id}, {"_id": 0})
     if not trx:
         raise HTTPException(404, "Transaksi tidak ditemukan")
-    return trx
+    debt_ctx = await _load_debt_financial_context()
+    return _enrich_transaction_financial_fields(trx, debt_ctx)
 
 
 @api.get("/transactions/{trx_id}/receipt")
@@ -1171,6 +1198,21 @@ async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_curre
         {"id": debt_id},
         {"$set": {"paid": new_paid, "status": status, "last_paid_at": now_iso()}},
     )
+    payment_id = gen_id()
+    await db.debt_payments.insert_one({
+        "id": payment_id,
+        "debt_id": debt_id,
+        "transaction_id": debt.get("transaction_id"),
+        "customer_name": debt.get("customer_name", "Pelanggan"),
+        "amount": pay_amount,
+        "cash_received": pay_amount,
+        "change": 0,
+        "payment_method": "cash",
+        "created_at": now_iso(),
+        "cashier_id": user["id"],
+        "cashier_name": user.get("name", user.get("email")),
+        "source": "debt_pay_endpoint",
+    })
     # Tambahkan penerimaan kas/bank tanpa membuat revenue baru dobel.
     await db.journal_entries.insert_one({
         "id": gen_id(),
@@ -1181,7 +1223,7 @@ async def pay_debt(debt_id: str, body: PayDebtIn, user: dict = Depends(get_curre
             {"account": "Piutang Bon", "debit": 0, "credit": pay_amount},
         ],
         "reference": "debt_payment",
-        "reference_id": debt_id,
+        "reference_id": payment_id,
         "unit": debt.get("unit", "warung"),
         "created_at": now_iso(),
     })
@@ -1222,8 +1264,23 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
         {"id": debt_id},
         {"$set": {"paid": debt["amount"], "status": "paid", "last_paid_at": now_iso()}},
     )
-    # Record remaining cash receipt to journal
+    # Record remaining cash receipt to journal + debt_payments so reports can rebuild cash-basis revenue.
+    payment_id = gen_id()
     if remaining > 0:
+        await db.debt_payments.insert_one({
+            "id": payment_id,
+            "debt_id": debt_id,
+            "transaction_id": debt.get("transaction_id"),
+            "customer_name": debt.get("customer_name", "Pelanggan"),
+            "amount": remaining,
+            "cash_received": remaining,
+            "change": 0,
+            "payment_method": "cash",
+            "created_at": now_iso(),
+            "cashier_id": user["id"],
+            "cashier_name": user.get("name", user.get("email")),
+            "source": "mark_paid_endpoint",
+        })
         await db.journal_entries.insert_one({
             "id": gen_id(),
             "date": now_iso(),
@@ -1233,8 +1290,8 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
                 {"account": "Piutang Bon", "debit": 0, "credit": remaining},
             ],
             "reference": "debt_payment",
-            "reference_id": debt_id,
-            "unit": "warung",
+            "reference_id": payment_id,
+            "unit": debt.get("unit", "warung"),
             "created_at": now_iso(),
         })
     # Update related transaction: paid_amount naik sebesar sisa bon. Jangan cancel transaksi asli.
@@ -1459,6 +1516,43 @@ async def _record_purchase_expense(doc: dict, source: str, kind: str = "po"):
     })
 
 
+async def _record_purchase_payment(doc: dict, amount: int, source: str, kind: str = "po", method: str = "transfer", proof_url: str = "", notes: str = "", paid_at: str = ""):
+    """Record actual cash out for PO/online order payment. Supports partial payment."""
+    amount = int(amount or 0)
+    if amount <= 0:
+        raise HTTPException(400, "Nominal pembayaran harus lebih dari 0")
+    total = int(doc.get("total") or 0)
+    old_paid = int(doc.get("paid_amount") or 0)
+    remaining = max(0, total - old_paid)
+    if remaining <= 0:
+        raise HTTPException(400, "Pembelian sudah lunas")
+    pay_amount = min(amount, remaining)
+    label = doc.get("po_no") or doc.get("order_number") or doc.get("id")
+    payment_doc = {
+        "id": gen_id(), "kind": kind, "purchase_id": doc["id"], "reference_no": label,
+        "amount": pay_amount, "method": method or "transfer", "payment_proof_url": proof_url or "",
+        "notes": notes or "", "paid_at": paid_at or now_iso(), "created_at": now_iso(),
+    }
+    await db.purchase_payments.insert_one(payment_doc)
+    await db.expenses.insert_one({
+        "id": gen_id(), "amount": pay_amount, "category": "Pembelian Bahan", "unit": "gudang",
+        "notes": f"Pembayaran {kind.upper()} {label}" + (f" — {source}" if source else "") + (f" — {notes}" if notes else ""),
+        "date": payment_doc["paid_at"], "created_at": now_iso(),
+        "reference": f"{kind}_payment", "reference_id": payment_doc["id"], "purchase_id": doc["id"],
+    })
+    await db.journal_entries.insert_one({
+        "id": gen_id(), "date": payment_doc["paid_at"],
+        "description": f"Pembayaran {kind.upper()} {label}",
+        "lines": [
+            {"account": "Pembelian Bahan", "debit": pay_amount, "credit": 0},
+            {"account": payment_account(method), "debit": 0, "credit": pay_amount},
+        ],
+        "reference": f"{kind}_payment", "reference_id": payment_doc["id"],
+        "unit": "gudang", "created_at": now_iso(),
+    })
+    return {k: v for k, v in payment_doc.items() if k != "_id"}
+
+
 async def _record_stock_receipt(doc: dict, kind: str = "po"):
     """Idempotent: add to inventory when delivery_status=arrived.
     Returns dict with counts: {added: N, skipped: [names], items_added: [{name, qty}]}.
@@ -1517,10 +1611,12 @@ async def update_po_status(po_id: str, body: StatusUpdateIn, user: dict = Depend
     suppliers = await db.suppliers.find_one({"id": po.get("supplier_id")})
     supplier_name = (suppliers or {}).get("name", "")
     side_effects = {}
-    if body.payment_status == "paid" and not po_after.get("expense_recorded"):
-        await _record_purchase_expense(po_after, supplier_name, kind="po")
-        await db.purchase_orders.update_one({"id": po_id}, {"$set": {"expense_recorded": True, "expense_recorded_at": now_iso()}})
-        side_effects["expense"] = True
+    if body.payment_status == "paid":
+        remaining = int(po_after.get("total") or 0) - int(po_after.get("paid_amount") or 0)
+        if remaining > 0:
+            await _record_purchase_payment(po_after, remaining, supplier_name, kind="po", method=po_after.get("payment_method") or "transfer", proof_url=po_after.get("payment_proof_url") or "", notes="Pelunasan via status")
+            await db.purchase_orders.update_one({"id": po_id}, {"$set": {"paid_amount": int(po_after.get("total") or 0), "payment_status": "paid", "paid_at": now_iso()}})
+            side_effects["payment"] = True
     if body.delivery_status == "arrived" and not po_after.get("stock_received"):
         await _record_stock_receipt(po_after, kind="po")
         await db.purchase_orders.update_one({"id": po_id}, {"$set": {"stock_received": True, "stock_received_at": now_iso(), "status": "received"}})
@@ -1545,10 +1641,12 @@ async def update_online_status(oid: str, body: StatusUpdateIn, user: dict = Depe
 
     o_after = await db.online_orders.find_one({"id": oid}, {"_id": 0})
     side_effects = {}
-    if body.payment_status == "paid" and not o_after.get("expense_recorded"):
-        await _record_purchase_expense(o_after, o.get("platform", ""), kind="online")
-        await db.online_orders.update_one({"id": oid}, {"$set": {"expense_recorded": True, "expense_recorded_at": now_iso()}})
-        side_effects["expense"] = True
+    if body.payment_status == "paid":
+        remaining = int(o_after.get("total") or 0) - int(o_after.get("paid_amount") or 0)
+        if remaining > 0:
+            await _record_purchase_payment(o_after, remaining, o_after.get("platform", ""), kind="online", method=o_after.get("payment_method") or "transfer", proof_url=o_after.get("payment_proof_url") or "", notes="Pelunasan via status")
+            await db.online_orders.update_one({"id": oid}, {"$set": {"paid_amount": int(o_after.get("total") or 0), "payment_status": "paid", "paid_at": now_iso()}})
+            side_effects["payment"] = True
     if body.delivery_status == "arrived" and not o_after.get("stock_received"):
         await _record_stock_receipt(o_after, kind="online")
         await db.online_orders.update_one({"id": oid}, {"$set": {"stock_received": True, "stock_received_at": now_iso(), "status": "received"}})
@@ -1843,25 +1941,6 @@ async def delete_income(income_id: str, user: dict = Depends(get_current_user)):
 
 
 # ---------- Financial normalization helpers ----------
-def _is_financial_sale_transaction(t: dict) -> bool:
-    """True untuk transaksi penjualan asli yang boleh masuk pendapatan/kas.
-
-    Pelunasan bon via kasir mengembalikan receipt untuk dicetak, tetapi bukan
-    transaksi penjualan baru. Dokumen legacy dari versi lama bisa memiliki
-    settled_from_debt/receipt_kind dan harus dikeluarkan dari revenue agar tidak
-    menghitung Rp11.000 sebagai penjualan terpisah.
-    """
-    if not t:
-        return False
-    if t.get("financial_exclude"):
-        return False
-    if t.get("receipt_kind") == "DEBT_SETTLEMENT" or t.get("settled_from_debt"):
-        return False
-    if t.get("cancelled"):
-        return False
-    return (t.get("transaction_type") or "SALE") == "SALE"
-
-
 def _money(v, default: int = 0) -> int:
     try:
         if v is None or v == "":
@@ -1871,125 +1950,283 @@ def _money(v, default: int = 0) -> int:
         return default
 
 
-def _transaction_cash_collected(t: dict) -> int:
-    """Cash-basis amount yang benar-benar diterima dari transaksi penjualan asli."""
+def _is_debt_settlement_document(t: dict) -> bool:
+    """Dokumen/receipt pelunasan bon tidak boleh dihitung sebagai penjualan baru."""
+    if not t:
+        return False
+    return bool(
+        t.get("financial_exclude")
+        or t.get("receipt_kind") == "DEBT_SETTLEMENT"
+        or t.get("settled_from_debt")
+        or (t.get("transaction_type") or "").upper() == "DEBT_SETTLEMENT"
+    )
+
+
+def _is_financial_sale_transaction(t: dict) -> bool:
+    """True untuk transaksi penjualan asli yang boleh masuk pendapatan/kas."""
+    if not t:
+        return False
+    if _is_debt_settlement_document(t):
+        return False
+    if t.get("cancelled"):
+        return False
+    return (t.get("transaction_type") or "SALE").upper() == "SALE"
+
+
+async def _load_debt_financial_context() -> dict:
+    """Load peta bon/pelunasan untuk menghitung revenue secara kanonis.
+
+    Sumber kebenaran untuk transaksi bon:
+    - transaksi asli menyimpan total belanja dan DP awal,
+    - customer_debts menyimpan sisa bon awal,
+    - debt_payments menyimpan cicilan/pelunasan.
+
+    Dengan cara ini laporan tidak bergantung pada dokumen receipt pelunasan atau
+    field paid_amount yang mungkin pernah tertimpa patch lama.
+    """
+    debts = await db.customer_debts.find({}, {"_id": 0}).to_list(5000)
+    payments = await db.debt_payments.find({}, {"_id": 0}).to_list(5000)
+    debt_by_trx = {}
+    debt_by_id = {}
+    payments_by_trx = {}
+    payments_by_debt = {}
+    for d in debts:
+        debt_by_id[d.get("id")] = d
+        if d.get("transaction_id"):
+            debt_by_trx[d.get("transaction_id")] = d
+    for p in payments:
+        if p.get("transaction_id"):
+            payments_by_trx.setdefault(p.get("transaction_id"), []).append(p)
+        if p.get("debt_id"):
+            payments_by_debt.setdefault(p.get("debt_id"), []).append(p)
+    return {
+        "debt_by_trx": debt_by_trx,
+        "debt_by_id": debt_by_id,
+        "payments_by_trx": payments_by_trx,
+        "payments_by_debt": payments_by_debt,
+    }
+
+
+def _initial_paid_for_transaction(t: dict, debt: Optional[dict] = None) -> int:
+    total = _money(t.get("total"))
+    if debt:
+        if debt.get("initial_paid") is not None:
+            return max(0, min(total, _money(debt.get("initial_paid"))))
+        original_total = _money(debt.get("original_total") or total)
+        # Schema baru: amount = sisa bon awal. Maka initial paid = total belanja - sisa bon.
+        if original_total > 0 and debt.get("amount") is not None:
+            return max(0, min(original_total, original_total - _money(debt.get("amount"))))
+    pm = (t.get("payment_method") or "cash").lower()
+    if pm == "cash":
+        return max(0, min(total, _money(t.get("cash_received")))) if total else max(0, _money(t.get("cash_received")))
+    paid = t.get("paid_amount")
+    if paid is not None:
+        return max(0, min(total, _money(paid))) if total else max(0, _money(paid))
+    return total
+
+
+def _canonical_cash_collected(t: dict, debt_ctx: Optional[dict] = None) -> int:
+    """Cash-basis amount yang benar-benar sudah diterima untuk transaksi asli."""
     if not _is_financial_sale_transaction(t):
         return 0
     total = _money(t.get("total"))
-    paid = _money(t.get("paid_amount"), None)
-    if paid is None:
-        paid = _money(t.get("cash_received"), total)
-    return max(0, min(total, paid)) if total else max(0, paid)
+    if total <= 0:
+        return 0
+    debt_ctx = debt_ctx or {}
+    debt = (debt_ctx.get("debt_by_trx") or {}).get(t.get("id"))
+    if debt:
+        initial_paid = _initial_paid_for_transaction(t, debt)
+        payments_by_trx = debt_ctx.get("payments_by_trx") or {}
+        payments_by_debt = debt_ctx.get("payments_by_debt") or {}
+        payment_sum = sum(_money(p.get("amount")) for p in payments_by_trx.get(t.get("id"), []))
+        if not payment_sum:
+            payment_sum = sum(_money(p.get("amount")) for p in payments_by_debt.get(debt.get("id"), []))
+        paid_on_debt = _money(debt.get("paid"))
+        collected = max(initial_paid + payment_sum, initial_paid + paid_on_debt)
+        # Jika bon sudah berstatus lunas, transaksi asli harus dianggap terkumpul penuh.
+        if debt.get("status") == "paid":
+            collected = max(collected, total)
+        return max(0, min(total, collected))
+    paid = t.get("paid_amount")
+    if paid is not None:
+        return max(0, min(total, _money(paid)))
+    pm = (t.get("payment_method") or "cash").lower()
+    if pm == "cash":
+        return max(0, min(total, _money(t.get("cash_received"))))
+    return total
+
+
+def _transaction_cash_collected(t: dict) -> int:
+    """Fallback sinkron untuk kode lama. Untuk laporan baru pakai _canonical_cash_collected + debt_ctx."""
+    return _canonical_cash_collected(t, None)
+
+
+def _enrich_transaction_financial_fields(t: dict, debt_ctx: Optional[dict] = None) -> dict:
+    row = dict(t or {})
+    if not _is_financial_sale_transaction(row):
+        return row
+    total = _money(row.get("total"))
+    debt_ctx = debt_ctx or {}
+    debt = (debt_ctx.get("debt_by_trx") or {}).get(row.get("id"))
+    collected = _canonical_cash_collected(row, debt_ctx)
+    remaining = max(0, total - collected)
+    row["paid_amount"] = collected
+    row["cash_collected"] = collected
+    row["debt_amount"] = remaining
+    row["payment_status"] = "PAID" if remaining == 0 else ("PARTIAL" if collected > 0 else "DEBT")
+    row["is_bon"] = remaining > 0
+    if debt:
+        row["debt_id"] = debt.get("id")
+        row["debt_initial_amount"] = _money(debt.get("amount"))
+        row["initial_paid"] = _initial_paid_for_transaction(row, debt)
+        row["debt_payments_total"] = max(0, collected - row.get("initial_paid", 0))
+    return row
 
 
 async def _repair_legacy_bon_settlement_transactions() -> int:
-    """Perbaiki data yang sempat dibuat oleh versi lama pelunasan bon.
+    """Perbaiki data bon dari patch lama.
 
-    Versi lama pernah: cancel transaksi awal Rp21.000 lalu membuat transaksi baru
-    Rp11.000 untuk pelunasan. Akibatnya Keuangan hanya membaca Rp11.000. Repair ini:
-    - mengembalikan transaksi awal sebagai transaksi penjualan aktif,
-    - set paid_amount transaksi awal menjadi total jika bon lunas,
-    - menandai transaksi pelunasan legacy sebagai receipt-only/financial_exclude.
-    Aman dijalankan berulang karena idempotent.
+    Patch awal sempat membatalkan transaksi Rp21.000 dan membuat transaksi baru
+    Rp11.000 untuk pelunasan. Fungsi ini mengembalikan transaksi asli sebagai
+    sumber riwayat/pendapatan, menandai transaksi Rp11.000 sebagai receipt-only,
+    dan membuat debt_payments agar laporan konsisten.
     """
-    legacy = await db.transactions.find({
-        "$or": [
-            {"settled_from_debt": {"$exists": True}},
-            {"receipt_kind": "DEBT_SETTLEMENT"},
-        ],
-        "financial_exclude": {"$ne": True},
-    }).to_list(1000)
     repaired = 0
-    for settlement in legacy:
-        debt_id = settlement.get("settled_from_debt")
-        original_id = settlement.get("settled_from_trx")
-        debt = await db.customer_debts.find_one({"id": debt_id}) if debt_id else None
-        if not original_id and debt:
-            original_id = debt.get("transaction_id")
-        original = await db.transactions.find_one({"id": original_id}) if original_id else None
+    debts = await db.customer_debts.find({"transaction_id": {"$exists": True}}, {"_id": 0}).to_list(5000)
+    for debt in debts:
+        debt_id = debt.get("id")
+        original_id = debt.get("transaction_id")
+        if not original_id:
+            continue
+        original = await db.transactions.find_one({"id": original_id})
+        if not original:
+            continue
 
-        # Tandai dokumen pelunasan sebagai receipt-only supaya tidak masuk revenue.
-        await db.transactions.update_one(
-            {"id": settlement.get("id")},
-            {"$set": {
-                "financial_exclude": True,
-                "receipt_kind": "DEBT_SETTLEMENT",
-                "transaction_type": "DEBT_SETTLEMENT",
-                "migration_note": "Excluded from revenue; settlement updates original transaction instead.",
-            }},
-        )
+        settlement_docs = []
+        if debt.get("settled_trx_id"):
+            st = await db.transactions.find_one({"id": debt.get("settled_trx_id")})
+            if st:
+                settlement_docs.append(st)
+        more = await db.transactions.find({
+            "$or": [
+                {"settled_from_debt": debt_id},
+                {"receipt_kind": "DEBT_SETTLEMENT", "settled_from_debt": debt_id},
+            ]
+        }).to_list(50)
+        for st in more:
+            if st and all(st.get("id") != x.get("id") for x in settlement_docs):
+                settlement_docs.append(st)
 
-        if original:
-            original_total = _money(original.get("total") or (debt or {}).get("original_total"))
-            if original_total <= 0:
+        original_total = max(_money(debt.get("original_total")), _money(original.get("total")), _money(original.get("subtotal")))
+        if original_total <= 0:
+            continue
+        initial_paid = _money(debt.get("initial_paid"), None)
+        if initial_paid is None:
+            initial_paid = max(0, original_total - _money(debt.get("amount")))
+        initial_paid = max(0, min(original_total, initial_paid))
+
+        # Pastikan setiap settlement legacy punya debt_payment record.
+        payment_sum = 0
+        for st in settlement_docs:
+            amount = _money(st.get("payment_amount") or st.get("total") or st.get("cash_received"))
+            if amount <= 0:
                 continue
-            debt_status_paid = bool(debt and debt.get("status") == "paid")
-            settlement_amount = _money(settlement.get("payment_amount") or settlement.get("total"))
-            current_paid = _money(original.get("paid_amount"), 0)
-            if debt_status_paid:
-                new_paid = original_total
-            else:
-                new_paid = min(original_total, current_paid + settlement_amount)
-            new_debt = max(0, original_total - new_paid)
+            payment_sum += amount
+            exists = await db.debt_payments.find_one({"legacy_transaction_id": st.get("id")})
+            if not exists:
+                await db.debt_payments.insert_one({
+                    "id": gen_id(),
+                    "debt_id": debt_id,
+                    "transaction_id": original_id,
+                    "legacy_transaction_id": st.get("id"),
+                    "customer_name": debt.get("customer_name", "Pelanggan"),
+                    "amount": amount,
+                    "cash_received": _money(st.get("cash_received"), amount),
+                    "change": _money(st.get("change"), 0),
+                    "payment_method": st.get("payment_method", debt.get("settlement_method", "cash")),
+                    "created_at": st.get("created_at") or debt.get("last_paid_at") or now_iso(),
+                    "cashier_id": st.get("cashier_id"),
+                    "cashier_name": st.get("cashier_name"),
+                    "migration_note": "created from legacy settlement transaction",
+                })
+
             await db.transactions.update_one(
-                {"id": original.get("id")},
-                {
-                    "$set": {
-                        "cancelled": False,
-                        "paid_amount": new_paid,
-                        "debt_amount": new_debt,
-                        "payment_status": "PAID" if new_debt == 0 else ("PARTIAL" if new_paid > 0 else "DEBT"),
-                        "is_bon": new_debt > 0,
-                        "legacy_bon_repaired": True,
-                        "settled_at": now_iso() if new_debt == 0 else original.get("settled_at"),
-                    },
-                    "$unset": {
-                        "cancelled_at": "",
-                        "cancelled_by": "",
-                        "cancel_reason": "",
-                        "replaced_by": "",
-                    },
-                },
+                {"id": st.get("id")},
+                {"$set": {
+                    "financial_exclude": True,
+                    "receipt_kind": "DEBT_SETTLEMENT",
+                    "transaction_type": "DEBT_SETTLEMENT",
+                    "settled_from_debt": debt_id,
+                    "settled_from_trx": original_id,
+                    "migration_note": "Excluded from revenue/history; original transaction holds sale.",
+                }},
             )
-            repaired += 1
+
+        payments = await db.debt_payments.find({"$or": [{"transaction_id": original_id}, {"debt_id": debt_id}]}, {"_id": 0}).to_list(100)
+        payment_sum = max(payment_sum, sum(_money(p.get("amount")) for p in payments))
+        paid_on_debt = max(_money(debt.get("paid")), payment_sum)
+        if debt.get("status") == "paid":
+            new_paid = original_total
+            new_debt = 0
+        else:
+            new_paid = min(original_total, initial_paid + paid_on_debt)
+            new_debt = max(0, original_total - new_paid)
+
+        await db.transactions.update_one(
+            {"id": original_id},
+            {
+                "$set": {
+                    "cancelled": False,
+                    "total": original_total,
+                    "subtotal": max(_money(original.get("subtotal")), original_total),
+                    "paid_amount": new_paid,
+                    "debt_amount": new_debt,
+                    "payment_status": "PAID" if new_debt == 0 else ("PARTIAL" if new_paid > 0 else "DEBT"),
+                    "is_bon": new_debt > 0,
+                    "initial_paid": initial_paid,
+                    "legacy_bon_repaired": True,
+                    "settled_at": now_iso() if new_debt == 0 else original.get("settled_at"),
+                },
+                "$unset": {"cancelled_at": "", "cancelled_by": "", "cancel_reason": "", "replaced_by": ""},
+            },
+        )
+        repaired += 1
     return repaired
 
 
 def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None) -> dict:
-    """Normalisasi state bon lama & baru.
-
-    Menghasilkan original_total, remaining_before, dan previous_paid yang dipakai
-    untuk update transaksi asal. Ini mencegah kasus paid_amount menjadi hanya
-    nominal pelunasan terakhir (misal Rp11.000) padahal total transaksi Rp21.000.
-    """
+    """Normalisasi state bon untuk pelunasan baru."""
     amount = _money(debt.get("amount"))
     paid_on_debt = _money(debt.get("paid"))
     original_total = _money(debt.get("original_total") or (original_trx or {}).get("total") or amount)
     remaining_before = max(0, amount - paid_on_debt)
-    computed_paid_before = max(0, original_total - remaining_before) if original_total else paid_on_debt
-    initial_paid = _money(debt.get("initial_paid"))
-    trx_paid = _money((original_trx or {}).get("paid_amount"), 0)
-    previous_paid = max(trx_paid, initial_paid + paid_on_debt, computed_paid_before)
+    initial_paid = _money(debt.get("initial_paid"), None)
+    if initial_paid is None:
+        initial_paid = max(0, original_total - amount)
+    trx_paid = _money((original_trx or {}).get("paid_amount"), initial_paid)
+    previous_paid = max(trx_paid, initial_paid + paid_on_debt)
     return {
         "amount": amount,
         "paid_on_debt": paid_on_debt,
         "original_total": original_total,
         "remaining_before": remaining_before,
         "previous_paid": previous_paid,
+        "initial_paid": initial_paid,
     }
 
 # ---------- Reports ----------
 @api.get("/reports/profit-loss")
 async def profit_loss(user: dict = Depends(get_current_user)):
-    transactions = await db.transactions.find({"cancelled": {"$ne": True}}, {"_id": 0}).to_list(5000)
+    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+    debt_ctx = await _load_debt_financial_context()
     revenue_by_unit = {}
     for t in transactions:
         if not _is_financial_sale_transaction(t):
             continue
         u = t.get("unit", "warung")
-        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + _transaction_cash_collected(t)
+        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + _canonical_cash_collected(t, debt_ctx)
     # Include non-POS incomes (cashback, tax refund, etc.) as "other_income"
     other_income_by_cat = {}
     for inc in incomes:
@@ -2056,8 +2293,9 @@ async def balance_sheet(user: dict = Depends(get_current_user)):
     capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
     debts = await db.customer_debts.find({}, {"_id": 0}).to_list(5000)
     inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(5000)
+    debt_ctx = await _load_debt_financial_context()
 
-    total_revenue = sum(_transaction_cash_collected(t) for t in transactions)
+    total_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
     total_expense = sum(e.get("amount", 0) for e in expenses)
     total_capital = sum(c.get("amount", 0) for c in capital)
     piutang_bon = sum(d.get("amount", 0) - d.get("paid", 0) for d in debts if d.get("status") != "paid")
@@ -2087,7 +2325,8 @@ async def cash_flow(user: dict = Depends(get_current_user)):
     transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
-    operating_in = sum(_transaction_cash_collected(t) for t in transactions)
+    debt_ctx = await _load_debt_financial_context()
+    operating_in = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
     operating_out = sum(e.get("amount", 0) for e in expenses)
     financing_in = sum(c.get("amount", 0) for c in capital)
     return {
@@ -2121,6 +2360,7 @@ async def cash_balance(user: dict = Depends(get_current_user)):
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
     capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+    debt_ctx = await _load_debt_financial_context()
 
     methods = ["cash", "bank", "ewallet"]
     balance = {m: 0 for m in methods}
@@ -2135,7 +2375,7 @@ async def cash_balance(user: dict = Depends(get_current_user)):
         if not _is_financial_sale_transaction(t):
             continue
         m = _normalize_pm(t.get("payment_method"))
-        amt = _transaction_cash_collected(t)
+        amt = _canonical_cash_collected(t, debt_ctx)
         if amt <= 0:
             continue
         balance[m] += amt
@@ -2182,15 +2422,17 @@ async def dashboard_summary(user: dict = Depends(get_current_user)):
     expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
     incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
     capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
+    debt_ctx = await _load_debt_financial_context()
+    transactions = [_enrich_transaction_financial_fields(t, debt_ctx) for t in transactions if not _is_debt_settlement_document(t)]
 
     today_tx = [t for t in transactions if t.get("created_at", "").startswith(today)]
     today_exp = [e for e in expenses if (e.get("date") or "").startswith(today)]
     today_inc = [i for i in incomes if (i.get("date") or "").startswith(today)]
-    today_revenue = sum(t.get("paid_amount", t.get("total", 0)) for t in today_tx if (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+    today_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in today_tx)
     today_other = sum(i.get("amount", 0) for i in today_inc)
     today_expense = sum(e.get("amount", 0) for e in today_exp)
 
-    total_revenue = sum(_transaction_cash_collected(t) for t in transactions)
+    total_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
     total_other = sum(i.get("amount", 0) for i in incomes)
     total_expense = sum(e.get("amount", 0) for e in expenses)
     total_capital = sum(c.get("amount", 0) for c in capital)
@@ -2199,16 +2441,16 @@ async def dashboard_summary(user: dict = Depends(get_current_user)):
     # Revenue by unit
     rev_by_unit = {}
     for t in transactions:
-        if (t.get("transaction_type") or "SALE") != "SALE" or t.get("cancelled"):
+        if not _is_financial_sale_transaction(t):
             continue
         u = t.get("unit", "warung")
-        rev_by_unit[u] = rev_by_unit.get(u, 0) + t.get("paid_amount", t.get("total", 0))
+        rev_by_unit[u] = rev_by_unit.get(u, 0) + _canonical_cash_collected(t, debt_ctx)
 
     # Weekly trend (last 7 days)
     weekly = []
     for delta in range(6, -1, -1):
         day = (datetime.now(timezone.utc) - timedelta(days=delta)).date().isoformat()
-        rev = sum(t.get("paid_amount", t.get("total", 0)) for t in transactions if t.get("created_at", "").startswith(day) and (t.get("transaction_type") or "SALE") == "SALE" and not t.get("cancelled"))
+        rev = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions if t.get("created_at", "").startswith(day) and _is_financial_sale_transaction(t))
         exp = sum(e.get("amount", 0) for e in expenses if (e.get("date") or "").startswith(day))
         weekly.append({"day": day[5:], "revenue": rev, "expense": exp})
 
@@ -2429,6 +2671,8 @@ async def startup():
     await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
     await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
     await db.audit_logs.create_index("timestamp")
+    await db.debt_payments.create_index([("transaction_id", 1), ("created_at", -1)])
+    await db.debt_payments.create_index([("debt_id", 1), ("created_at", -1)])
     # Repair data yang sempat dibuat versi lama: pelunasan bon jangan menjadi revenue baru Rp11.000.
     try:
         repaired = await _repair_legacy_bon_settlement_transactions()
@@ -2593,9 +2837,25 @@ async def create_plot(body: PlotIn, user: dict = Depends(get_current_user)):
     return await insert_doc("vineyard_plots", body.model_dump())
 
 
+@api.put("/vineyard/plots/{plot_id}")
+async def update_plot(plot_id: str, body: PlotIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["updated_at"] = now_iso()
+    await db.vineyard_plots.update_one({"id": plot_id}, {"$set": data})
+    doc = await db.vineyard_plots.find_one({"id": plot_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Plot tidak ditemukan")
+    await write_audit(user, "update", "vineyard_plot", plot_id, {"name": data.get("name")})
+    return doc
+
+
 @api.delete("/vineyard/plots/{plot_id}")
 async def delete_plot(plot_id: str, user: dict = Depends(get_current_user)):
+    linked = await db.vineyard_harvests.count_documents({"plot_id": plot_id}) + await db.vineyard_activities.count_documents({"plot_id": plot_id}) + await db.vineyard_input_usages.count_documents({"plot_id": plot_id})
+    if linked:
+        raise HTTPException(400, "Plot sudah punya panen/aktivitas/input. Hapus catatan terkait dulu agar riwayat tidak rusak.")
     await db.vineyard_plots.delete_one({"id": plot_id})
+    await write_audit(user, "delete", "vineyard_plot", plot_id, {})
     return {"ok": True}
 
 
@@ -2606,6 +2866,7 @@ class HarvestIn(BaseModel):
     quality_grade: str = "A"
     notes: Optional[str] = ""
     date: Optional[str] = None
+    inventory_item_id: Optional[str] = ""
 
 
 @api.get("/vineyard/harvests")
@@ -2613,11 +2874,178 @@ async def list_harvests(user: dict = Depends(get_current_user)):
     return await db.vineyard_harvests.find({}, {"_id": 0}).sort("date", -1).to_list(500)
 
 
+async def _get_or_create_harvest_inventory_item(grade: str, item_id: str = "") -> dict:
+    if item_id:
+        existing = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
+        if existing:
+            return existing
+    grade = (grade or "A").upper()
+    name = f"Anggur Panen Grade {grade}"
+    existing = await db.inventory_items.find_one({"name": name, "business_unit": "anggur"}, {"_id": 0})
+    if existing:
+        return existing
+    doc = {
+        "id": gen_id(), "name": name, "category": "Hasil Panen", "unit": "kg",
+        "current_stock": 0, "min_stock": 0, "cost_price": 0, "sell_price": 0,
+        "business_unit": "anggur", "location": "Gudang Panen",
+        "notes": "Dibuat otomatis saat catat panen kebun anggur", "created_at": now_iso(),
+    }
+    await db.inventory_items.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
 @api.post("/vineyard/harvests")
 async def create_harvest(body: HarvestIn, user: dict = Depends(get_current_user)):
+    if body.quantity_kg <= 0:
+        raise HTTPException(400, "Jumlah panen harus lebih dari 0 kg")
+    plot = await db.vineyard_plots.find_one({"id": body.plot_id}, {"_id": 0})
+    if not plot:
+        raise HTTPException(404, "Plot kebun tidak ditemukan")
+    inv_item = await _get_or_create_harvest_inventory_item(body.quality_grade, body.inventory_item_id or "")
     data = body.model_dump()
     data["date"] = data.get("date") or now_iso()
-    return await insert_doc("vineyard_harvests", data)
+    data["inventory_item_id"] = inv_item["id"]
+    data["inventory_item_name"] = inv_item.get("name")
+    data["stock_recorded"] = True
+    data["plot_name"] = plot.get("name", "")
+    doc = await insert_doc("vineyard_harvests", data)
+    await db.inventory_items.update_one({"id": inv_item["id"]}, {"$inc": {"current_stock": float(body.quantity_kg)}})
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": inv_item["id"], "type": "vineyard_harvest",
+        "quantity": float(body.quantity_kg),
+        "reason": f"Panen {plot.get('name','Kebun')} kualitas {body.quality_grade}",
+        "reference": "vineyard_harvest", "reference_id": doc["id"],
+        "created_at": now_iso(),
+    })
+    await write_notification("HARVEST", "Panen anggur dicatat", f"{plot.get('name','Plot')} +{body.quantity_kg:g} kg masuk Inventori/Gudang", business_id="anggur", ref_type="vineyard_harvest", ref_id=doc["id"])
+    await write_audit(user, "create", "vineyard_harvest", doc["id"], {"qty": body.quantity_kg, "item_id": inv_item["id"]})
+    return doc
+
+
+@api.delete("/vineyard/harvests/{harvest_id}")
+async def delete_harvest(harvest_id: str, user: dict = Depends(get_current_user)):
+    h = await db.vineyard_harvests.find_one({"id": harvest_id}, {"_id": 0})
+    if not h:
+        raise HTTPException(404, "Panen tidak ditemukan")
+    if h.get("inventory_item_id") and h.get("quantity_kg"):
+        await db.inventory_items.update_one({"id": h["inventory_item_id"]}, {"$inc": {"current_stock": -float(h.get("quantity_kg") or 0)}})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": h["inventory_item_id"], "type": "vineyard_harvest_delete_reverse",
+            "quantity": -float(h.get("quantity_kg") or 0), "reason": f"Hapus catatan panen {h.get('plot_name','')}",
+            "reference": "vineyard_harvest", "reference_id": harvest_id, "created_at": now_iso(),
+        })
+    await db.vineyard_harvests.delete_one({"id": harvest_id})
+    await write_audit(user, "delete", "vineyard_harvest", harvest_id, {"qty": h.get("quantity_kg")})
+    return {"ok": True}
+
+
+class VineyardActivityIn(BaseModel):
+    plot_id: str
+    activity_type: str = "perawatan"
+    date: Optional[str] = None
+    labor_hours: Optional[float] = 0
+    cost: Optional[int] = 0
+    notes: Optional[str] = ""
+
+
+@api.get("/vineyard/activities")
+async def list_vineyard_activities(user: dict = Depends(get_current_user)):
+    acts = await db.vineyard_activities.find({}, {"_id": 0}).sort("date", -1).to_list(500)
+    plots = {p["id"]: p for p in await list_collection("vineyard_plots")}
+    for a in acts:
+        a["plot_name"] = plots.get(a.get("plot_id"), {}).get("name", "—")
+    return acts
+
+
+@api.post("/vineyard/activities")
+async def create_vineyard_activity(body: VineyardActivityIn, user: dict = Depends(get_current_user)):
+    if not await db.vineyard_plots.find_one({"id": body.plot_id}):
+        raise HTTPException(404, "Plot kebun tidak ditemukan")
+    doc = body.model_dump()
+    doc["date"] = doc.get("date") or now_iso()
+    doc = await insert_doc("vineyard_activities", doc)
+    if int(body.cost or 0) > 0:
+        await db.expenses.insert_one({
+            "id": gen_id(), "amount": int(body.cost or 0), "category": "Biaya Kebun Anggur", "unit": "anggur",
+            "notes": f"Aktivitas kebun: {body.activity_type}", "date": doc["date"], "created_at": now_iso(),
+            "reference": "vineyard_activity", "reference_id": doc["id"],
+        })
+    await write_audit(user, "create", "vineyard_activity", doc["id"], {"type": body.activity_type})
+    return doc
+
+
+@api.delete("/vineyard/activities/{activity_id}")
+async def delete_vineyard_activity(activity_id: str, user: dict = Depends(get_current_user)):
+    await db.vineyard_activities.delete_one({"id": activity_id})
+    await db.expenses.delete_many({"reference": "vineyard_activity", "reference_id": activity_id})
+    await write_audit(user, "delete", "vineyard_activity", activity_id, {})
+    return {"ok": True}
+
+
+class VineyardInputUseIn(BaseModel):
+    plot_id: str
+    item_id: str
+    quantity: float
+    purpose: Optional[str] = "Perawatan kebun"
+    date: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+@api.get("/vineyard/input-usages")
+async def list_vineyard_input_usages(user: dict = Depends(get_current_user)):
+    rows = await db.vineyard_input_usages.find({}, {"_id": 0}).sort("date", -1).to_list(500)
+    plots = {p["id"]: p for p in await list_collection("vineyard_plots")}
+    items = {i["id"]: i for i in await list_collection("inventory_items")}
+    for r in rows:
+        r["plot_name"] = plots.get(r.get("plot_id"), {}).get("name", "—")
+        r["item_name"] = items.get(r.get("item_id"), {}).get("name", r.get("item_name", "—"))
+        r["unit"] = items.get(r.get("item_id"), {}).get("unit", r.get("unit", ""))
+    return rows
+
+
+@api.post("/vineyard/input-usages")
+async def create_vineyard_input_usage(body: VineyardInputUseIn, user: dict = Depends(get_current_user)):
+    if body.quantity <= 0:
+        raise HTTPException(400, "Jumlah input harus lebih dari 0")
+    plot = await db.vineyard_plots.find_one({"id": body.plot_id}, {"_id": 0})
+    item = await db.inventory_items.find_one({"id": body.item_id}, {"_id": 0})
+    if not plot:
+        raise HTTPException(404, "Plot kebun tidak ditemukan")
+    if not item:
+        raise HTTPException(404, "Item inventori tidak ditemukan")
+    if float(item.get("current_stock") or 0) < float(body.quantity):
+        raise HTTPException(400, f"Stok {item.get('name')} tidak cukup")
+    doc = body.model_dump()
+    doc["date"] = doc.get("date") or now_iso()
+    doc["item_name"] = item.get("name")
+    doc["unit"] = item.get("unit", "")
+    doc["plot_name"] = plot.get("name")
+    doc = await insert_doc("vineyard_input_usages", doc)
+    await db.inventory_items.update_one({"id": body.item_id}, {"$inc": {"current_stock": -float(body.quantity)}})
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": body.item_id, "type": "vineyard_input_use",
+        "quantity": -float(body.quantity), "reason": f"Input kebun {plot.get('name')}: {body.purpose}",
+        "reference": "vineyard_input_usage", "reference_id": doc["id"], "created_at": now_iso(),
+    })
+    await write_audit(user, "create", "vineyard_input_usage", doc["id"], {"item_id": body.item_id, "qty": body.quantity})
+    return doc
+
+
+@api.delete("/vineyard/input-usages/{usage_id}")
+async def delete_vineyard_input_usage(usage_id: str, user: dict = Depends(get_current_user)):
+    u = await db.vineyard_input_usages.find_one({"id": usage_id}, {"_id": 0})
+    if not u:
+        raise HTTPException(404, "Pemakaian input tidak ditemukan")
+    await db.inventory_items.update_one({"id": u.get("item_id")}, {"$inc": {"current_stock": float(u.get("quantity") or 0)}})
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": u.get("item_id"), "type": "vineyard_input_delete_reverse",
+        "quantity": float(u.get("quantity") or 0), "reason": "Hapus pemakaian input kebun",
+        "reference": "vineyard_input_usage", "reference_id": usage_id, "created_at": now_iso(),
+    })
+    await db.vineyard_input_usages.delete_one({"id": usage_id})
+    await write_audit(user, "delete", "vineyard_input_usage", usage_id, {})
+    return {"ok": True}
 
 
 # ---------- B2B Customers & Invoices ----------
@@ -2636,6 +3064,23 @@ async def list_b2b_customers(user: dict = Depends(get_current_user)):
 @api.post("/b2b/customers")
 async def create_b2b_customer(body: B2BCustomerIn, user: dict = Depends(get_current_user)):
     return await insert_doc("b2b_customers", body.model_dump())
+
+
+@api.put("/b2b/customers/{cust_id}")
+async def update_b2b_customer(cust_id: str, body: B2BCustomerIn, user: dict = Depends(get_current_user)):
+    await db.b2b_customers.update_one({"id": cust_id}, {"$set": {**body.model_dump(), "updated_at": now_iso()}})
+    doc = await db.b2b_customers.find_one({"id": cust_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Pelanggan tidak ditemukan")
+    return doc
+
+
+@api.delete("/b2b/customers/{cust_id}")
+async def delete_b2b_customer(cust_id: str, user: dict = Depends(get_current_user)):
+    if await db.b2b_invoices.find_one({"customer_id": cust_id}):
+        raise HTTPException(400, "Pelanggan sudah punya invoice. Hapus invoice terkait dulu.")
+    await db.b2b_customers.delete_one({"id": cust_id})
+    return {"ok": True}
 
 
 class B2BInvoiceItemIn(BaseModel):
@@ -2718,19 +3163,40 @@ async def list_suppliers(user: dict = Depends(get_current_user)):
     return await list_collection("suppliers")
 
 
+def normalize_supplier_term(term: str) -> str:
+    allowed = {"cash", "transfer", "qris", "bon"}
+    t = (term or "cash").lower()
+    aliases = {"tunai": "cash", "cod": "cash", "credit": "bon", "hutang": "bon"}
+    return aliases.get(t, t if t in allowed else "cash")
+
+
 @api.post("/suppliers")
 async def create_supplier(body: SupplierIn, user: dict = Depends(get_current_user)):
     data = body.model_dump()
-    allowed = {"cash", "transfer", "qris", "bon"}
-    term = (data.get("payment_terms") or "cash").lower()
-    aliases = {"tunai": "cash", "cod": "cash", "credit": "bon", "hutang": "bon"}
-    data["payment_terms"] = aliases.get(term, term if term in allowed else "cash")
+    data["payment_terms"] = normalize_supplier_term(data.get("payment_terms"))
     return await insert_doc("suppliers", data)
+
+
+@api.put("/suppliers/{sup_id}")
+async def update_supplier(sup_id: str, body: SupplierIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["payment_terms"] = normalize_supplier_term(data.get("payment_terms"))
+    data["updated_at"] = now_iso()
+    await db.suppliers.update_one({"id": sup_id}, {"$set": data})
+    doc = await db.suppliers.find_one({"id": sup_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Supplier tidak ditemukan")
+    await write_audit(user, "update", "supplier", sup_id, {"name": data.get("name")})
+    return doc
 
 
 @api.delete("/suppliers/{sup_id}")
 async def delete_supplier(sup_id: str, user: dict = Depends(get_current_user)):
+    linked = await db.purchase_orders.count_documents({"supplier_id": sup_id})
+    if linked:
+        raise HTTPException(400, "Supplier sudah dipakai PO. Hapus/ubah PO terkait dulu.")
     await db.suppliers.delete_one({"id": sup_id})
+    await write_audit(user, "delete", "supplier", sup_id, {})
     return {"ok": True}
 
 
@@ -2745,7 +3211,13 @@ class POIn(BaseModel):
     supplier_id: str
     items: List[POItemIn]
     expected_date: Optional[str] = None
+    due_date: Optional[str] = None
     notes: Optional[str] = ""
+    purchase_url: Optional[str] = ""
+    invoice_image_url: Optional[str] = ""
+    payment_proof_url: Optional[str] = ""
+    paid_amount: Optional[int] = 0
+    payment_method: Optional[str] = "transfer"
 
 
 @api.get("/purchase-orders")
@@ -2760,17 +3232,47 @@ async def list_po(user: dict = Depends(get_current_user)):
 @api.post("/purchase-orders")
 async def create_po(body: POIn, user: dict = Depends(get_current_user)):
     items = [i.model_dump() for i in body.items]
-    total = sum(i["quantity"] * i["unit_price"] for i in items)
+    total = int(sum(i["quantity"] * i["unit_price"] for i in items))
     po_no = f"PO-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:5].upper()}"
+    paid = max(0, min(int(body.paid_amount or 0), total))
+    pay_status = "paid" if paid >= total and total > 0 else ("partial" if paid > 0 else "unpaid")
     doc = {
         "id": gen_id(), "po_no": po_no, "supplier_id": body.supplier_id,
-        "items": items, "total": int(total), "status": "sent",
-        "expected_date": body.expected_date, "notes": body.notes,
+        "items": items, "total": total, "paid_amount": paid, "payment_status": pay_status,
+        "status": "sent", "delivery_status": "pending",
+        "expected_date": body.expected_date, "due_date": body.due_date, "notes": body.notes,
+        "purchase_url": body.purchase_url or "", "invoice_image_url": body.invoice_image_url or "",
+        "payment_proof_url": body.payment_proof_url or "", "payment_method": body.payment_method or "transfer",
         "created_by": user["id"], "created_at": now_iso(),
     }
     await db.purchase_orders.insert_one(doc)
+    if paid > 0:
+        supplier = await db.suppliers.find_one({"id": body.supplier_id})
+        pay_doc = {**doc, "paid_amount": 0}
+        await _record_purchase_payment(pay_doc, paid, (supplier or {}).get("name", ""), "po", body.payment_method or "transfer", body.payment_proof_url or "", "Pembayaran awal PO")
     doc.pop("_id", None)
     return doc
+
+
+@api.put("/purchase-orders/{po_id}")
+async def update_po(po_id: str, body: POIn, user: dict = Depends(get_current_user)):
+    po = await db.purchase_orders.find_one({"id": po_id})
+    if not po:
+        raise HTTPException(404, "PO tidak ditemukan")
+    items = [i.model_dump() for i in body.items]
+    total = int(sum(i["quantity"] * i["unit_price"] for i in items))
+    paid = int(po.get("paid_amount") or 0)
+    pay_status = "paid" if paid >= total and total > 0 else ("partial" if paid > 0 else "unpaid")
+    update = {
+        "supplier_id": body.supplier_id, "items": items, "total": total, "payment_status": pay_status,
+        "expected_date": body.expected_date, "due_date": body.due_date, "notes": body.notes,
+        "purchase_url": body.purchase_url or "", "invoice_image_url": body.invoice_image_url or "",
+        "payment_proof_url": body.payment_proof_url or po.get("payment_proof_url", ""),
+        "payment_method": body.payment_method or po.get("payment_method", "transfer"), "updated_at": now_iso(),
+    }
+    await db.purchase_orders.update_one({"id": po_id}, {"$set": update})
+    await write_audit(user, "update", "purchase_order", po_id, {"po_no": po.get("po_no")})
+    return await db.purchase_orders.find_one({"id": po_id}, {"_id": 0})
 
 
 @api.post("/purchase-orders/{po_id}/receive")
@@ -2783,20 +3285,47 @@ async def receive_po(po_id: str, user: dict = Depends(get_current_user)):
     stock_result = await _record_stock_receipt(po, kind="po")
     if stock_result["added"] == 0 and stock_result["skipped"]:
         raise HTTPException(400, f"Tidak ada item PO yang cocok dengan inventori: {', '.join(stock_result['skipped'])}. Periksa nama/ID item.")
-    supplier = await db.suppliers.find_one({"id": po.get("supplier_id")})
-    if not po.get("expense_recorded"):
-        await _record_purchase_expense(po, (supplier or {}).get("name", ""), kind="po")
     await db.purchase_orders.update_one(
         {"id": po_id},
         {"$set": {
             "status": "received", "received_at": now_iso(),
             "stock_received": True, "stock_received_at": now_iso(),
-            "expense_recorded": True, "expense_recorded_at": now_iso(),
-            "delivery_status": "arrived", "payment_status": po.get("payment_status") or "paid",
+            "delivery_status": "arrived",
+            "payment_status": po.get("payment_status") or ("partial" if int(po.get("paid_amount") or 0) > 0 else "unpaid"),
         }},
     )
     await write_audit(user, "update", "purchase_order", po_id, {"action": "receive"})
     return {"ok": True, "added": stock_result["added"], "skipped": stock_result["skipped"], "items": stock_result["items_added"]}
+
+
+class PurchasePayIn(BaseModel):
+    amount: int
+    method: Optional[str] = "transfer"
+    payment_proof_url: Optional[str] = ""
+    notes: Optional[str] = ""
+    paid_at: Optional[str] = None
+
+
+@api.get("/purchase-orders/{po_id}/payments")
+async def list_po_payments(po_id: str, user: dict = Depends(get_current_user)):
+    return await db.purchase_payments.find({"kind": "po", "purchase_id": po_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.post("/purchase-orders/{po_id}/pay")
+async def pay_purchase_order(po_id: str, body: PurchasePayIn, user: dict = Depends(get_current_user)):
+    po = await db.purchase_orders.find_one({"id": po_id}, {"_id": 0})
+    if not po:
+        raise HTTPException(404, "PO tidak ditemukan")
+    supplier = await db.suppliers.find_one({"id": po.get("supplier_id")})
+    pay = await _record_purchase_payment(po, body.amount, (supplier or {}).get("name", ""), "po", body.method or "transfer", body.payment_proof_url or po.get("payment_proof_url", ""), body.notes or "", body.paid_at or "")
+    new_paid = int(po.get("paid_amount") or 0) + int(pay["amount"])
+    status = "paid" if new_paid >= int(po.get("total") or 0) else "partial"
+    update = {"paid_amount": new_paid, "payment_status": status, "last_payment_at": pay["paid_at"]}
+    if body.payment_proof_url:
+        update["payment_proof_url"] = body.payment_proof_url
+    await db.purchase_orders.update_one({"id": po_id}, {"$set": update})
+    await write_audit(user, "update", "purchase_order_payment", po_id, {"amount": pay["amount"], "status": status})
+    return {"ok": True, "payment": pay, "paid_amount": new_paid, "payment_status": status}
 
 
 # ---------- Online Orders (Shopee/Tokopedia) ----------
@@ -2807,7 +3336,12 @@ class OnlineOrderIn(BaseModel):
     shipping_cost: Optional[int] = 0
     order_date: Optional[str] = None
     expected_date: Optional[str] = None
+    due_date: Optional[str] = None
     invoice_image_url: Optional[str] = ""
+    payment_proof_url: Optional[str] = ""
+    order_url: Optional[str] = ""
+    paid_amount: Optional[int] = 0
+    payment_method: Optional[str] = "transfer"
     notes: Optional[str] = ""
 
 
@@ -2819,17 +3353,46 @@ async def list_online(user: dict = Depends(get_current_user)):
 @api.post("/online-orders")
 async def create_online(body: OnlineOrderIn, user: dict = Depends(get_current_user)):
     items = [i.model_dump() for i in body.items]
-    total = sum(i["quantity"] * i["unit_price"] for i in items) + (body.shipping_cost or 0)
+    total = int(sum(i["quantity"] * i["unit_price"] for i in items) + (body.shipping_cost or 0))
+    paid = max(0, min(int(body.paid_amount or 0), total))
+    pay_status = "paid" if paid >= total and total > 0 else ("partial" if paid > 0 else "unpaid")
     doc = {
         "id": gen_id(), "platform": body.platform, "order_number": body.order_number,
-        "items": items, "total": int(total), "shipping_cost": body.shipping_cost or 0,
-        "status": "ordered", "order_date": body.order_date or now_iso(),
-        "expected_date": body.expected_date, "invoice_image_url": body.invoice_image_url,
+        "items": items, "total": total, "paid_amount": paid, "payment_status": pay_status,
+        "shipping_cost": body.shipping_cost or 0, "status": "ordered", "delivery_status": "pending",
+        "order_date": body.order_date or now_iso(), "expected_date": body.expected_date, "due_date": body.due_date,
+        "invoice_image_url": body.invoice_image_url, "payment_proof_url": body.payment_proof_url or "",
+        "order_url": body.order_url or "", "payment_method": body.payment_method or "transfer",
         "notes": body.notes, "created_at": now_iso(),
     }
     await db.online_orders.insert_one(doc)
+    if paid > 0:
+        pay_doc = {**doc, "paid_amount": 0}
+        await _record_purchase_payment(pay_doc, paid, body.platform, "online", body.payment_method or "transfer", body.payment_proof_url or "", "Pembayaran awal order online")
     doc.pop("_id", None)
     return doc
+
+
+@api.put("/online-orders/{oid}")
+async def update_online(oid: str, body: OnlineOrderIn, user: dict = Depends(get_current_user)):
+    o = await db.online_orders.find_one({"id": oid})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    items = [i.model_dump() for i in body.items]
+    total = int(sum(i["quantity"] * i["unit_price"] for i in items) + (body.shipping_cost or 0))
+    paid = int(o.get("paid_amount") or 0)
+    pay_status = "paid" if paid >= total and total > 0 else ("partial" if paid > 0 else "unpaid")
+    update = {
+        "platform": body.platform, "order_number": body.order_number, "items": items, "total": total,
+        "payment_status": pay_status, "shipping_cost": body.shipping_cost or 0,
+        "order_date": body.order_date or o.get("order_date"), "expected_date": body.expected_date, "due_date": body.due_date,
+        "invoice_image_url": body.invoice_image_url, "payment_proof_url": body.payment_proof_url or o.get("payment_proof_url", ""),
+        "order_url": body.order_url or "", "payment_method": body.payment_method or o.get("payment_method", "transfer"),
+        "notes": body.notes, "updated_at": now_iso(),
+    }
+    await db.online_orders.update_one({"id": oid}, {"$set": update})
+    await write_audit(user, "update", "online_order", oid, {"order_number": body.order_number})
+    return await db.online_orders.find_one({"id": oid}, {"_id": 0})
 
 
 @api.post("/online-orders/{oid}/receive")
@@ -2842,19 +3405,38 @@ async def receive_online(oid: str, user: dict = Depends(get_current_user)):
     stock_result = await _record_stock_receipt(o, kind="online")
     if stock_result["added"] == 0 and stock_result["skipped"]:
         raise HTTPException(400, f"Tidak ada item yang cocok dengan inventori: {', '.join(stock_result['skipped'])}. Edit order ini di Pengaturan lalu kaitkan dengan item inventori.")
-    if not o.get("expense_recorded"):
-        await _record_purchase_expense(o, o.get("platform", ""), kind="online")
     await db.online_orders.update_one(
         {"id": oid},
         {"$set": {
             "status": "received", "received_at": now_iso(),
             "stock_received": True, "stock_received_at": now_iso(),
-            "expense_recorded": True, "expense_recorded_at": now_iso(),
-            "delivery_status": "arrived", "payment_status": o.get("payment_status") or "paid",
+            "delivery_status": "arrived",
+            "payment_status": o.get("payment_status") or ("partial" if int(o.get("paid_amount") or 0) > 0 else "unpaid"),
         }},
     )
     await write_audit(user, "update", "online_order", oid, {"action": "receive"})
     return {"ok": True, "added": stock_result["added"], "skipped": stock_result["skipped"], "items": stock_result["items_added"]}
+
+
+@api.get("/online-orders/{oid}/payments")
+async def list_online_payments(oid: str, user: dict = Depends(get_current_user)):
+    return await db.purchase_payments.find({"kind": "online", "purchase_id": oid}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.post("/online-orders/{oid}/pay")
+async def pay_online_order(oid: str, body: PurchasePayIn, user: dict = Depends(get_current_user)):
+    o = await db.online_orders.find_one({"id": oid}, {"_id": 0})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    pay = await _record_purchase_payment(o, body.amount, o.get("platform", ""), "online", body.method or "transfer", body.payment_proof_url or o.get("payment_proof_url", ""), body.notes or "", body.paid_at or "")
+    new_paid = int(o.get("paid_amount") or 0) + int(pay["amount"])
+    status = "paid" if new_paid >= int(o.get("total") or 0) else "partial"
+    update = {"paid_amount": new_paid, "payment_status": status, "last_payment_at": pay["paid_at"]}
+    if body.payment_proof_url:
+        update["payment_proof_url"] = body.payment_proof_url
+    await db.online_orders.update_one({"id": oid}, {"$set": update})
+    await write_audit(user, "update", "online_payment", oid, {"amount": pay["amount"], "status": status})
+    return {"ok": True, "payment": pay, "paid_amount": new_paid, "payment_status": status}
 
 
 # ---------- KDS (Kitchen Display) ----------
@@ -3812,7 +4394,8 @@ MODULE_COLLECTIONS = {
 
 @api.post("/system/reset-module/{module}")
 async def reset_module(module: str, user: dict = Depends(require_roles("super_admin"))):
-    """Wipe data for one specific module."""
+    """Reset massal dinonaktifkan di v2.5.4 untuk mencegah salah hapus data produksi."""
+    raise HTTPException(410, "Reset data massal dinonaktifkan. Hapus/edit data satu per satu dari menu masing-masing.")
     colls = MODULE_COLLECTIONS.get(module.lower())
     if not colls:
         raise HTTPException(400, f"Modul tidak dikenal: {module}. Pilih dari: {', '.join(MODULE_COLLECTIONS.keys())}")
@@ -3826,9 +4409,8 @@ async def reset_module(module: str, user: dict = Depends(require_roles("super_ad
 
 @api.post("/system/reset-data")
 async def reset_demo_data(body: ResetDataIn, user: dict = Depends(require_roles("super_admin"))):
-    """Hapus seluruh data transaksional. Pertahankan: users, business_units (opt),
-    branches (opt), business_profile (opt), settings, notification_settings, wa_templates.
-    """
+    """Reset data demo dinonaktifkan di v2.5.4 untuk keamanan data produksi."""
+    raise HTTPException(410, "Reset data demo dinonaktifkan. Hapus/edit data satu per satu dari menu masing-masing.")
     if body.confirm != "RESET":
         raise HTTPException(400, "Konfirmasi tidak cocok. Ketik 'RESET' untuk melanjutkan.")
     # Collections to wipe (transactional / demo-able)
@@ -3899,10 +4481,11 @@ async def delete_purchase_order(po_id: str, user: dict = Depends(require_roles("
                     "reason": f"Hapus PO {po.get('po_no', po_id)}",
                     "created_at": now_iso(),
                 })
-    # If expense had been recorded, delete it
-    if po.get("expense_recorded"):
-        await db.expenses.delete_many({"reference": "po", "reference_id": po_id})
-        await db.journal_entries.delete_many({"reference": "po", "reference_id": po_id})
+    # Delete purchase payment records and related expense/journal rows for this PO only
+    pay_ids = [x["id"] for x in await db.purchase_payments.find({"kind": "po", "purchase_id": po_id}, {"_id": 0, "id": 1}).to_list(500)]
+    await db.expenses.delete_many({"$or": [{"reference": "po", "reference_id": po_id}, {"purchase_id": po_id}]})
+    await db.journal_entries.delete_many({"$or": [{"reference": "po", "reference_id": po_id}, {"reference": "po_payment", "reference_id": {"$in": pay_ids}}]})
+    await db.purchase_payments.delete_many({"kind": "po", "purchase_id": po_id})
     await db.purchase_orders.delete_one({"id": po_id})
     await write_audit(user, "delete", "purchase_order", po_id, {"po_no": po.get("po_no")})
     return {"ok": True, "reversed_stock": bool(po.get("stock_received")), "reversed_expense": bool(po.get("expense_recorded"))}
@@ -3929,9 +4512,10 @@ async def delete_online_order(oid: str, user: dict = Depends(require_roles("supe
                     "reason": f"Hapus Online {o.get('order_number', oid)}",
                     "created_at": now_iso(),
                 })
-    if o.get("expense_recorded"):
-        await db.expenses.delete_many({"reference": "online", "reference_id": oid})
-        await db.journal_entries.delete_many({"reference": "online", "reference_id": oid})
+    pay_ids = [x["id"] for x in await db.purchase_payments.find({"kind": "online", "purchase_id": oid}, {"_id": 0, "id": 1}).to_list(500)]
+    await db.expenses.delete_many({"$or": [{"reference": "online", "reference_id": oid}, {"purchase_id": oid}]})
+    await db.journal_entries.delete_many({"$or": [{"reference": "online", "reference_id": oid}, {"reference": "online_payment", "reference_id": {"$in": pay_ids}}]})
+    await db.purchase_payments.delete_many({"kind": "online", "purchase_id": oid})
     await db.online_orders.delete_one({"id": oid})
     await write_audit(user, "delete", "online_order", oid, {"order_number": o.get("order_number")})
     return {"ok": True}

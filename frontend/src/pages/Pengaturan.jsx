@@ -207,7 +207,7 @@ export default function Pengaturan() {
       </div>
 
       {/* Reset Data — Super Admin only */}
-      {isSuperAdmin && (
+      {false && isSuperAdmin && (
         <div className="bg-red-50 border-2 border-red-200 rounded-xl p-5 space-y-3">
           <h2 className="font-semibold text-red-900 flex items-center gap-2"><ShieldAlert className="w-5 h-5" /> Zona Berbahaya</h2>
           <p className="text-sm text-red-800">

@@ -113,7 +113,7 @@ export default function Kasir() {
   useEffect(() => { load(); loadBizUnits(); loadRecent(); api.get("/settings").then(({ data }) => setSettings((p) => ({ ...p, ...data }))).catch(() => {}); }, []);
 
   useEffect(() => {
-    const h = (e) => { const t = e.detail?.type; if (t === "transaction_created" || t === "transaction_cancelled") loadRecent(); if (t === "bizunit_updated") loadBizUnits(); };
+    const h = (e) => { const t = e.detail?.type; if (t === "transaction_created" || t === "transaction_cancelled" || t === "transaction_updated") loadRecent(); if (t === "bizunit_updated") loadBizUnits(); };
     window.addEventListener("aw:ws", h);
     return () => window.removeEventListener("aw:ws", h);
   }, []);
@@ -632,6 +632,10 @@ export default function Kasir() {
                 </div>
                 <div className="text-right shrink-0">
                   <div className={`font-mono text-sm font-bold ${t.cancelled ? "line-through text-gray-400" : "text-[#1a6b3c]"}`}>{formatRupiah(t.total)}</div>
+                  {(t.paid_amount || t.cash_collected || 0) !== (t.total || 0) && (
+                    <div className="text-[10px] text-gray-500">Terbayar {formatRupiah(t.paid_amount || t.cash_collected || 0)}</div>
+                  )}
+                  {(t.debt_amount || 0) > 0 && <div className="text-[10px] text-amber-700">Sisa bon {formatRupiah(t.debt_amount)}</div>}
                   <div className="flex gap-2 justify-end mt-1 flex-wrap">
                     <button data-testid={`detail-trx-${t.id}`} onClick={() => setShowReceipt(t)} className="text-xs text-[#1a6b3c] font-semibold hover:underline">Detail</button>
                     <button data-testid={`reprint-trx-${t.id}`} onClick={() => { setShowReceipt(t); toast.info("Struk lama siap diprint ulang"); }} className="text-xs text-amber-600 font-semibold hover:underline">Print Ulang</button>

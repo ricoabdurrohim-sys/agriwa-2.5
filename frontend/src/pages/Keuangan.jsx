@@ -47,7 +47,7 @@ export default function Keuangan() {
   useEffect(() => {
     const h = (e) => {
       const k = e.detail?.type;
-      if (k === "transaction_created" || k === "transaction_cancelled") load();
+      if (k === "transaction_created" || k === "transaction_cancelled" || k === "transaction_updated") load();
       if (k === "bizunit_updated") loadBizUnits();
     };
     window.addEventListener("aw:ws", h);
@@ -142,7 +142,7 @@ export default function Keuangan() {
             <Wallet className="w-4 h-4 text-[#1a6b3c]" /> Pemasukan Kasir
           </div>
           <div className="font-mono text-2xl font-bold text-[#1a6b3c]" data-testid="total-kasir">{formatRupiah(totalKasir)}</div>
-          <div className="text-[11px] text-gray-500 mt-0.5">{validTrx.length} transaksi (non-bon, non-batal)</div>
+          <div className="text-[11px] text-gray-500 mt-0.5">{validTrx.length} transaksi penjualan asli</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-2 text-xs uppercase font-semibold text-gray-500 tracking-wider mb-1">
@@ -175,8 +175,8 @@ export default function Keuangan() {
         </TabsList>
         <TabsContent value="kasir" className="p-2">
           <div className="divide-y divide-gray-100">
-            {trx.length === 0 ? <div className="text-center py-10 text-gray-400 text-sm">Belum ada transaksi kasir</div> :
-              trx.slice(0, 50).map((t) => {
+            {validTrx.length === 0 ? <div className="text-center py-10 text-gray-400 text-sm">Belum ada transaksi kasir</div> :
+              validTrx.slice(0, 50).map((t) => {
                 const pm = (t.payment_method || "cash").toLowerCase();
                 const isBank = ["transfer", "bank", "bca", "mandiri", "bri", "bni", "debit"].includes(pm);
                 const isEw = ["qris", "qr", "gopay", "ovo", "dana", "shopeepay", "ewallet"].includes(pm);

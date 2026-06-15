@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone } from "lucide-react";
+import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone, Edit2 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
 import api, { formatRupiah } from "@/lib/api";
 import ResetModuleButton from "@/components/ResetModuleButton";
@@ -26,6 +26,8 @@ export default function Warung() {
   const [showAdd, setShowAdd] = useState(false);
   const [activeTable, setActiveTable] = useState(null);
   const [qrTable, setQrTable] = useState(null);
+  const [editTable, setEditTable] = useState(null);
+  const [editTableName, setEditTableName] = useState("");
   const [search, setSearch] = useState("");
   const [tick, setTick] = useState(0);
 
@@ -60,6 +62,19 @@ export default function Warung() {
     if (!newTableName.trim()) return;
     await api.post("/tables", { name: newTableName });
     setNewTableName(""); setShowAdd(false); load(); toast.success("Meja ditambahkan");
+  };
+
+  const openEditTable = (t) => { setEditTable(t); setEditTableName(t.name || ""); };
+  const saveEditTable = async () => {
+    if (!editTable || !editTableName.trim()) return toast.error("Nama meja wajib");
+    await api.put(`/tables/${editTable.id}`, { name: editTableName.trim() });
+    setEditTable(null); setEditTableName(""); load(); toast.success("Meja diperbarui");
+  };
+  const deleteTable = async (t) => {
+    if (ordersByTable[t.id]) return toast.error("Meja masih punya order aktif. Selesaikan dulu.");
+    if (!window.confirm(`Hapus ${t.name}? Hanya meja ini yang dihapus, bukan semua meja.`)) return;
+    await api.delete(`/tables/${t.id}`);
+    load(); toast.success("Meja dihapus");
   };
 
   const filteredItems = items.filter((i) => i.name.toLowerCase().includes(search.toLowerCase()));
@@ -267,11 +282,21 @@ export default function Warung() {
                   </>
                 )}
               </div>
-              <button data-testid={`qr-btn-${t.id}`} onClick={(e) => { e.stopPropagation(); setQrTable(t); }}
-                className="absolute top-2 right-7 p-1.5 hover:bg-white/60 rounded-md text-gray-500 hover:text-[#1a6b3c] transition-colors"
-                title="Tampilkan QR Self-Order">
-                <QrCode className="w-3.5 h-3.5" />
-              </button>
+              <div className="absolute top-2 right-2 flex gap-1">
+                <button data-testid={`qr-btn-${t.id}`} onClick={(e) => { e.stopPropagation(); setQrTable(t); }}
+                  className="p-1.5 hover:bg-white/60 rounded-md text-gray-500 hover:text-[#1a6b3c] transition-colors"
+                  title="Tampilkan QR Self-Order">
+                  <QrCode className="w-3.5 h-3.5" />
+                </button>
+                <button data-testid={`edit-table-${t.id}`} onClick={(e) => { e.stopPropagation(); openEditTable(t); }}
+                  className="p-1.5 hover:bg-white/60 rounded-md text-gray-500 hover:text-blue-600 transition-colors" title="Edit meja">
+                  <Edit2 className="w-3.5 h-3.5" />
+                </button>
+                <button data-testid={`delete-table-${t.id}`} onClick={(e) => { e.stopPropagation(); deleteTable(t); }}
+                  className="p-1.5 hover:bg-white/60 rounded-md text-gray-500 hover:text-red-600 transition-colors" title="Hapus meja ini">
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           );
         })}
@@ -285,6 +310,18 @@ export default function Warung() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowAdd(false)}>Batal</Button>
             <Button onClick={addTable} data-testid="confirm-add-table-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editTable} onOpenChange={() => setEditTable(null)}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Edit Meja</DialogTitle></DialogHeader>
+          <Input data-testid="edit-table-name-input" value={editTableName} onChange={(e) => setEditTableName(e.target.value)}
+            placeholder="Nama meja" className="h-12" onKeyDown={(e) => e.key === "Enter" && saveEditTable()} />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTable(null)}>Batal</Button>
+            <Button onClick={saveEditTable} data-testid="confirm-edit-table-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
