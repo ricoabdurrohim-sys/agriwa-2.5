@@ -52,6 +52,7 @@ export default function Dashboard() {
   const [reminders, setReminders] = useState(null);
   const [bizUnits, setBizUnits] = useState([]);
   const [seeding, setSeeding] = useState(false);
+  const [error, setError] = useState("");
 
   const load = async () => {
     try {
@@ -66,7 +67,10 @@ export default function Dashboard() {
       setReminders(rem.data);
       setBizUnits(bu.data.filter((u) => u.active !== false));
     } catch (e) {
+      console.error(e);
+      setError(e?.response?.data?.detail || "Gagal memuat dashboard. Coba refresh atau restart backend.");
       toast.error("Gagal memuat dashboard");
+      setSummary((prev) => prev || { today: {}, revenue_by_unit: {}, weekly_trend: [], low_stock: [], recent_transactions: [] });
     }
   };
 
@@ -83,16 +87,6 @@ export default function Dashboard() {
     return () => window.removeEventListener("aw:ws", h);
   }, []);
 
-  useEffect(() => {
-    const handler = (e) => {
-      const t = e.detail?.type;
-      if (t === "transaction_created" || t === "transaction_cancelled" || t === "transaction_updated" || t === "order_created" || t === "order_updated") {
-        load();
-      }
-    };
-    window.addEventListener("aw:ws", handler);
-    return () => window.removeEventListener("aw:ws", handler);
-  }, []);
 
   const seedSample = async () => {
     if (!window.confirm("Muat data contoh? Ini akan menghapus data transaksi/inventori saat ini.")) return;
@@ -112,7 +106,7 @@ export default function Dashboard() {
     return <div className="text-center py-20 text-gray-500">Memuat...</div>;
   }
 
-  const t = summary.today;
+  const t = summary.today || {};
   const profitColor = t.net_profit >= 0 ? "#1a6b3c" : "#e53e3e";
 
   const unitPocketData = Object.entries(summary.revenue_by_unit || {}).map(([k, v]) => ({
@@ -138,13 +132,19 @@ export default function Dashboard() {
             {new Date().toLocaleDateString("id-ID", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
           </p>
         </div>
-        {summary.recent_transactions?.length === 0 && (
+        {false && summary.recent_transactions?.length === 0 && (
           <Button onClick={seedSample} disabled={seeding} data-testid="seed-sample-btn"
             className="bg-[#f4a228] hover:bg-[#d98b1a] text-white">
             <Sparkles className="w-4 h-4 mr-1.5" /> {seeding ? "Memuat..." : "Muat Data Contoh"}
           </Button>
         )}
       </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-700 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5" /> <span>{error}</span>
+        </div>
+      )}
 
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
@@ -325,7 +325,7 @@ export default function Dashboard() {
           </button>
         </div>
         <div className="divide-y divide-gray-100">
-          {summary.recent_transactions?.length === 0 && (
+          {false && summary.recent_transactions?.length === 0 && (
             <div className="px-4 py-10 text-center text-gray-400 text-sm">
               Belum ada transaksi. Mulai jualan di Kasir atau muat data contoh.
             </div>

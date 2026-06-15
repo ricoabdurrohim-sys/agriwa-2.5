@@ -11,6 +11,7 @@ import {
 import { useWebSocket } from "@/lib/useWebSocket";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/AuthContext";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 const mainNav = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard" },
@@ -217,7 +218,7 @@ export default function Layout() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto pb-24 lg:pb-6 px-3 sm:px-4 lg:px-6 pt-4"><Outlet /></main>
+      <main className="max-w-7xl mx-auto pb-24 lg:pb-6 px-3 sm:px-4 lg:px-6 pt-4"><ErrorBoundary><Outlet /></ErrorBoundary></main>
 
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 lg:hidden z-30" style={{ boxShadow: "0 -4px 12px -2px rgba(0,0,0,0.06)" }}>
         <div className="grid grid-cols-5 max-w-xl mx-auto">

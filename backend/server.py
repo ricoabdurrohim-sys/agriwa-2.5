@@ -2341,131 +2341,250 @@ def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None)
         "initial_paid": initial_paid,
     }
 
-# ---------- Reports ----------
-@api.get("/reports/profit-loss")
-async def profit_loss(user: dict = Depends(get_current_user)):
+
+async def _build_unified_finance_summary(limit: int = 1000) -> dict:
+    """Satu sumber kebenaran untuk Kasir, Keuangan, Dashboard, dan Laporan.
+
+    Prinsip:
+    - transaksi asli menyimpan nilai struk dan item;
+    - pembayaran bon hanya menambah cash_collected transaksi asli;
+    - dokumen/receipt pelunasan bon tidak dihitung sebagai penjualan baru;
+    - halaman frontend tidak menghitung ulang rumus sendiri.
+    """
     try:
         await _repair_legacy_bon_settlement_transactions()
     except Exception:
+        # Repair tidak boleh membuat halaman crash. Data tetap diringkas best-effort.
         pass
-    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
-    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
+
     debt_ctx = await _load_debt_financial_context()
+    raw_transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(10000)
+    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(10000)
+    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(10000)
+    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(10000)
+    debts_raw = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(10000)
+    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(10000)
+
+    inv_items = {i.get("id"): i for i in inventory}
+
+    def _item_cost_total(t: dict) -> int:
+        if _money(t.get("cost_total")):
+            return _money(t.get("cost_total"))
+        total_cost = 0
+        for it in t.get("items") or []:
+            inv = inv_items.get(it.get("item_id")) or {}
+            qty = _money(it.get("quantity"))
+            total_cost += qty * _money(inv.get("cost_price"))
+        return int(total_cost)
+
+    ledger = []
     revenue_by_unit = {}
-    for t in transactions:
-        if not _is_financial_sale_transaction(t):
+    revenue_by_method = {"cash": 0, "bank": 0, "ewallet": 0}
+    sales_value_by_unit = {}
+    total_cogs = 0
+
+    for t in raw_transactions:
+        try:
+            row = _enrich_transaction_financial_fields(t, debt_ctx)
+            if not _is_financial_sale_transaction(row):
+                continue
+            transaction_total = _money(row.get("transaction_total") or row.get("total"))
+            cash_collected = _canonical_cash_collected(row, debt_ctx)
+            if transaction_total <= 0 and cash_collected <= 0:
+                continue
+            open_receivable = max(0, transaction_total - cash_collected)
+            cogs = _item_cost_total(row)
+            total_cogs += cogs
+            unit = row.get("unit") or "warung"
+            method = _normalize_pm(row.get("payment_method"))
+            revenue_by_unit[unit] = revenue_by_unit.get(unit, 0) + cash_collected
+            sales_value_by_unit[unit] = sales_value_by_unit.get(unit, 0) + transaction_total
+            revenue_by_method[method] = revenue_by_method.get(method, 0) + cash_collected
+            initial_paid = _money(row.get("initial_paid"))
+            debt_payments_total = _money(row.get("debt_payments_total"))
+            ledger.append({
+                **row,
+                "total": transaction_total,
+                "transaction_total": transaction_total,
+                "cash_collected": cash_collected,
+                "paid_amount": cash_collected,
+                "open_receivable": open_receivable,
+                "debt_amount": open_receivable,
+                "initial_paid": initial_paid,
+                "debt_payments_total": debt_payments_total,
+                "cost_total": cogs,
+                "ledger_label": "Lunas" if open_receivable == 0 else ("Bon Sebagian" if cash_collected > 0 else "Bon"),
+                "finance_note": f"Nilai struk {format_rp_short(transaction_total)}; uang masuk {format_rp_short(cash_collected)}; sisa bon {format_rp_short(open_receivable)}",
+            })
+        except Exception as e:
+            # Satu transaksi rusak tidak boleh membuat halaman Keuangan blank.
             continue
-        u = t.get("unit", "warung")
-        revenue_by_unit[u] = revenue_by_unit.get(u, 0) + _canonical_cash_collected(t, debt_ctx)
-    # Include non-POS incomes (cashback, tax refund, etc.) as "other_income"
-    other_income_by_cat = {}
+
+    other_income_by_category = {}
     for inc in incomes:
-        c = inc.get("category", "Pemasukan Lain-lain")
-        other_income_by_cat[c] = other_income_by_cat.get(c, 0) + inc.get("amount", 0)
-    total_other_income = sum(other_income_by_cat.values())
-    total_revenue = sum(revenue_by_unit.values()) + total_other_income
-    expense_by_cat = {}
-    for e in expenses:
-        c = e.get("category", "Lain-lain")
-        expense_by_cat[c] = expense_by_cat.get(c, 0) + e.get("amount", 0)
-    # Internal use/waste/adjustment are expenses based on HPP, not revenue.
-    for t in transactions:
-        trx_type = (t.get("transaction_type") or "SALE")
-        if trx_type != "SALE" and t.get("cost_total", 0):
-            label = {"SELF_USE": "Pemakaian Sendiri", "WASTE": "Barang Rusak", "ADJUSTMENT": "Penyesuaian Stok"}.get(trx_type, "Internal")
-            expense_by_cat[label] = expense_by_cat.get(label, 0) + int(t.get("cost_total", 0))
-    total_expense = sum(expense_by_cat.values())
-    # COGS uses transaction cost snapshot first; fallback to current product/BOM cost for old data.
-    cogs = 0
-    inv_items = {i["id"]: i for i in await db.inventory_items.find({}, {"_id": 0}).to_list(2000)}
-    boms = await db.bom_recipes.find({}, {"_id": 0}).to_list(2000)
-    bom_by_output = {b["output_item_id"]: b for b in boms}
-    for t in transactions:
-        if not _is_financial_sale_transaction(t):
-            continue
-        if t.get("cost_total"):
-            cogs += int(t.get("cost_total") or 0)
-            continue
-        for it in t.get("items", []):
-            bom = bom_by_output.get(it.get("item_id"))
-            if bom:
-                for ing in bom["ingredients"]:
-                    inv = inv_items.get(ing["item_id"])
-                    if inv:
-                        cogs += int(ing["quantity"] * it.get("quantity", 0) * inv.get("cost_price", 0))
-            else:
-                inv = inv_items.get(it.get("item_id"))
-                if inv:
-                    cogs += int(inv.get("cost_price", 0) * it.get("quantity", 0))
-    gross_profit = total_revenue - cogs
+        cat = inc.get("category") or "Pemasukan Lain-lain"
+        other_income_by_category[cat] = other_income_by_category.get(cat, 0) + _money(inc.get("amount"))
+
+    expense_by_category = {}
+    for exp in expenses:
+        cat = exp.get("category") or "Lain-lain"
+        expense_by_category[cat] = expense_by_category.get(cat, 0) + _money(exp.get("amount"))
+
+    total_pos_income = sum(_money(x.get("cash_collected")) for x in ledger)
+    total_pos_sales_value = sum(_money(x.get("transaction_total")) for x in ledger)
+    total_other_income = sum(other_income_by_category.values())
+    total_expense = sum(expense_by_category.values())
+    total_capital = sum(_money(c.get("amount")) for c in capital)
+    total_debt = sum(max(0, _money(d.get("amount")) - _money(d.get("paid"))) for d in debts_raw if d.get("status") != "paid")
+
+    total_revenue = total_pos_income + total_other_income
+    gross_profit = total_revenue - total_cogs
     net_profit = gross_profit - total_expense
-    gpm = (gross_profit / total_revenue * 100) if total_revenue else 0
-    npm = (net_profit / total_revenue * 100) if total_revenue else 0
+
+    # Cash balance per metode. Pelunasan bon disajikan di transaksi asli; metode mengikuti transaksi asli
+    # agar konsisten dan ringan. Jika nanti perlu detail rekening, debt_payments bisa diperinci lagi.
+    methods = ["cash", "bank", "ewallet"]
+    by_method = {m: {"balance": 0, "inflow": 0, "outflow": 0, "in_count": 0, "out_count": 0} for m in methods}
+    for row in ledger:
+        m = _normalize_pm(row.get("payment_method"))
+        amt = _money(row.get("cash_collected"))
+        if amt > 0:
+            by_method[m]["balance"] += amt
+            by_method[m]["inflow"] += amt
+            by_method[m]["in_count"] += 1
+    for inc in incomes:
+        m = _normalize_pm(inc.get("payment_method"))
+        amt = _money(inc.get("amount"))
+        by_method[m]["balance"] += amt
+        by_method[m]["inflow"] += amt
+        by_method[m]["in_count"] += 1
+    for cap in capital:
+        m = _normalize_pm(cap.get("payment_method"))
+        amt = _money(cap.get("amount"))
+        by_method[m]["balance"] += amt
+        by_method[m]["inflow"] += amt
+        by_method[m]["in_count"] += 1
+    for exp in expenses:
+        m = _normalize_pm(exp.get("payment_method"))
+        amt = _money(exp.get("amount"))
+        by_method[m]["balance"] -= amt
+        by_method[m]["outflow"] += amt
+        by_method[m]["out_count"] += 1
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    today_rows = [r for r in ledger if str(r.get("created_at", "")).startswith(today)]
+    today_exp = [e for e in expenses if str(e.get("date") or e.get("created_at") or "").startswith(today)]
+    today_inc = [i for i in incomes if str(i.get("date") or i.get("created_at") or "").startswith(today)]
+
+    weekly = []
+    for delta in range(6, -1, -1):
+        day = (datetime.now(timezone.utc) - timedelta(days=delta)).date().isoformat()
+        rev = sum(_money(r.get("cash_collected")) for r in ledger if str(r.get("created_at", "")).startswith(day))
+        exp = sum(_money(e.get("amount")) for e in expenses if str(e.get("date") or e.get("created_at") or "").startswith(day))
+        weekly.append({"day": day[5:], "revenue": rev, "expense": exp})
+
+    inventory_value = sum(_money(i.get("current_stock")) * _money(i.get("cost_price")) for i in inventory)
+    cash_position = total_capital + total_pos_income + total_other_income - total_expense
+    retained = total_revenue - total_expense
+
+    safe_limit = max(1, min(_money(limit, 1000), 5000))
+    normalized_debts = [_normalize_debt_for_response(d) for d in debts_raw]
+
     return {
-        "revenue_by_unit": revenue_by_unit,
-        "other_income_by_category": other_income_by_cat,
-        "total_other_income": total_other_income,
-        "total_revenue": total_revenue,
-        "cogs": cogs,
-        "gross_profit": gross_profit,
-        "expense_by_category": expense_by_cat,
-        "total_expense": total_expense,
-        "net_profit": net_profit,
-        "gross_profit_margin": round(gpm, 2),
-        "net_profit_margin": round(npm, 2),
+        "ok": True,
+        "generated_at": now_iso(),
+        "totals": {
+            "pos_income": total_pos_income,
+            "pos_sales_value": total_pos_sales_value,
+            "other_income": total_other_income,
+            "revenue": total_revenue,
+            "cogs": total_cogs,
+            "gross_profit": gross_profit,
+            "expense": total_expense,
+            "net_profit": net_profit,
+            "debt": total_debt,
+            "capital": total_capital,
+            "cash_position": cash_position,
+            "inventory_value": int(inventory_value),
+        },
+        "today": {
+            "revenue": sum(_money(r.get("cash_collected")) for r in today_rows) + sum(_money(i.get("amount")) for i in today_inc),
+            "revenue_pos": sum(_money(r.get("cash_collected")) for r in today_rows),
+            "other_income": sum(_money(i.get("amount")) for i in today_inc),
+            "expense": sum(_money(e.get("amount")) for e in today_exp),
+            "net_profit": sum(_money(r.get("cash_collected")) for r in today_rows) + sum(_money(i.get("amount")) for i in today_inc) - sum(_money(e.get("amount")) for e in today_exp),
+            "cash_position": cash_position,
+            "tx_count": len(today_rows),
+        },
+        "profit_loss": {
+            "revenue_by_unit": revenue_by_unit,
+            "sales_value_by_unit": sales_value_by_unit,
+            "other_income_by_category": other_income_by_category,
+            "total_other_income": total_other_income,
+            "total_revenue": total_revenue,
+            "cogs": total_cogs,
+            "gross_profit": gross_profit,
+            "expense_by_category": expense_by_category,
+            "total_expense": total_expense,
+            "net_profit": net_profit,
+            "gross_profit_margin": round((gross_profit / total_revenue * 100), 2) if total_revenue else 0,
+            "net_profit_margin": round((net_profit / total_revenue * 100), 2) if total_revenue else 0,
+        },
+        "balance_sheet": {
+            "assets": {
+                "Kas": cash_position,
+                "Piutang Bon Pelanggan": total_debt,
+                "Persediaan": int(inventory_value),
+                "total": cash_position + total_debt + int(inventory_value),
+            },
+            "liabilities": {"Hutang Usaha": 0, "total": 0},
+            "equity": {"Modal Disetor": total_capital, "Laba Ditahan": retained, "total": total_capital + retained},
+        },
+        "cash_flow": {
+            "operating": {"in": total_pos_income + total_other_income, "out": total_expense, "net": total_pos_income + total_other_income - total_expense},
+            "investing": {"in": 0, "out": 0, "net": 0},
+            "financing": {"in": total_capital, "out": 0, "net": total_capital},
+            "net_cash_flow": total_pos_income + total_other_income - total_expense + total_capital,
+        },
+        "cash_balance": {
+            "by_method": by_method,
+            "total_balance": sum(v["balance"] for v in by_method.values()),
+            "total_inflow": sum(v["inflow"] for v in by_method.values()),
+            "total_outflow": sum(v["outflow"] for v in by_method.values()),
+        },
+        "by_unit": revenue_by_unit,
+        "by_method": revenue_by_method,
+        "weekly_trend": weekly,
+        "cashier_ledger": ledger[:safe_limit],
+        "pos_transactions": ledger[:safe_limit],
+        "recent_transactions": ledger[:10],
+        "incomes": incomes[:safe_limit],
+        "expenses": expenses[:safe_limit],
+        "debts": normalized_debts[:safe_limit],
     }
+
+
+@api.get("/finance/system-summary")
+async def finance_system_summary(user: dict = Depends(get_current_user), limit: int = 1000):
+    return await _build_unified_finance_summary(limit=limit)
+
+# ---------- Reports ----------
+@api.get("/reports/profit-loss")
+async def profit_loss(user: dict = Depends(get_current_user)):
+    summary = await _build_unified_finance_summary(limit=5000)
+    return summary["profit_loss"]
 
 
 @api.get("/reports/balance-sheet")
 async def balance_sheet(user: dict = Depends(get_current_user)):
-    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
-    debts = await db.customer_debts.find({}, {"_id": 0}).to_list(5000)
-    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(5000)
-    debt_ctx = await _load_debt_financial_context()
-
-    total_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
-    total_expense = sum(e.get("amount", 0) for e in expenses)
-    total_capital = sum(c.get("amount", 0) for c in capital)
-    piutang_bon = sum(d.get("amount", 0) - d.get("paid", 0) for d in debts if d.get("status") != "paid")
-    inventory_value = sum((i.get("current_stock", 0) * i.get("cost_price", 0)) for i in inventory)
-
-    cash = total_capital + total_revenue - total_expense
-    retained = total_revenue - total_expense
-
-    return {
-        "assets": {
-            "Kas": cash,
-            "Piutang Bon Pelanggan": piutang_bon,
-            "Persediaan": int(inventory_value),
-            "total": cash + piutang_bon + int(inventory_value),
-        },
-        "liabilities": {"Hutang Usaha": 0, "total": 0},
-        "equity": {
-            "Modal Disetor": total_capital,
-            "Laba Ditahan": retained,
-            "total": total_capital + retained,
-        },
-    }
+    summary = await _build_unified_finance_summary(limit=5000)
+    return summary["balance_sheet"]
 
 
 @api.get("/reports/cash-flow")
 async def cash_flow(user: dict = Depends(get_current_user)):
-    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
-    debt_ctx = await _load_debt_financial_context()
-    operating_in = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
-    operating_out = sum(e.get("amount", 0) for e in expenses)
-    financing_in = sum(c.get("amount", 0) for c in capital)
-    return {
-        "operating": {"in": operating_in, "out": operating_out, "net": operating_in - operating_out},
-        "investing": {"in": 0, "out": 0, "net": 0},
-        "financing": {"in": financing_in, "out": 0, "net": financing_in},
-        "net_cash_flow": (operating_in - operating_out) + financing_in,
-    }
+    summary = await _build_unified_finance_summary(limit=5000)
+    return summary["cash_flow"]
 
 
 def _normalize_pm(pm: str) -> str:
@@ -2484,202 +2603,43 @@ def _normalize_pm(pm: str) -> str:
 
 @api.get("/reports/cash-balance")
 async def cash_balance(user: dict = Depends(get_current_user)):
-    """Saldo kas per metode pembayaran (tunai/bank/dompet digital).
-    Sumber: transaksi kasir (non-bon, non-cancelled), pemasukan & pengeluaran manual.
-    """
-    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
-    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
-    debt_ctx = await _load_debt_financial_context()
-
-    methods = ["cash", "bank", "ewallet"]
-    balance = {m: 0 for m in methods}
-    inflow = {m: 0 for m in methods}
-    outflow = {m: 0 for m in methods}
-    in_count = {m: 0 for m in methods}
-    out_count = {m: 0 for m in methods}
-
-    # POS transactions (positive cash inflow). For partial/debt sales, only paid_amount enters cash/bank/QRIS.
-    # Receipt pelunasan bon tidak dihitung sebagai penjualan terpisah; ia mengupdate transaksi asli.
-    for t in transactions:
-        if not _is_financial_sale_transaction(t):
-            continue
-        m = _normalize_pm(t.get("payment_method"))
-        amt = _canonical_cash_collected(t, debt_ctx)
-        if amt <= 0:
-            continue
-        balance[m] += amt
-        inflow[m] += amt
-        in_count[m] += 1
-
-    # Manual incomes
-    for i in incomes:
-        m = _normalize_pm(i.get("payment_method"))
-        amt = i.get("amount", 0)
-        balance[m] += amt
-        inflow[m] += amt
-        in_count[m] += 1
-
-    # Capital injections (assume cash unless tagged)
-    for c in capital:
-        m = _normalize_pm(c.get("payment_method"))
-        amt = c.get("amount", 0)
-        balance[m] += amt
-        inflow[m] += amt
-        in_count[m] += 1
-
-    # Expenses (outflow)
-    for e in expenses:
-        m = _normalize_pm(e.get("payment_method"))
-        amt = e.get("amount", 0)
-        balance[m] -= amt
-        outflow[m] += amt
-        out_count[m] += 1
-
-    total_balance = sum(balance.values())
-    return {
-        "by_method": {m: {"balance": balance[m], "inflow": inflow[m], "outflow": outflow[m], "in_count": in_count[m], "out_count": out_count[m]} for m in methods},
-        "total_balance": total_balance,
-        "total_inflow": sum(inflow.values()),
-        "total_outflow": sum(outflow.values()),
-    }
-
-
+    summary = await _build_unified_finance_summary(limit=5000)
+    return summary["cash_balance"]
 
 
 @api.get("/finance/summary")
-async def finance_summary(user: dict = Depends(get_current_user), limit: int = 500):
-    # Repair ringan tiap dibuka agar data bon lama tidak membuat menu saling beda.
-    try:
-        await _repair_legacy_bon_settlement_transactions()
-    except Exception:
-        pass
-    """Ringkasan keuangan kanonis untuk halaman Keuangan.
-
-    Endpoint ini menjadi sumber kebenaran yang sama untuk Keuangan, Dashboard,
-    dan Laporan: transaksi pelunasan bon tidak dihitung sebagai penjualan baru;
-    transaksi asli tetap ditampilkan dengan cash_collected yang sudah termasuk DP
-    awal + cicilan/pelunasan bon.
-    """
-    debt_ctx = await _load_debt_financial_context()
-    transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
-    pos_transactions = []
-    for t in transactions:
-        row = _enrich_transaction_financial_fields(t, debt_ctx)
-        if not _is_financial_sale_transaction(row):
-            continue
-        # transaction_total = nilai struk asli; cash_collected = uang yang benar-benar sudah masuk
-        row["transaction_total"] = _money(row.get("transaction_total") or row.get("total"))
-        row["cash_collected"] = _canonical_cash_collected(row, debt_ctx)
-        row["open_receivable"] = max(0, row["transaction_total"] - row["cash_collected"])
-        row["ledger_label"] = "Lunas" if row["open_receivable"] == 0 else ("Bon Sebagian" if row["cash_collected"] > 0 else "Bon")
-        row["finance_note"] = f"Struk {format_rp_short(row['transaction_total'])}; masuk {format_rp_short(row['cash_collected'])}; sisa {format_rp_short(row['open_receivable'])}"
-        pos_transactions.append(row)
-
-    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
-    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(5000)
-    debts = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
-
-    total_pos_income = sum(_money(t.get("cash_collected")) for t in pos_transactions)
-    total_pos_sales_value = sum(_money(t.get("transaction_total")) for t in pos_transactions)
-    total_other_income = sum(_money(i.get("amount")) for i in incomes)
-    total_expense = sum(_money(e.get("amount")) for e in expenses)
-    total_debt = sum(max(0, _money(d.get("amount")) - _money(d.get("paid"))) for d in debts if d.get("status") != "paid")
-
-    by_unit = {}
-    by_method = {}
-    for t in pos_transactions:
-        u = t.get("unit") or "warung"
-        m = _normalize_pm(t.get("payment_method"))
-        by_unit[u] = by_unit.get(u, 0) + _money(t.get("cash_collected"))
-        by_method[m] = by_method.get(m, 0) + _money(t.get("cash_collected"))
-
+async def finance_summary(user: dict = Depends(get_current_user), limit: int = 1000):
+    # Backward-compatible alias. Frontend Keuangan memakai endpoint ini sebagai sumber kebenaran.
+    summary = await _build_unified_finance_summary(limit=limit)
     return {
-        "total_pos_income": total_pos_income,
-        "total_pos_sales_value": total_pos_sales_value,
-        "total_other_income": total_other_income,
-        "total_expense": total_expense,
-        "total_debt": total_debt,
-        "net_cash": total_pos_income + total_other_income - total_expense,
-        "by_unit": by_unit,
-        "by_method": by_method,
-        "pos_transactions": pos_transactions[: max(1, min(int(limit or 500), 2000))],
-        "cashier_ledger": pos_transactions[: max(1, min(int(limit or 500), 2000))],
-        "incomes": incomes,
-        "expenses": expenses,
-        "debts": [_normalize_debt_for_response(d) for d in debts],
+        **summary,
+        "total_pos_income": summary["totals"]["pos_income"],
+        "total_pos_sales_value": summary["totals"]["pos_sales_value"],
+        "total_other_income": summary["totals"]["other_income"],
+        "total_expense": summary["totals"]["expense"],
+        "total_debt": summary["totals"]["debt"],
+        "net_cash": summary["totals"]["pos_income"] + summary["totals"]["other_income"] - summary["totals"]["expense"],
     }
 
 @api.get("/dashboard/summary")
 async def dashboard_summary(user: dict = Depends(get_current_user)):
-    try:
-        await _repair_legacy_bon_settlement_transactions()
-    except Exception:
-        pass
-    today = datetime.now(timezone.utc).date().isoformat()
-    transactions = await db.transactions.find({}, {"_id": 0}).to_list(5000)
-    expenses = await db.expenses.find({}, {"_id": 0}).to_list(5000)
-    incomes = await db.incomes.find({}, {"_id": 0}).to_list(5000)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(5000)
-    debt_ctx = await _load_debt_financial_context()
-    transactions = [_enrich_transaction_financial_fields(t, debt_ctx) for t in transactions if not _is_debt_settlement_document(t)]
-
-    today_tx = [t for t in transactions if t.get("created_at", "").startswith(today)]
-    today_exp = [e for e in expenses if (e.get("date") or "").startswith(today)]
-    today_inc = [i for i in incomes if (i.get("date") or "").startswith(today)]
-    today_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in today_tx)
-    today_other = sum(i.get("amount", 0) for i in today_inc)
-    today_expense = sum(e.get("amount", 0) for e in today_exp)
-
-    total_revenue = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions)
-    total_other = sum(i.get("amount", 0) for i in incomes)
-    total_expense = sum(e.get("amount", 0) for e in expenses)
-    total_capital = sum(c.get("amount", 0) for c in capital)
-    cash_position = total_capital + total_revenue + total_other - total_expense
-
-    # Revenue by unit
-    rev_by_unit = {}
-    for t in transactions:
-        if not _is_financial_sale_transaction(t):
-            continue
-        u = t.get("unit", "warung")
-        rev_by_unit[u] = rev_by_unit.get(u, 0) + _canonical_cash_collected(t, debt_ctx)
-
-    # Weekly trend (last 7 days)
-    weekly = []
-    for delta in range(6, -1, -1):
-        day = (datetime.now(timezone.utc) - timedelta(days=delta)).date().isoformat()
-        rev = sum(_canonical_cash_collected(t, debt_ctx) for t in transactions if t.get("created_at", "").startswith(day) and _is_financial_sale_transaction(t))
-        exp = sum(e.get("amount", 0) for e in expenses if (e.get("date") or "").startswith(day))
-        weekly.append({"day": day[5:], "revenue": rev, "expense": exp})
-
-    # Low stock
+    summary = await _build_unified_finance_summary(limit=500)
     inv = await db.inventory_items.find({}, {"_id": 0}).to_list(2000)
-    low = [i for i in inv if i.get("current_stock", 0) <= i.get("min_stock", 0) and i.get("min_stock", 0) > 0]
-
-    recent_tx = sorted(transactions, key=lambda x: x.get("created_at", ""), reverse=True)[:10]
-
+    low = [i for i in inv if _money(i.get("current_stock")) <= _money(i.get("min_stock")) and _money(i.get("min_stock")) > 0]
     return {
-        "today": {
-            "revenue": today_revenue + today_other,
-            "revenue_pos": today_revenue,
-            "other_income": today_other,
-            "expense": today_expense,
-            "net_profit": today_revenue + today_other - today_expense,
-            "cash_position": cash_position,
-            "tx_count": len(today_tx),
-        },
-        "revenue_by_unit": rev_by_unit,
-        "weekly_trend": weekly,
+        "today": summary["today"],
+        "revenue_by_unit": summary["by_unit"],
+        "weekly_trend": summary["weekly_trend"],
         "low_stock": low,
-        "recent_transactions": recent_tx,
+        "recent_transactions": summary["recent_transactions"],
     }
 
 
 # ---------- Sample Data Seed ----------
 @api.post("/seed/sample-data")
 async def seed_sample(user: dict = Depends(require_roles("super_admin"))):
+    if os.environ.get("ALLOW_SAMPLE_SEED", "false").lower() != "true":
+        raise HTTPException(403, "Fitur muat data contoh dimatikan agar data asli tidak terhapus.")
     # Wipe (except users)
     for coll in ["investors", "capital_injections", "land_rental", "inventory_items", "bom_recipes",
                  "tables", "orders", "transactions", "customer_debts", "expenses",
@@ -4778,68 +4738,39 @@ MODULE_COLLECTIONS = {
 
 @api.post("/system/reset-module/{module}")
 async def reset_module(module: str, user: dict = Depends(require_roles("super_admin"))):
-    """Reset massal dinonaktifkan di v2.5.4 untuk mencegah salah hapus data produksi."""
-    raise HTTPException(410, "Reset data massal dinonaktifkan. Hapus/edit data satu per satu dari menu masing-masing.")
-    colls = MODULE_COLLECTIONS.get(module.lower())
-    if not colls:
-        raise HTTPException(400, f"Modul tidak dikenal: {module}. Pilih dari: {', '.join(MODULE_COLLECTIONS.keys())}")
-    counts = {}
-    for c in colls:
-        result = await db[c].delete_many({})
-        counts[c] = result.deleted_count
-    await write_audit(user, "delete", "module_reset", module, {"wiped": counts})
-    return {"ok": True, "module": module, "wiped": counts, "total_deleted": sum(counts.values())}
+    """Reset massal permanen dinonaktifkan. Tidak ada kode penghapus tersembunyi di endpoint ini."""
+    raise HTTPException(410, "Reset data massal dinonaktifkan permanen. Hapus/edit data satu per satu dari menu masing-masing.")
 
 
 @api.post("/system/reset-data")
 async def reset_demo_data(body: ResetDataIn, user: dict = Depends(require_roles("super_admin"))):
-    """Reset data demo dinonaktifkan di v2.5.4 untuk keamanan data produksi."""
-    raise HTTPException(410, "Reset data demo dinonaktifkan. Hapus/edit data satu per satu dari menu masing-masing.")
-    if body.confirm != "RESET":
-        raise HTTPException(400, "Konfirmasi tidak cocok. Ketik 'RESET' untuk melanjutkan.")
-    # Collections to wipe (transactional / demo-able)
-    wipe = [
-        "transactions", "orders", "customer_debts", "expenses", "incomes",
-        "journal_entries", "stock_movements",
-        "purchase_orders", "online_orders", "suppliers",
-        "inventory_items", "bom_recipes",
-        "tables", "investors", "capital_injections", "land_rental", "dividends",
-        "employees", "attendance", "payroll",
-        "opname_sessions", "bank_transactions", "bank_accounts",
-        "production_batches", "vineyard_plots", "vineyard_harvests",
-        "b2b_customers", "b2b_invoices",
-        "members", "loyalty_settings", "promos",
-        "audit_logs",
+    """Reset data demo permanen dinonaktifkan untuk keamanan data produksi."""
+    raise HTTPException(410, "Reset data demo dinonaktifkan permanen. Hapus/edit data satu per satu dari menu masing-masing.")
+
+
+
+@api.get("/system/integration-health")
+async def integration_health(user: dict = Depends(get_current_user)):
+    """Ringkasan cepat untuk mengecek integrasi modul tanpa membuka semua menu satu per satu."""
+    collections = [
+        "transactions", "customer_debts", "debt_payments", "inventory_items", "stock_movements",
+        "purchase_orders", "online_orders", "suppliers", "vineyard_plots", "vineyard_harvests",
+        "employees", "payroll", "opname_sessions", "expenses", "incomes", "audit_logs",
     ]
-    keep_optional = []
-    if body.keep_business_units:
-        keep_optional.append("business_units")
-    else:
-        wipe.append("business_units")
-    if body.keep_branches:
-        keep_optional.append("branches")
-    else:
-        wipe.append("branches")
-    if body.keep_business_profile:
-        keep_optional.append("business_profile")
-    else:
-        wipe.append("business_profile")
-
     counts = {}
-    for coll in wipe:
-        result = await db[coll].delete_many({})
-        counts[coll] = result.deleted_count
-
-    await write_audit(user, "delete", "system_reset", "all", {
-        "wiped": counts,
-        "kept": keep_optional + ["users", "settings", "notification_settings", "wa_templates"],
-    })
-    return {
-        "ok": True,
-        "wiped": counts,
-        "kept_collections": keep_optional + ["users", "settings", "notification_settings", "wa_templates"],
-        "total_deleted": sum(counts.values()),
-    }
+    for c in collections:
+        try:
+            counts[c] = await db[c].count_documents({})
+        except Exception:
+            counts[c] = 0
+    summary = await _build_unified_finance_summary(limit=200)
+    warnings = []
+    if counts.get("transactions", 0) and summary.get("totals", {}).get("pos_income", 0) == 0:
+        warnings.append("Ada transaksi kasir, tetapi pemasukan kasir masih 0. Cek transaksi bon/settlement lama.")
+    open_debt = summary.get("totals", {}).get("debt", 0)
+    if open_debt < 0:
+        warnings.append("Piutang bon negatif. Data bon perlu dicek.")
+    return {"ok": True, "counts": counts, "finance_totals": summary.get("totals", {}), "warnings": warnings}
 
 
 # ---------- Delete endpoints for PO / Online order / Expense ----------
