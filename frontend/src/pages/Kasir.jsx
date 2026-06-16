@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
+import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
 import { printViaIframe } from "@/lib/safePrint";
@@ -136,7 +136,8 @@ export default function Kasir() {
       setDebts(debtRes.data || []);
       setTrxMatches(trxRes.data || []);
     } catch (err) {
-      toast.error("Gagal memuat transaksi/bon");
+      if (showDebtFinder || String(q || "").trim()) toast.error("Gagal memuat transaksi/bon");
+      setDebts([]); setTrxMatches([]);
     }
   };
   const openDebtFinder = () => { setShowDebtFinder((v) => !v); loadDebts(); };
@@ -388,7 +389,7 @@ export default function Kasir() {
       setCart([]); setCashReceived(""); setDiscount(0); setIsBon(false); setTransactionType("SALE"); setCustomerName(""); setCustomerPhone("");
       setBonInfo(null);
       clearPromo(); clearMember();
-      load(); loadRecent(); loadDebts();
+      load(); loadRecent();
       // Clear bon URL param after settlement so reload doesn't re-trigger
       if (bonInfo) {
         window.history.replaceState({}, "", "/kasir");
@@ -410,9 +411,6 @@ export default function Kasir() {
           <div className="flex gap-2">
             <Button data-testid="open-debt-finder-btn" onClick={openDebtFinder} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">
               <Search className="w-4 h-4 mr-1.5" /> Cari Transaksi
-            </Button>
-            <Button data-testid="scan-transaction-btn" onClick={() => nav('/scan?mode=transaction')} variant="outline" className="border-emerald-300 text-emerald-800 hover:bg-emerald-50">
-              <ScanLine className="w-4 h-4 mr-1.5" /> Scan QR
             </Button>
             <Button data-testid="open-history-btn" onClick={() => { setShowHistory(true); loadRecent(); }} variant="outline" className="border-gray-300">
               <ReceiptIcon className="w-4 h-4 mr-1.5" /> Riwayat / Batal
@@ -749,7 +747,7 @@ export default function Kasir() {
       <Dialog open={showHistory} onOpenChange={setShowHistory}>
         <DialogContent className="max-w-2xl max-h-[80vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle>Riwayat Transaksi · Detail / Print Ulang / Edit</DialogTitle>
+            <DialogTitle>Riwayat Transaksi · Detail / Edit</DialogTitle>
           </DialogHeader>
           <div className="mb-2">
             <Input value={historySearch} onChange={(e) => setHistorySearch(e.target.value)} placeholder="Cari no nota / nama pelanggan / no HP" className="h-9" />
@@ -781,7 +779,6 @@ export default function Kasir() {
                   {(t.debt_amount || 0) > 0 && <div className="text-[10px] text-amber-700">Sisa bon {formatRupiah(t.debt_amount)}</div>}
                   <div className="flex gap-2 justify-end mt-1 flex-wrap">
                     <button data-testid={`detail-trx-${t.id}`} onClick={() => setShowReceipt(t)} className="text-xs text-[#1a6b3c] font-semibold hover:underline">Detail</button>
-                    <button data-testid={`reprint-trx-${t.id}`} onClick={() => { setShowReceipt(t); toast.info("Struk lama siap diprint ulang"); }} className="text-xs text-amber-600 font-semibold hover:underline">Print Ulang</button>
                     {!t.cancelled && (
                       <>
                         <button data-testid={`edit-trx-${t.id}`} onClick={() => setEditTrx({ ...t })} className="text-xs text-blue-600 font-medium hover:underline">Edit</button>

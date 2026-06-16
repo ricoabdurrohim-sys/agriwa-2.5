@@ -23,7 +23,6 @@ import KDS from "@/pages/KDS";
 import Karyawan from "@/pages/Karyawan";
 import StockOpname from "@/pages/StockOpname";
 import BankImport from "@/pages/BankImport";
-import Onboarding from "@/pages/Onboarding";
 import BusinessUnits from "@/pages/BusinessUnits";
 import Promo from "@/pages/Promo";
 import UserManagement from "@/pages/UserManagement";
@@ -70,7 +69,6 @@ function AppRouter() {
         <Route path="/branches" element={<Branches />} />
         <Route path="/members" element={<Members />} />
         <Route path="/audit" element={<AuditLog />} />
-        <Route path="/onboarding" element={<Onboarding />} />
         <Route path="/pengaturan" element={<Pengaturan />} />
         <Route path="/bantuan" element={<Bantuan />} />
       </Route>

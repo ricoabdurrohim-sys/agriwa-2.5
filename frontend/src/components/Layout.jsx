@@ -4,7 +4,7 @@ import {
   LayoutDashboard, UtensilsCrossed, Calculator, FileBarChart,
   Grape, Warehouse, Users, HandCoins, Settings,
   HelpCircle, Menu, LogOut, Bell, ChefHat, Beaker, Truck,
-  Briefcase, ClipboardCheck, Building2, Sparkles, Tag, Layers,
+  Briefcase, ClipboardCheck, Building2, Tag, Layers,
   Shield, MessageCircle, Activity, Crown, Building, Eye, EyeOff, Sliders, Check,
   Package, ScanLine,
 } from "lucide-react";
@@ -25,8 +25,6 @@ const allModules = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, group: "Ringkasan", essential: true },
   { to: "/notifications", label: "Notifikasi", icon: MessageCircle, group: "Ringkasan" },
   { to: "/scan", label: "Pintasan Scan", icon: ScanLine, group: "Ringkasan" },
-  { to: "/onboarding", label: "Setup Wizard", icon: Sparkles, group: "Ringkasan" },
-
   { to: "/warung", label: "Warung & Meja", icon: UtensilsCrossed, group: "Operasional", essential: true },
   { to: "/kasir", label: "Kasir POS", icon: Calculator, group: "Operasional", essential: true },
   { to: "/kds", label: "Dapur / KDS", icon: ChefHat, group: "Operasional" },
@@ -169,9 +167,13 @@ export default function Layout() {
                       </button>
                     </div>
                     <div className="grid grid-cols-3 gap-2 mt-4">
-                      {[allModules[0], allModules[3], allModules[4]].map((m) => (
+                      {[
+                        { to: "/", label: "Dashboard", icon: LayoutDashboard },
+                        { to: "/warung", label: "Warung", icon: UtensilsCrossed },
+                        { to: "/kasir", label: "Kasir", icon: Calculator },
+                      ].map((m) => (
                         <NavLink key={m.to} to={m.to} end={m.to === "/"} onClick={() => setOpen(false)} className="rounded-xl bg-white/10 hover:bg-white/15 border border-white/10 px-2 py-2 text-center text-[11px] font-semibold text-white/90">
-                          <m.icon className="w-4 h-4 mx-auto mb-1 text-[#f4a228]" />{m.label.split(' ')[0]}
+                          <m.icon className="w-4 h-4 mx-auto mb-1 text-[#f4a228]" />{m.label}
                         </NavLink>
                       ))}
                     </div>

@@ -17,7 +17,7 @@ import secrets
 import hmac
 import hashlib
 from urllib.parse import quote
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
 from starlette.middleware.cors import CORSMiddleware
@@ -804,8 +804,9 @@ def _batch_prefix_from_name(name: str) -> str:
     return "".join(w[0] for w in words[:3])[:3]
 
 
-async def _generate_batch_no(item_name: str, purchase_date: str = "") -> str:
-    # Format contoh: GP150626001 = Gula Pasir, 15 Juni 2026, pembelian ke-001 hari itu.
+async def _generate_batch_no(item_name: str, purchase_date: str = "", item_id: str = "") -> str:
+    # Format contoh: GP150626001 = Gula Pasir, 15 Juni 2026, pembelian pertama untuk item itu pada hari itu.
+    # Counter dipisah per barang, bukan global lintas semua item.
     prefix = _batch_prefix_from_name(item_name)
     if purchase_date:
         raw = str(purchase_date)[:10]
@@ -817,7 +818,10 @@ async def _generate_batch_no(item_name: str, purchase_date: str = "") -> str:
         dt = datetime.now(timezone.utc)
     date_part = dt.strftime("%d%m%y")
     regex = f"^{re.escape(prefix + date_part)}"
-    count = await db.inventory_batches.count_documents({"batch_no": {"$regex": regex}})
+    query = {"batch_no": {"$regex": regex}}
+    if item_id:
+        query["item_id"] = item_id
+    count = await db.inventory_batches.count_documents(query)
     return f"{prefix}{date_part}{count + 1:03d}"
 
 
@@ -827,7 +831,7 @@ async def _record_inventory_batch(item: dict, qty: float, body: dict, source: st
     batch_no = (body.get("batch_no") or "").strip()
     purchase_date = body.get("purchase_date") or body.get("date") or ""
     if not batch_no:
-        batch_no = await _generate_batch_no(item.get("name"), purchase_date)
+        batch_no = await _generate_batch_no(item.get("name"), purchase_date, item.get("id"))
     batch = {
         "id": gen_id(),
         "item_id": item.get("id"),
@@ -898,28 +902,69 @@ async def _printable_batch_payload(batch: dict, base_url: str = "") -> dict:
     }
 
 
-async def _consume_inventory_batches(item_id: str, qty: float, reference: str = "stock_out"):
-    """Kurangi sisa batch secara FIFO agar sisa batch lama bisa dilihat di Inventori."""
+async def _consume_inventory_batches(item_id: str, qty: float, reference: str = "stock_out", preferred_batch: str = ""):
+    """Kurangi sisa batch. Kalau preferred_batch dipilih, pakai batch itu dulu, lalu FIFO."""
     remaining = float(qty or 0)
     if remaining <= 0:
         return []
     consumed = []
-    cursor = db.inventory_batches.find({"item_id": item_id}).sort("created_at", 1)
-    async for b in cursor:
-        if remaining <= 0:
-            break
+
+    async def take_from_batch(b, amount_left):
         current_left = b.get("remaining_quantity")
         if current_left is None:
             current_left = b.get("quantity", 0)
         current_left = float(current_left or 0)
-        if current_left <= 0:
-            continue
-        take = min(current_left, remaining)
+        if current_left <= 0 or amount_left <= 0:
+            return amount_left
+        take = min(current_left, amount_left)
         new_left = max(0, current_left - take)
         await db.inventory_batches.update_one({"id": b.get("id")}, {"$set": {"remaining_quantity": new_left, "updated_at": now_iso()}})
         consumed.append({"batch_id": b.get("id"), "batch_no": b.get("batch_no"), "qty_out": take, "remaining_after": new_left})
-        remaining -= take
+        return amount_left - take
+
+    used_ids = set()
+    if preferred_batch:
+        pref = await db.inventory_batches.find_one({
+            "item_id": item_id,
+            "$or": [{"id": preferred_batch}, {"batch_no": preferred_batch}],
+        }, {"_id": 0})
+        if pref:
+            remaining = await take_from_batch(pref, remaining)
+            used_ids.add(pref.get("id"))
+
+    cursor = db.inventory_batches.find({"item_id": item_id}).sort("created_at", 1)
+    async for b in cursor:
+        if remaining <= 0:
+            break
+        if b.get("id") in used_ids:
+            continue
+        remaining = await take_from_batch(b, remaining)
     return consumed
+
+
+async def _reconcile_batch_remaining(item_id: str):
+    """Perbaiki sisa batch dari stock_movements agar batch lama yang sudah dipakai tampil benar."""
+    batches = await db.inventory_batches.find({"item_id": item_id}, {"_id": 0}).to_list(2000)
+    if not batches:
+        return []
+    used = {}
+    moves = db.stock_movements.find({"item_id": item_id, "consumed_batches": {"$exists": True}}, {"_id": 0, "consumed_batches": 1})
+    async for mv in moves:
+        for c in mv.get("consumed_batches") or []:
+            key = c.get("batch_id") or c.get("batch_no")
+            if key:
+                used[key] = used.get(key, 0.0) + float(c.get("qty_out") or 0)
+    changed = []
+    for b in batches:
+        qty = float(b.get("quantity") or 0)
+        spent = float(used.get(b.get("id"), 0.0) + used.get(b.get("batch_no"), 0.0))
+        expected = max(0.0, qty - spent)
+        current = b.get("remaining_quantity")
+        if current is None or abs(float(current or 0) - expected) > 0.0001:
+            await db.inventory_batches.update_one({"id": b.get("id")}, {"$set": {"remaining_quantity": expected, "updated_at": now_iso()}})
+            b["remaining_quantity"] = expected
+            changed.append(b.get("batch_no"))
+    return changed
 
 
 @api.get("/inventory")
@@ -1001,6 +1046,7 @@ async def update_inventory(item_id: str, body: dict, user: dict = Depends(get_cu
 
 @api.get("/inventory/{item_id}/batches")
 async def list_inventory_batches(item_id: str, user: dict = Depends(get_current_user)):
+    await _reconcile_batch_remaining(item_id)
     return await db.inventory_batches.find({"item_id": item_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
@@ -1063,6 +1109,7 @@ async def delete_bom(bom_id: str, user: dict = Depends(get_current_user)):
 # ---------- Produksi (Restock product via BOM) ----------
 class ProduceIn(BaseModel):
     quantity: float  # how many finished units to produce
+    selected_batches: Optional[Dict[str, str]] = None  # ingredient_item_id -> batch_no/id
 
 
 @api.post("/inventory/{item_id}/produce")
@@ -1095,7 +1142,7 @@ async def produce_item(item_id: str, body: ProduceIn, user: dict = Depends(get_c
                 {"id": ing["item_id"]},
                 {"$inc": {"current_stock": -qty_used}},
             )
-            used_batches = await _consume_inventory_batches(ing["item_id"], qty_used, reference=f"PRODUCE-{item_id}")
+            used_batches = await _consume_inventory_batches(ing["item_id"], qty_used, reference=f"PRODUCE-{item_id}", preferred_batch=(body.selected_batches or {}).get(ing["item_id"], ""))
             await db.stock_movements.insert_one({
                 "id": gen_id(),
                 "item_id": ing["item_id"],
@@ -3190,6 +3237,7 @@ async def startup():
     await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_items.create_index([("name_key", 1), ("unit", 1), ("business_unit", 1)])
     await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
+    await db.inventory_batches.create_index([("item_id", 1), ("batch_no", 1)])
     await db.inventory_batches.create_index([("batch_no", 1)])
     await db.transactions.create_index([("trx_no", 1)])
     await db.transactions.create_index([("customer_name", 1)])
@@ -3295,6 +3343,7 @@ class ProductionBatchIn(BaseModel):
     quantity: int
     notes: Optional[str] = ""
     force: bool = False  # override insufficient stock
+    selected_batches: Optional[Dict[str, str]] = None
 
 
 @api.post("/production/batches")
@@ -3315,7 +3364,7 @@ async def create_batch(body: ProductionBatchIn, user: dict = Depends(get_current
         required = ing["quantity"] * body.quantity
         actual_cost += int(required * inv.get("cost_price", 0))
         await db.inventory_items.update_one({"id": ing["item_id"]}, {"$inc": {"current_stock": -required}})
-        used_batches = await _consume_inventory_batches(ing["item_id"], required, reference=f"PROD-{body.recipe_id}")
+        used_batches = await _consume_inventory_batches(ing["item_id"], required, reference=f"PROD-{body.recipe_id}", preferred_batch=(body.selected_batches or {}).get(ing["item_id"], ""))
         await db.stock_movements.insert_one({
             "id": gen_id(), "item_id": ing["item_id"], "type": "production_out",
             "quantity": -required, "reason": f"Produksi {bom.get('name')}",

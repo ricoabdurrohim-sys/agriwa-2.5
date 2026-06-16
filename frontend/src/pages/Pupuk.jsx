@@ -21,11 +21,14 @@ export default function Pupuk() {
   const [quantity, setQuantity] = useState(1);
   const [preview, setPreview] = useState(null);
   const [notes, setNotes] = useState("");
+  const [inventory, setInventory] = useState([]);
+  const [selectedBatches, setSelectedBatches] = useState({});
 
   const load = async () => {
-    const [b, h] = await Promise.all([api.get("/bom"), api.get("/production/batches")]);
+    const [b, h, inv] = await Promise.all([api.get("/bom"), api.get("/production/batches"), api.get("/inventory")]);
     setRecipes(b.data.filter((r) => r.type === "fertilizer"));
     setBatches(h.data);
+    setInventory(inv.data || []);
   };
   useEffect(() => { load(); }, []);
 
@@ -39,9 +42,9 @@ export default function Pupuk() {
 
   const startProduction = async () => {
     try {
-      await api.post("/production/batches", { recipe_id: recipeId, quantity: parseInt(quantity), notes, force: !preview?.can_produce });
+      await api.post("/production/batches", { recipe_id: recipeId, quantity: parseInt(quantity), notes, force: !preview?.can_produce, selected_batches: selectedBatches });
       toast.success("Produksi selesai. Stok produk bertambah.");
-      setShow(false); setPreview(null); setRecipeId(""); setQuantity(1); setNotes("");
+      setShow(false); setPreview(null); setRecipeId(""); setQuantity(1); setNotes(""); setSelectedBatches({});
       load();
     } catch (e) { toast.error(e?.response?.data?.detail || "Gagal memproses"); }
   };
@@ -59,6 +62,8 @@ export default function Pupuk() {
       toast.success('Label produksi dikirim ke printer thermal');
     } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
   };
+
+  const inventoryById = Object.fromEntries((inventory || []).map((it) => [it.id, it]));
 
   return (
     <div className="space-y-4 fade-in">
@@ -117,7 +122,7 @@ export default function Pupuk() {
         </TabsContent>
       </Tabs>
 
-      <Dialog open={show} onOpenChange={(o) => { setShow(o); if (!o) setPreview(null); }}>
+      <Dialog open={show} onOpenChange={(o) => { setShow(o); if (!o) { setPreview(null); setSelectedBatches({}); } }}>
         <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>Mulai Produksi</DialogTitle></DialogHeader>
           <div className="space-y-3">
@@ -141,14 +146,28 @@ export default function Pupuk() {
                   {preview.can_produce ? "Bahan mencukupi" : "Stok bahan tidak cukup"}
                 </div>
                 <div className="space-y-1">
-                  {preview.checklist.map((c) => (
-                    <div key={c.item_id} className="flex justify-between text-xs">
-                      <span>{c.name}</span>
-                      <span className={`font-mono ${c.sufficient ? "text-emerald-700" : "text-red-700 font-semibold"}`}>
-                        {c.required} / {c.available} {c.unit}
-                      </span>
+                  {preview.checklist.map((c) => {
+                    const item = inventoryById[c.item_id] || {};
+                    return (
+                    <div key={c.item_id} className="space-y-1 border-b border-gray-200 last:border-0 pb-1.5">
+                      <div className="flex justify-between text-xs">
+                        <span>{c.name}</span>
+                        <span className={`font-mono ${c.sufficient ? "text-emerald-700" : "text-red-700 font-semibold"}`}>
+                          {c.required} / {c.available} {c.unit}
+                        </span>
+                      </div>
+                      <select
+                        value={selectedBatches[c.item_id] || ""}
+                        onChange={(e) => setSelectedBatches((p) => ({ ...p, [c.item_id]: e.target.value }))}
+                        className="w-full rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-700"
+                      >
+                        <option value="">FIFO otomatis: batch masuk lebih dulu dipakai dulu</option>
+                        {(item.recent_batches || []).filter((b) => Number(b.remaining_quantity ?? b.quantity ?? 0) > 0).map((b) => (
+                          <option key={b.id || b.batch_no} value={b.batch_no || b.id}>{b.batch_no} · sisa {Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} {b.unit || c.unit || ""}</option>
+                        ))}
+                      </select>
                     </div>
-                  ))}
+                  );})}
                 </div>
                 <div className="border-t border-gray-200 mt-2 pt-2 flex justify-between text-sm">
                   <span className="font-medium">Estimasi Biaya</span>

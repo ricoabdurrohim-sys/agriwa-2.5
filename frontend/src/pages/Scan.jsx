@@ -1,81 +1,96 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { ScanLine, Search, Camera, XCircle } from "lucide-react";
+import { ScanLine, Search, Camera, XCircle, Keyboard, RefreshCcw } from "lucide-react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
+
+const SCANNER_ID = "agriwarung-html5-qr-reader";
 
 export default function Scan() {
   const nav = useNavigate();
   const [params] = useSearchParams();
   const initialCode = params.get("code") || "";
   const mode = params.get("mode") || "all";
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const detectorRef = useRef(null);
-  const timerRef = useRef(null);
+  const scannerRef = useRef(null);
+  const resolvingRef = useRef(false);
   const [code, setCode] = useState(initialCode);
-  const [status, setStatus] = useState(initialCode ? "Membuka hasil scan..." : "Siap scan QR / barcode");
+  const [status, setStatus] = useState(initialCode ? "Membuka hasil scan..." : "Klik Mulai Scan untuk membuka kamera");
   const [scanning, setScanning] = useState(false);
-  const [cameraSupported, setCameraSupported] = useState(true);
+  const [manualOnly, setManualOnly] = useState(false);
 
-  const stopCamera = () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = null;
-    try { streamRef.current?.getTracks?.().forEach((t) => t.stop()); } catch {}
-    streamRef.current = null;
+  const stopCamera = async () => {
+    try {
+      if (scannerRef.current) {
+        const s = scannerRef.current;
+        scannerRef.current = null;
+        await s.stop().catch(() => {});
+        await s.clear().catch(() => {});
+      }
+    } catch {}
     setScanning(false);
   };
 
   const resolve = async (raw) => {
     const value = String(raw || "").trim();
     if (!value) return toast.error("Kode kosong");
+    if (resolvingRef.current) return;
+    resolvingRef.current = true;
     setStatus("Mencari data...");
     try {
       const { data } = await api.get(`/scan/resolve?code=${encodeURIComponent(value)}`);
-      stopCamera();
+      await stopCamera();
       toast.success(`Ditemukan: ${data.kind}`);
       nav(data.target || "/kasir");
     } catch (e) {
+      resolvingRef.current = false;
       setStatus("Tidak ditemukan. Coba scan ulang atau ketik nomor nota/batch.");
       toast.error(e?.response?.data?.detail || "Kode tidak ditemukan");
     }
   };
 
   const startCamera = async () => {
-    if (!("BarcodeDetector" in window)) {
-      setCameraSupported(false);
-      setStatus("Browser ini belum mendukung kamera scanner. Ketik nomor nota/batch manual.");
-      return;
-    }
+    if (scanning) return;
+    setManualOnly(false);
+    setStatus("Menyiapkan kamera...");
     try {
-      detectorRef.current = new window.BarcodeDetector({ formats: ["qr_code", "code_128", "ean_13", "ean_8"] });
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setManualOnly(true);
+        setStatus("Browser belum memberi akses kamera. Pastikan buka aplikasi lewat HTTPS Vercel dan izinkan kamera, atau input kode manual.");
+        return;
+      }
+      const { Html5Qrcode } = await import("html5-qrcode");
+      const cameras = await Html5Qrcode.getCameras();
+      if (!cameras?.length) {
+        setManualOnly(true);
+        setStatus("Kamera tidak ditemukan. Cek izin kamera Windows/Edge/Chrome, atau input kode manual.");
+        return;
+      }
+      await stopCamera();
+      const scanner = new Html5Qrcode(SCANNER_ID, { verbose: false });
+      scannerRef.current = scanner;
+      const backCamera = cameras.find((c) => /back|rear|environment/i.test(c.label || "")) || cameras[0];
+      await scanner.start(
+        backCamera.id,
+        { fps: 8, qrbox: { width: 240, height: 240 }, aspectRatio: 1.333 },
+        (decodedText) => resolve(decodedText),
+        () => {}
+      );
       setScanning(true);
-      setStatus("Arahkan kamera ke QR/barcode");
-      timerRef.current = setInterval(async () => {
-        try {
-          if (!videoRef.current || videoRef.current.readyState < 2) return;
-          const codes = await detectorRef.current.detect(videoRef.current);
-          if (codes?.length) {
-            const raw = codes[0].rawValue;
-            if (raw) resolve(raw);
-          }
-        } catch {}
-      }, 650);
+      setStatus("Kamera aktif. Arahkan QR/barcode ke kotak scan.");
     } catch (e) {
-      setCameraSupported(false);
-      setStatus("Kamera tidak bisa dibuka. Pastikan izin kamera aktif atau gunakan input manual.");
+      console.error(e);
+      setManualOnly(true);
+      setScanning(false);
+      setStatus("Kamera tidak bisa dibuka. Klik ikon gembok di address bar → Camera → Allow, lalu reload. Input manual tetap bisa dipakai.");
       toast.error("Kamera tidak bisa dibuka");
     }
   };
 
   useEffect(() => {
     if (initialCode) resolve(initialCode);
-    return stopCamera;
+    return () => { stopCamera(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialCode]);
 
@@ -91,29 +106,29 @@ export default function Scan() {
             <p className="text-sm text-gray-500">Mode: {modeLabel}</p>
           </div>
         </div>
-        <p className="text-xs text-gray-500 leading-relaxed">Scan QR struk untuk membuka detail transaksi, scan QR batch untuk membuka inventori/batch, atau ketik nomor nota/batch secara manual.</p>
+        <p className="text-xs text-gray-500 leading-relaxed">Scan QR struk untuk membuka transaksi, scan QR batch untuk membuka inventori/batch, atau ketik nomor nota/batch manual.</p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-3">
-        <div className="aspect-[4/3] rounded-xl bg-gray-900 overflow-hidden flex items-center justify-center relative">
-          <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover ${scanning ? "block" : "hidden"}`} />
-          {!scanning && <div className="text-center text-white/80 p-6"><Camera className="w-12 h-12 mx-auto mb-3 opacity-70" /><div className="text-sm">Kamera belum aktif</div></div>}
-          <div className="absolute inset-8 border-2 border-white/70 rounded-2xl pointer-events-none" />
+        <div className="rounded-xl bg-gray-900 overflow-hidden min-h-[320px] flex items-center justify-center relative">
+          <div id={SCANNER_ID} className="w-full min-h-[320px] flex items-center justify-center text-white/80" />
+          {!scanning && <div className="absolute inset-0 flex items-center justify-center text-center text-white/80 p-6 pointer-events-none"><div><Camera className="w-12 h-12 mx-auto mb-3 opacity-70" /><div className="text-sm">Kamera belum aktif</div><div className="text-xs text-white/55 mt-1">Klik Mulai Scan agar browser meminta izin kamera</div></div></div>}
         </div>
-        <div className="text-xs text-gray-500 bg-gray-50 rounded-lg p-2">{status}</div>
+        <div className={`text-xs rounded-lg p-2 ${manualOnly ? "bg-amber-50 text-amber-800 border border-amber-200" : "bg-gray-50 text-gray-600"}`}>{status}</div>
         <div className="grid grid-cols-2 gap-2">
           <Button onClick={startCamera} className="bg-[#1a6b3c] hover:bg-[#14522d]" disabled={scanning}><Camera className="w-4 h-4 mr-1.5" /> Mulai Scan</Button>
           <Button variant="outline" onClick={stopCamera} disabled={!scanning}><XCircle className="w-4 h-4 mr-1.5" /> Stop</Button>
         </div>
-        {!cameraSupported && <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2">Gunakan Chrome/Edge terbaru dan izinkan kamera. Di desktop, QR scanner kamera tergantung dukungan browser; input manual tetap bisa dipakai.</div>}
+        {manualOnly && <Button variant="ghost" size="sm" onClick={() => window.location.reload()} className="w-full"><RefreshCcw className="w-4 h-4 mr-1" /> Reload setelah izin kamera diubah</Button>}
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-2">
-        <div className="text-sm font-semibold text-gray-900">Input manual</div>
+        <div className="text-sm font-semibold text-gray-900 flex items-center gap-1.5"><Keyboard className="w-4 h-4" /> Input manual</div>
         <div className="flex gap-2">
           <Input value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && resolve(code)} placeholder="Nomor nota / batch / kode QR" className="font-mono" />
           <Button variant="outline" onClick={() => resolve(code)}><Search className="w-4 h-4 mr-1" /> Cari</Button>
         </div>
+        <div className="text-[11px] text-gray-500">Contoh input manual: TRX-20260616-ABC123, GP160626001, atau kode aw:batch:GP160626001.</div>
       </div>
     </div>
   );

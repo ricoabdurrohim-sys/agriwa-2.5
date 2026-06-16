@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer, QrCode } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { exportInventoryXLSX, exportInventoryPDF } from "@/lib/exports";
 import ImageUpload, { resolveImageUrl } from "@/components/ImageUpload";
@@ -29,7 +29,6 @@ const initial = {
 };
 
 export default function Inventori() {
-  const nav = useNavigate();
   const [params] = useSearchParams();
   const batchLookup = params.get("batch") || "";
   const [items, setItems] = useState([]);
@@ -43,6 +42,7 @@ export default function Inventori() {
   const [produceItem, setProduceItem] = useState(null);
   const [produceQty, setProduceQty] = useState("");
   const [producing, setProducing] = useState(false);
+  const [produceBatchChoice, setProduceBatchChoice] = useState({});
   const [batchItem, setBatchItem] = useState(null);
   const [batchRows, setBatchRows] = useState([]);
   const [templateId, setTemplateId] = useState("new");
@@ -193,6 +193,7 @@ export default function Inventori() {
   const openProduce = (item) => {
     setProduceItem(item);
     setProduceQty("");
+    setProduceBatchChoice({});
   };
 
   const doProduce = async () => {
@@ -200,7 +201,7 @@ export default function Inventori() {
     if (!q || q <= 0) return toast.error("Masukkan jumlah produksi");
     setProducing(true);
     try {
-      const { data } = await api.post(`/inventory/${produceItem.id}/produce`, { quantity: q });
+      const { data } = await api.post(`/inventory/${produceItem.id}/produce`, { quantity: q, selected_batches: produceBatchChoice });
       toast.success(`Produksi ${q} ${produceItem.unit} ${produceItem.name} berhasil${data.has_bom ? " — bahan baku otomatis berkurang" : ""}`);
       setProduceItem(null); setProduceQty(""); load();
     } catch (e) {
@@ -220,9 +221,6 @@ export default function Inventori() {
           <p className="text-sm text-gray-500 mt-0.5">{items.length} barang · {lowCount} stok menipis</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button data-testid="scan-inventory-btn" variant="outline" onClick={() => nav('/scan?mode=inventory')}>
-            <QrCode className="w-4 h-4 mr-1.5" /> Scan QR
-          </Button>
           <Button data-testid="add-inventory-btn" onClick={openNew} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Barang Baru
           </Button>
@@ -455,11 +453,23 @@ export default function Inventori() {
                         const available = ref?.current_stock || 0;
                         const insufficient = q > 0 && available < ing.quantity * q;
                         return (
-                          <div key={ing.item_id} className="text-xs flex justify-between font-mono">
-                            <span className="text-amber-900">{ref?.name || ing.item_id}</span>
-                            <span className={insufficient ? "text-red-600 font-bold" : "text-amber-800"}>
-                              {need} / tersedia {available} {ref?.unit || ""}
-                            </span>
+                          <div key={ing.item_id} className="text-xs space-y-1 border-b border-amber-100 last:border-0 pb-1.5">
+                            <div className="flex justify-between font-mono">
+                              <span className="text-amber-900">{ref?.name || ing.item_id}</span>
+                              <span className={insufficient ? "text-red-600 font-bold" : "text-amber-800"}>
+                                {need} / tersedia {available} {ref?.unit || ""}
+                              </span>
+                            </div>
+                            <select
+                              value={produceBatchChoice[ing.item_id] || ""}
+                              onChange={(e) => setProduceBatchChoice((p) => ({ ...p, [ing.item_id]: e.target.value }))}
+                              className="w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-[11px] text-gray-700"
+                            >
+                              <option value="">FIFO otomatis: batch masuk lebih dulu dipakai dulu</option>
+                              {(ref?.recent_batches || []).filter((b) => Number(b.remaining_quantity ?? b.quantity ?? 0) > 0).map((b) => (
+                                <option key={b.id || b.batch_no} value={b.batch_no || b.id}>{b.batch_no} · sisa {Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} {b.unit || ref?.unit || ""}</option>
+                              ))}
+                            </select>
                           </div>
                         );
                       })}
