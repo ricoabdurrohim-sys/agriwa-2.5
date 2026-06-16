@@ -948,17 +948,23 @@ async def _reconcile_batch_remaining(item_id: str):
     if not batches:
         return []
     used = {}
-    moves = db.stock_movements.find({"item_id": item_id, "consumed_batches": {"$exists": True}}, {"_id": 0, "consumed_batches": 1})
+    moves = db.stock_movements.find({"item_id": item_id, "$or": [{"consumed_batches": {"$exists": True}}, {"restored_batches": {"$exists": True}}]}, {"_id": 0, "consumed_batches": 1, "restored_batches": 1})
+    restored = {}
     async for mv in moves:
         for c in mv.get("consumed_batches") or []:
             key = c.get("batch_id") or c.get("batch_no")
             if key:
                 used[key] = used.get(key, 0.0) + float(c.get("qty_out") or 0)
+        for r in mv.get("restored_batches") or []:
+            key = r.get("batch_id") or r.get("batch_no")
+            if key:
+                restored[key] = restored.get(key, 0.0) + float(r.get("qty_in") or 0)
     changed = []
     for b in batches:
         qty = float(b.get("quantity") or 0)
         spent = float(used.get(b.get("id"), 0.0) + used.get(b.get("batch_no"), 0.0))
-        expected = max(0.0, qty - spent)
+        added_back = float(restored.get(b.get("id"), 0.0) + restored.get(b.get("batch_no"), 0.0))
+        expected = max(0.0, min(qty, qty - spent + added_back))
         current = b.get("remaining_quantity")
         if current is None or abs(float(current or 0) - expected) > 0.0001:
             await db.inventory_batches.update_one({"id": b.get("id")}, {"$set": {"remaining_quantity": expected, "updated_at": now_iso()}})
@@ -968,8 +974,21 @@ async def _reconcile_batch_remaining(item_id: str):
 
 
 @api.get("/inventory")
-async def list_inventory(user: dict = Depends(get_current_user)):
-    items = await db.inventory_items.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+async def list_inventory(user: dict = Depends(get_current_user), include_batches: bool = True, limit: int = 3000):
+    """List inventory.
+
+    include_batches=false dipakai Kasir/Warung supaya halaman tidak menarik seluruh
+    riwayat batch dan tetap cepat. Menu Inventori/Produksi tetap memakai batch.
+    """
+    safe_limit = max(100, min(int(limit or 3000), 5000))
+    items = await db.inventory_items.find({}, {"_id": 0}).sort("created_at", -1).to_list(safe_limit)
+    if not include_batches:
+        for item in items:
+            item["recent_batches"] = []
+            item["batch_count"] = 0
+            item["batch_remaining_total"] = 0
+        return items
+
     batches = await db.inventory_batches.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     by_item = {}
     for b in batches:
@@ -2108,53 +2127,102 @@ async def update_online_status(oid: str, body: StatusUpdateIn, user: dict = Depe
 
 # Cancel transaction (refund inventory)
 @api.delete("/transactions/{trx_id}")
-async def cancel_transaction(trx_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+async def cancel_transaction(trx_id: str, user: dict = Depends(get_current_user)):
+    """Batalkan transaksi kasir secara aman.
+
+    Perbaikan v2.5.15:
+    - kasir/admin biasa boleh membatalkan dari Riwayat Kasir;
+    - transaksi bon juga bisa dibatalkan;
+    - transaksi manual-cancel tidak lagi dianggap aktif oleh normalisasi finance;
+    - stok dikembalikan, piutang bon dibatalkan, debt payment terkait divoid.
+    """
     trx = await db.transactions.find_one({"id": trx_id}, {"_id": 0})
     if not trx:
         raise HTTPException(404, "Transaksi tidak ditemukan")
-    if trx.get("cancelled"):
+    if trx.get("cancelled") and trx.get("cancel_reason") == "manual_cancel":
         raise HTTPException(400, "Sudah dibatalkan")
-    # Restore inventory: only restore the product (BOM was never deducted at sale)
-    for it in trx.get("items", []):
-        await db.inventory_items.update_one({"id": it["item_id"]}, {"$inc": {"current_stock": it["quantity"]}})
+    if _is_debt_settlement_document(trx):
+        raise HTTPException(400, "Struk pelunasan bon tidak dibatalkan sendiri. Batalkan transaksi asalnya dari Riwayat Kasir.")
+
+    trx_no = trx.get("trx_no") or trx.get("id")
+    now = now_iso()
+
+    # Restore inventory and reverse batch consumption.
+    for it in trx.get("items", []) or []:
+        item_id = it.get("item_id")
+        qty = float(it.get("quantity") or 0)
+        if not item_id or qty == 0:
+            continue
+        await db.inventory_items.update_one({"id": item_id}, {"$inc": {"current_stock": qty}})
+        # Jika transaksi dulu mengurangi batch, tambahkan kembali ke batch terkait.
+        moves = await db.stock_movements.find({"reference_id": trx_no, "item_id": item_id}, {"_id": 0}).to_list(50)
+        restored_batches = []
+        for mv in moves:
+            for cb in mv.get("consumed_batches") or []:
+                bid = cb.get("batch_id")
+                bno = cb.get("batch_no")
+                qout = float(cb.get("qty_out") or 0)
+                if qout <= 0:
+                    continue
+                q = {"$or": [{"id": bid}, {"batch_no": bno}], "item_id": item_id}
+                await db.inventory_batches.update_one(q, {"$inc": {"remaining_quantity": qout}, "$set": {"updated_at": now}})
+                restored_batches.append({"batch_id": bid, "batch_no": bno, "qty_in": qout})
         await db.stock_movements.insert_one({
-            "id": gen_id(), "item_id": it["item_id"], "type": "cancel_refund",
-            "quantity": it["quantity"], "reason": f"Pembatalan {trx['trx_no']}",
-            "created_at": now_iso(),
+            "id": gen_id(), "item_id": item_id, "type": "cancel_refund",
+            "quantity": qty, "qty_in": qty, "qty_out": 0,
+            "reason": f"Pembatalan {trx_no}",
+            "reference": "transaction_cancel", "reference_id": trx_id,
+            "restored_batches": restored_batches,
+            "created_at": now,
         })
-    await db.transactions.update_one({"id": trx_id}, {"$set": {"cancelled": True, "cancelled_at": now_iso(), "cancelled_by": user["id"]}})
 
-    # Cancel related customer debt (bon)
-    if trx.get("is_bon"):
-        await db.customer_debts.update_many(
-            {"transaction_id": trx_id},
-            {"$set": {"status": "cancelled", "cancelled_at": now_iso()}},
-        )
+    await db.transactions.update_one(
+        {"id": trx_id},
+        {"$set": {
+            "cancelled": True,
+            "cancel_reason": "manual_cancel",
+            "payment_status": "CANCELLED",
+            "is_bon": False,
+            "debt_amount": 0,
+            "cash_collected": 0,
+            "paid_amount": 0,
+            "cancelled_at": now,
+            "cancelled_by": user.get("id"),
+            "cancelled_by_name": user.get("name"),
+        }},
+    )
 
-    # Revert loyalty points (refund redeemed, deduct earned)
-    if trx.get("member_id"):
-        revert = {}
-        if trx.get("points_earned"):
-            revert["$inc"] = {"points": -int(trx["points_earned"]), "total_spent": -int(trx.get("total", 0))}
-        # Note: points_redeemed was deducted on create, so add it back
-        # We track points_redeemed in the transaction items field if needed; safer to look at deduction record
-        if revert:
-            await db.members.update_one({"id": trx["member_id"]}, revert)
+    # Cancel related customer debt (bon) and void payments so summary tidak menghitungnya lagi.
+    await db.customer_debts.update_many(
+        {"transaction_id": trx_id},
+        {"$set": {"status": "cancelled", "paid": 0, "cancelled_at": now, "cancelled_by": user.get("id")}},
+    )
+    await db.debt_payments.update_many(
+        {"transaction_id": trx_id},
+        {"$set": {"voided": True, "voided_at": now, "voided_by": user.get("id"), "void_reason": "transaction_cancelled"}},
+    )
 
-    # Reverse journal entry
-    await db.journal_entries.insert_one({
-        "id": gen_id(), "date": now_iso(),
-        "description": f"PEMBATALAN {trx['trx_no']}",
-        "lines": [
-            {"account": f"Pendapatan {trx.get('unit', 'warung').capitalize()}", "debit": trx["total"], "credit": 0},
-            {"account": "Kas", "debit": 0, "credit": trx["total"]},
-        ],
-        "reference": "cancellation", "reference_id": trx_id, "unit": trx.get("unit"),
-        "created_at": now_iso(),
-    })
-    await write_audit(user, "delete", "transaction", trx_id, {"trx_no": trx.get("trx_no"), "total": trx.get("total")})
+    # Revert loyalty points (best effort).
+    if trx.get("member_id") and trx.get("points_earned"):
+        await db.members.update_one({"id": trx["member_id"]}, {"$inc": {"points": -int(trx.get("points_earned") or 0), "total_spent": -int(trx.get("total") or 0)}})
+
+    # Reverse journal entry. Finance summary utama memang mengecualikan manual_cancel, tapi journal tetap menyimpan audit.
+    total = int(trx.get("total") or 0)
+    if total > 0:
+        await db.journal_entries.insert_one({
+            "id": gen_id(), "date": now,
+            "description": f"PEMBATALAN {trx_no}",
+            "lines": [
+                {"account": f"Pendapatan {trx.get('unit', 'warung').capitalize()}", "debit": total, "credit": 0},
+                {"account": "Kas/Piutang", "debit": 0, "credit": total},
+            ],
+            "reference": "cancellation", "reference_id": trx_id, "unit": trx.get("unit"),
+            "created_at": now,
+        })
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "transaction", trx_id, {"trx_no": trx_no, "total": total, "reason": "manual_cancel"})
     await broadcast_event("transaction_cancelled", {"id": trx_id})
-    return {"ok": True}
+    return {"ok": True, "cancelled": True}
 
 
 # Edit transaction (only certain fields, not items)
@@ -2429,7 +2497,9 @@ def _is_financial_sale_transaction(t: dict) -> bool:
         return False
     if (t.get("transaction_type") or "SALE").upper() != "SALE":
         return False
-    if t.get("cancelled") and not (t.get("legacy_bon_repaired") or t.get("debt_id") or t.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy")):
+    if t.get("cancel_reason") in ("manual_cancel", "user_cancel", "void"):
+        return False
+    if t.get("cancelled") and not (t.get("legacy_bon_repaired") or t.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy")):
         return False
     return True
 
@@ -2445,8 +2515,8 @@ async def _load_debt_financial_context() -> dict:
     Dengan cara ini laporan tidak bergantung pada dokumen receipt pelunasan atau
     field paid_amount yang mungkin pernah tertimpa patch lama.
     """
-    debts = await db.customer_debts.find({}, {"_id": 0}).to_list(5000)
-    payments = await db.debt_payments.find({}, {"_id": 0}).to_list(5000)
+    debts = await db.customer_debts.find({"status": {"$ne": "cancelled"}}, {"_id": 0}).to_list(5000)
+    payments = await db.debt_payments.find({"voided": {"$ne": True}}, {"_id": 0}).to_list(5000)
     debt_by_trx = {}
     debt_by_id = {}
     payments_by_trx = {}
@@ -2535,7 +2605,9 @@ def _enrich_transaction_financial_fields(t: dict, debt_ctx: Optional[dict] = Non
         total = max(total, _money(debt.get("original_total")))
     collected = _canonical_cash_collected({**row, "total": total}, debt_ctx)
     remaining = max(0, total - collected)
-    if row.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy") or debt or row.get("legacy_bon_repaired"):
+    if row.get("cancel_reason") in ("manual_cancel", "user_cancel", "void"):
+        return {**row, "cancelled": True, "payment_status": "CANCELLED", "is_bon": False, "debt_amount": 0, "paid_amount": 0, "cash_collected": 0}
+    if row.get("cancel_reason") in ("replaced_by_payment", "replaced_by_debt_payment", "debt_settlement_legacy") or row.get("legacy_bon_repaired"):
         row["cancelled"] = False
         row.pop("cancel_reason", None)
     row["total"] = total
@@ -3239,8 +3311,14 @@ async def startup():
     await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_batches.create_index([("item_id", 1), ("batch_no", 1)])
     await db.inventory_batches.create_index([("batch_no", 1)])
+    await db.production_batches.create_index([("created_at", -1)])
+    await db.production_batches.create_index([("batch_no", 1)])
+    await db.b2b_invoices.create_index([("created_at", -1)])
     await db.transactions.create_index([("trx_no", 1)])
     await db.transactions.create_index([("customer_name", 1)])
+    await db.transactions.create_index([("customer_phone", 1)])
+    await db.customer_debts.create_index([("customer_name", 1)])
+    await db.customer_debts.create_index([("customer_phone", 1)])
     await db.customer_debts.create_index([("customer_name", 1)])
     await db.customer_debts.create_index([("customer_phone", 1)])
     await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
@@ -3351,53 +3429,160 @@ async def create_batch(body: ProductionBatchIn, user: dict = Depends(get_current
     bom = await db.bom_recipes.find_one({"id": body.recipe_id}, {"_id": 0})
     if not bom:
         raise HTTPException(404, "Resep tidak ditemukan")
+    production_id = gen_id()
     actual_cost = 0
+    created_at = now_iso()
+
     # Check stock
-    for ing in bom["ingredients"]:
-        inv = await db.inventory_items.find_one({"id": ing["item_id"]})
-        required = ing["quantity"] * body.quantity
-        if not inv or (inv.get("current_stock", 0) < required and not body.force):
+    for ing in bom.get("ingredients", []):
+        inv = await db.inventory_items.find_one({"id": ing.get("item_id")})
+        required = float(ing.get("quantity") or 0) * float(body.quantity or 0)
+        if not inv or (float(inv.get("current_stock") or 0) < required and not body.force):
             raise HTTPException(400, f"Stok {inv.get('name') if inv else 'bahan'} tidak cukup")
-    # Deduct
-    for ing in bom["ingredients"]:
-        inv = await db.inventory_items.find_one({"id": ing["item_id"]})
-        required = ing["quantity"] * body.quantity
-        actual_cost += int(required * inv.get("cost_price", 0))
+
+    consumed_summary = []
+    # Deduct inputs
+    for ing in bom.get("ingredients", []):
+        inv = await db.inventory_items.find_one({"id": ing.get("item_id")})
+        required = float(ing.get("quantity") or 0) * float(body.quantity or 0)
+        actual_cost += int(required * int(inv.get("cost_price") or 0))
         await db.inventory_items.update_one({"id": ing["item_id"]}, {"$inc": {"current_stock": -required}})
-        used_batches = await _consume_inventory_batches(ing["item_id"], required, reference=f"PROD-{body.recipe_id}", preferred_batch=(body.selected_batches or {}).get(ing["item_id"], ""))
+        used_batches = await _consume_inventory_batches(ing["item_id"], required, reference=f"PROD-{production_id}", preferred_batch=(body.selected_batches or {}).get(ing["item_id"], ""))
+        consumed_summary.append({"item_id": ing["item_id"], "item_name": inv.get("name"), "quantity": required, "unit": inv.get("unit"), "batches": used_batches})
         await db.stock_movements.insert_one({
             "id": gen_id(), "item_id": ing["item_id"], "type": "production_out",
-            "quantity": -required, "reason": f"Produksi {bom.get('name')}",
+            "quantity": -required, "qty_out": required, "qty_in": 0,
+            "reason": f"Produksi {bom.get('name')}",
+            "reference": "production_batch", "reference_id": production_id,
             "consumed_batches": used_batches,
-            "created_at": now_iso(),
+            "created_at": created_at,
         })
+
     # Add output
-    await db.inventory_items.update_one({"id": bom["output_item_id"]}, {"$inc": {"current_stock": body.quantity}})
+    await db.inventory_items.update_one({"id": bom["output_item_id"]}, {"$inc": {"current_stock": float(body.quantity or 0)}})
     output_item = await db.inventory_items.find_one({"id": bom["output_item_id"]}, {"_id": 0})
-    out_batch = await _record_output_batch_if_enabled(output_item, body.quantity, "production_batch", ref=body.recipe_id, notes=body.notes or f"Hasil produksi {bom.get('name')}")
+    out_batch = await _record_output_batch_if_enabled(output_item, body.quantity, "production_batch", ref=production_id, notes=body.notes or f"Hasil produksi {bom.get('name')}")
     await db.stock_movements.insert_one({
         "id": gen_id(), "item_id": bom["output_item_id"], "type": "production_in",
-        "quantity": body.quantity, "reason": f"Hasil produksi {bom.get('name')}",
+        "quantity": float(body.quantity or 0), "qty_in": float(body.quantity or 0), "qty_out": 0,
+        "reason": f"Hasil produksi {bom.get('name')}",
+        "reference": "production_batch", "reference_id": production_id,
+        "batch_id": (out_batch or {}).get("id", ""),
         "batch_no": (out_batch or {}).get("batch_no", ""),
-        "created_at": now_iso(),
+        "created_at": created_at,
     })
     batch_no = (out_batch or {}).get("batch_no") or f"BATCH-{datetime.now().strftime('%Y%m')}-{str(uuid.uuid4())[:5].upper()}"
     doc = {
-        "id": gen_id(), "batch_no": batch_no, "recipe_id": body.recipe_id,
+        "id": production_id, "batch_no": batch_no, "recipe_id": body.recipe_id,
         "recipe_name": bom.get("name"), "output_item_id": bom["output_item_id"],
-        "quantity": body.quantity, "actual_cost": actual_cost,
+        "output_item_name": output_item.get("name") if output_item else "",
+        "quantity": float(body.quantity or 0), "actual_cost": actual_cost,
         "inventory_batch_id": (out_batch or {}).get("id", ""),
         "inventory_batch_no": (out_batch or {}).get("batch_no", ""),
-        "notes": body.notes, "created_by": user["id"], "created_at": now_iso(),
+        "consumed_inputs": consumed_summary,
+        "notes": body.notes, "created_by": user["id"], "created_at": created_at,
     }
     await db.production_batches.insert_one(doc)
-    doc.pop("_id", None)
+    invalidate_finance_summary_cache()
+    await write_audit(user, "create", "production_batch", production_id, {"batch_no": batch_no, "recipe": bom.get("name"), "qty": body.quantity})
     return doc
 
 
 @api.get("/production/batches")
 async def list_batches(user: dict = Depends(get_current_user)):
-    return await db.production_batches.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return await db.production_batches.find({"cancelled": {"$ne": True}}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+class ProductionBatchEditIn(BaseModel):
+    notes: Optional[str] = None
+    batch_no: Optional[str] = None
+
+
+@api.put("/production/batches/{batch_id}")
+async def update_production_batch(batch_id: str, body: ProductionBatchEditIn, user: dict = Depends(get_current_user)):
+    batch = await db.production_batches.find_one({"$or": [{"id": batch_id}, {"batch_no": batch_id}]}, {"_id": 0})
+    if not batch:
+        raise HTTPException(404, "Riwayat produksi tidak ditemukan")
+    update = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if not update:
+        return batch
+    update["updated_at"] = now_iso()
+    update["updated_by"] = user.get("id")
+    await db.production_batches.update_one({"id": batch["id"]}, {"$set": update})
+    # Sinkronkan label inventory batch output jika batch_no/catatan diedit.
+    if batch.get("inventory_batch_id"):
+        inv_update = {}
+        if "batch_no" in update:
+            inv_update["batch_no"] = update["batch_no"]
+        if "notes" in update:
+            inv_update["notes"] = update["notes"]
+        if inv_update:
+            inv_update["updated_at"] = update["updated_at"]
+            await db.inventory_batches.update_one({"id": batch["inventory_batch_id"]}, {"$set": inv_update})
+    await write_audit(user, "update", "production_batch", batch["id"], update)
+    return await db.production_batches.find_one({"id": batch["id"]}, {"_id": 0})
+
+
+@api.delete("/production/batches/{batch_id}")
+async def delete_production_batch(batch_id: str, user: dict = Depends(get_current_user)):
+    batch = await db.production_batches.find_one({"$or": [{"id": batch_id}, {"batch_no": batch_id}]}, {"_id": 0})
+    if not batch:
+        raise HTTPException(404, "Riwayat produksi tidak ditemukan")
+    if batch.get("cancelled"):
+        raise HTTPException(400, "Riwayat produksi sudah dibatalkan")
+    production_id = batch["id"]
+    now = now_iso()
+    qty = float(batch.get("quantity") or 0)
+
+    # Kurangi stok barang jadi. Jangan sampai stok negatif tanpa alasan jelas.
+    out_item_id = batch.get("output_item_id")
+    if out_item_id and qty:
+        out_item = await db.inventory_items.find_one({"id": out_item_id}, {"_id": 0})
+        if out_item and float(out_item.get("current_stock") or 0) < qty:
+            raise HTTPException(400, "Stok barang jadi sudah dipakai. Tidak bisa hapus produksi; lakukan penyesuaian stok dulu.")
+        await db.inventory_items.update_one({"id": out_item_id}, {"$inc": {"current_stock": -qty}})
+        if batch.get("inventory_batch_id"):
+            await db.inventory_batches.update_one({"id": batch["inventory_batch_id"]}, {"$set": {"remaining_quantity": 0, "cancelled": True, "cancelled_at": now, "updated_at": now}})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": out_item_id, "type": "production_delete_output_reverse",
+            "quantity": -qty, "qty_out": qty, "qty_in": 0,
+            "reason": f"Hapus produksi {batch.get('batch_no')}",
+            "reference": "production_batch_delete", "reference_id": production_id,
+            "created_at": now,
+        })
+
+    # Kembalikan bahan baku sesuai consumed_inputs jika tersedia; fallback ke BOM.
+    consumed_inputs = batch.get("consumed_inputs") or []
+    if not consumed_inputs:
+        bom = await db.bom_recipes.find_one({"id": batch.get("recipe_id")}, {"_id": 0}) or {}
+        for ing in bom.get("ingredients", []):
+            consumed_inputs.append({"item_id": ing.get("item_id"), "quantity": float(ing.get("quantity") or 0) * qty, "batches": []})
+    for c in consumed_inputs:
+        item_id = c.get("item_id")
+        qin = float(c.get("quantity") or 0)
+        if not item_id or qin <= 0:
+            continue
+        await db.inventory_items.update_one({"id": item_id}, {"$inc": {"current_stock": qin}})
+        restored = []
+        for b in c.get("batches") or []:
+            bid, bno, q = b.get("batch_id"), b.get("batch_no"), float(b.get("qty_out") or 0)
+            if q <= 0:
+                continue
+            await db.inventory_batches.update_one({"$or": [{"id": bid}, {"batch_no": bno}], "item_id": item_id}, {"$inc": {"remaining_quantity": q}, "$set": {"updated_at": now}})
+            restored.append({"batch_id": bid, "batch_no": bno, "qty_in": q})
+        await db.stock_movements.insert_one({
+            "id": gen_id(), "item_id": item_id, "type": "production_delete_input_restore",
+            "quantity": qin, "qty_in": qin, "qty_out": 0,
+            "reason": f"Hapus produksi {batch.get('batch_no')}",
+            "reference": "production_batch_delete", "reference_id": production_id,
+            "restored_batches": restored,
+            "created_at": now,
+        })
+
+    await db.production_batches.update_one({"id": production_id}, {"$set": {"cancelled": True, "cancelled_at": now, "cancelled_by": user.get("id")}})
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "production_batch", production_id, {"batch_no": batch.get("batch_no"), "qty": qty})
+    return {"ok": True, "cancelled": True}
 
 
 # ---------- Kebun / Farm (generic, formerly vineyard) ----------

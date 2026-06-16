@@ -111,7 +111,7 @@ export default function Kasir() {
   const clearPromo = () => { setAppliedPromo(null); setPromoCode(""); setDiscount(0); };
 
   const load = async () => {
-    const { data } = await api.get("/inventory");
+    const { data } = await api.get("/inventory?include_batches=false&limit=2000");
     setItems(data.filter((i) => !String(i.category || '').toLowerCase().includes('bahan baku')));
   };
   const loadBizUnits = async () => {
@@ -229,7 +229,7 @@ export default function Kasir() {
     if (!window.confirm(`Batalkan transaksi ${trx.trx_no} (${formatRupiah(trx.total)})?\nStok akan dikembalikan.`)) return;
     try {
       await api.delete(`/transactions/${trx.id}`);
-      toast.success("Transaksi dibatalkan, stok dikembalikan");
+      toast.success("Transaksi dibatalkan, stok dikembalikan dan laporan disesuaikan");
       loadRecent(); load();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Gagal membatalkan");

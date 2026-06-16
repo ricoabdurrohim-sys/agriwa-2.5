@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Beaker, Play, History, CheckCircle2, XCircle, Printer, QrCode } from "lucide-react";
+import { Beaker, Play, CheckCircle2, XCircle, Printer, Edit2, Trash2 } from "lucide-react";
 import api, { formatRupiah, formatDateTime } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,6 +23,8 @@ export default function Pupuk() {
   const [notes, setNotes] = useState("");
   const [inventory, setInventory] = useState([]);
   const [selectedBatches, setSelectedBatches] = useState({});
+  const [editBatch, setEditBatch] = useState(null);
+  const [editBatchForm, setEditBatchForm] = useState({ batch_no: "", notes: "" });
 
   const load = async () => {
     const [b, h, inv] = await Promise.all([api.get("/bom"), api.get("/production/batches"), api.get("/inventory")]);
@@ -63,6 +65,30 @@ export default function Pupuk() {
     } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
   };
 
+  const openEditBatch = (b) => {
+    setEditBatch(b);
+    setEditBatchForm({ batch_no: b.batch_no || "", notes: b.notes || "" });
+  };
+
+  const saveEditBatch = async () => {
+    if (!editBatch) return;
+    try {
+      await api.put(`/production/batches/${editBatch.id}`, editBatchForm);
+      toast.success("Riwayat produksi diperbarui");
+      setEditBatch(null);
+      load();
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal update riwayat produksi"); }
+  };
+
+  const deleteProductionBatch = async (b) => {
+    if (!window.confirm(`Hapus/batalkan produksi ${b.batch_no || b.recipe_name}?\nStok barang jadi akan dikurangi dan bahan baku dikembalikan.`)) return;
+    try {
+      await api.delete(`/production/batches/${b.id}`);
+      toast.success("Produksi dibatalkan dan stok dikembalikan");
+      load();
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal hapus produksi"); }
+  };
+
   const inventoryById = Object.fromEntries((inventory || []).map((it) => [it.id, it]));
 
   return (
@@ -100,7 +126,11 @@ export default function Pupuk() {
                     <div className="font-mono font-semibold">{b.quantity} unit</div>
                     <div className="text-xs text-gray-500 font-mono">{formatRupiah(b.actual_cost)}</div>
                   </div>
-                  <Button size="sm" variant="outline" onClick={() => printProductionThermal(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Thermal</Button>
+                  <div className="flex gap-1 flex-wrap justify-end">
+                    <Button size="sm" variant="outline" onClick={() => printProductionThermal(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Thermal</Button>
+                    <Button size="sm" variant="outline" onClick={() => openEditBatch(b)}><Edit2 className="w-3.5 h-3.5 mr-1" /> Edit</Button>
+                    <Button size="sm" variant="outline" className="text-red-600 hover:text-red-700" onClick={() => deleteProductionBatch(b)}><Trash2 className="w-3.5 h-3.5 mr-1" /> Hapus</Button>
+                  </div>
                 </div>
               );})}
             </div>
@@ -188,6 +218,27 @@ export default function Pupuk() {
               className={preview?.can_produce ? "bg-[#1a6b3c] hover:bg-[#14522d]" : "bg-[#e53e3e] hover:bg-red-700"}>
               {preview?.can_produce ? "Selesai Produksi" : (preview ? "Override & Produksi" : "Cek Bahan Dulu")}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editBatch} onOpenChange={(o) => { if (!o) setEditBatch(null); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>Edit Riwayat Produksi</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label>No Batch</Label>
+              <Input value={editBatchForm.batch_no} onChange={(e) => setEditBatchForm((p) => ({ ...p, batch_no: e.target.value }))} />
+            </div>
+            <div>
+              <Label>Catatan</Label>
+              <Input value={editBatchForm.notes} onChange={(e) => setEditBatchForm((p) => ({ ...p, notes: e.target.value }))} />
+            </div>
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg p-2">Edit hanya mengubah label/catatan. Jumlah produksi tidak diubah agar stok dan HPP tidak rusak.</div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditBatch(null)}>Batal</Button>
+            <Button onClick={saveEditBatch}>Simpan</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

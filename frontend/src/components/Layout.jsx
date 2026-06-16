@@ -162,9 +162,6 @@ export default function Layout() {
                           <div className="text-xs text-white/65">Mini ERP · POS · Kebun · Ternak</div>
                         </div>
                       </div>
-                      <button data-testid="edit-drawer-btn" onClick={() => setEditMode((v) => !v)} className={`p-2 rounded-xl transition-colors ${editMode ? "bg-[#f4a228] text-white" : "bg-white/10 text-white/80 hover:bg-white/20"}`} title="Atur tampilan menu">
-                        <Sliders className="w-4 h-4" />
-                      </button>
                     </div>
                     <div className="grid grid-cols-3 gap-2 mt-4">
                       {[
@@ -177,6 +174,9 @@ export default function Layout() {
                         </NavLink>
                       ))}
                     </div>
+                    <button data-testid="edit-drawer-btn" onClick={() => setEditMode((v) => !v)} className={`mt-3 w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border border-white/10 transition-colors ${editMode ? "bg-[#f4a228] text-white" : "bg-white/10 text-white/85 hover:bg-white/20"}`} title="Atur tampilan menu">
+                      <Sliders className="w-4 h-4" /> {editMode ? "Selesai Atur Menu" : "Atur Menu"}
+                    </button>
                   </div>
                   <div className="px-4 pt-3 pb-2 border-b border-white/5">
                     <button data-testid="toggle-fullview-btn" onClick={toggleFullView} className="w-full flex items-center gap-2 text-xs px-3 py-2.5 rounded-xl bg-white/8 hover:bg-white/12 border border-white/10 text-white/90">

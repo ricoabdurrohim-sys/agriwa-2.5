@@ -136,6 +136,17 @@ export default function Anggur() {
     await api.post(`/b2b/invoices/${inv.id}/pay`, { amount: parseInt(a) });
     load(); toast.success("Pembayaran dicatat");
   };
+
+  const deleteInvoice = async (inv) => {
+    if (!window.confirm(`Hapus invoice ${inv.invoice_no}?`)) return;
+    try {
+      await api.delete(`/b2b/invoices/${inv.id}`);
+      load();
+      toast.success("Invoice dihapus");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Gagal menghapus invoice");
+    }
+  };
   const printInvoice = (inv) => {
     printViaIframe({ title: inv.invoice_no, css: "body{font-family:monospace;padding:20px} .r{display:flex;justify-content:space-between;border-bottom:1px dashed #ddd;padding:4px 0} h2{text-align:center}", buildBody: (doc) => {
       const d = doc.createElement("div");
