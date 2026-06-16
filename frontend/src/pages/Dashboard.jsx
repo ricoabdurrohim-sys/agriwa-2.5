@@ -83,8 +83,13 @@ export default function Dashboard() {
         load();
       }
     };
+    const financeH = () => load();
     window.addEventListener("aw:ws", h);
-    return () => window.removeEventListener("aw:ws", h);
+    window.addEventListener("aw:finance-mutated", financeH);
+    return () => {
+      window.removeEventListener("aw:ws", h);
+      window.removeEventListener("aw:finance-mutated", financeH);
+    };
   }, []);
 
 

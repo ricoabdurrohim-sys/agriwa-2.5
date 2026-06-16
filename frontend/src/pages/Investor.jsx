@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Plus, HandCoins, TrendingUp, Users, Briefcase } from "lucide-react";
+import { Plus, HandCoins, TrendingUp, Users, Briefcase, Pencil, Trash2 } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,7 +20,8 @@ export default function Investor() {
   const [units, setUnits] = useState([]);
   const [showInvForm, setShowInvForm] = useState(false);
   const [showCapForm, setShowCapForm] = useState(false);
-  const [invForm, setInvForm] = useState({ name: "", phone: "", address: "" });
+  const [editingInvestor, setEditingInvestor] = useState(null);
+  const [invForm, setInvForm] = useState({ name: "", phone: "", address: "", notes: "" });
   const [capForm, setCapForm] = useState({ investor_id: "", amount: 0, unit: "umum", notes: "" });
   const [divPreview, setDivPreview] = useState(null);
   const [divProfit, setDivProfit] = useState(0);
@@ -39,11 +40,39 @@ export default function Investor() {
   };
   useEffect(() => { load(); }, []);
 
-  const addInvestor = async () => {
-    if (!invForm.name) return toast.error("Nama wajib");
-    await api.post("/investors", invForm);
-    setInvForm({ name: "", phone: "", address: "" });
-    setShowInvForm(false); load(); toast.success("Investor ditambahkan");
+  const openInvestorForm = (investor = null) => {
+    setEditingInvestor(investor);
+    setInvForm(investor
+      ? { name: investor.name || "", phone: investor.phone || "", address: investor.address || "", notes: investor.notes || "" }
+      : { name: "", phone: "", address: "", notes: "" }
+    );
+    setShowInvForm(true);
+  };
+
+  const saveInvestor = async () => {
+    if (!invForm.name?.trim()) return toast.error("Nama wajib");
+    try {
+      if (editingInvestor?.id) {
+        await api.put(`/investors/${editingInvestor.id}`, invForm);
+        toast.success("Investor diperbarui");
+      } else {
+        await api.post("/investors", invForm);
+        toast.success("Investor ditambahkan");
+      }
+      setInvForm({ name: "", phone: "", address: "", notes: "" });
+      setEditingInvestor(null);
+      setShowInvForm(false);
+      await load();
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal menyimpan investor"); }
+  };
+
+  const deleteInvestor = async (investor) => {
+    if (!window.confirm(`Hapus investor ${investor.name}?`)) return;
+    try {
+      await api.delete(`/investors/${investor.id}`);
+      toast.success("Investor dihapus");
+      await load();
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal menghapus investor"); }
   };
 
   const addCapital = async () => {
@@ -75,7 +104,7 @@ export default function Investor() {
           <p className="text-sm text-gray-500 mt-0.5">Kelola investor, modal disetor, dan dividen</p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" data-testid="add-investor-btn" onClick={() => setShowInvForm(true)}>
+          <Button variant="outline" data-testid="add-investor-btn" onClick={() => openInvestorForm()}>
             <Users className="w-4 h-4 mr-1.5" /> Investor
           </Button>
           <Button data-testid="add-capital-btn" onClick={() => setShowCapForm(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]">
@@ -103,8 +132,20 @@ export default function Investor() {
                     <div className="text-xs text-gray-500">{i.phone || "—"}</div>
                   </div>
                 </div>
-                <div className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(i.total_capital)}</div>
-                <div className="text-xs text-gray-500 font-mono">{i.ownership_pct.toFixed(1)}% kepemilikan</div>
+                <div className="flex items-end justify-between gap-2 mt-2">
+                  <div>
+                    <div className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(i.total_capital)}</div>
+                    <div className="text-xs text-gray-500 font-mono">{i.ownership_pct.toFixed(1)}% kepemilikan</div>
+                  </div>
+                  <div className="flex gap-1">
+                    <Button size="sm" variant="outline" className="h-8 px-2" onClick={() => openInvestorForm(i)} title="Edit investor">
+                      <Pencil className="w-3.5 h-3.5" />
+                    </Button>
+                    <Button size="sm" variant="outline" className="h-8 px-2 text-red-600 hover:text-red-700" onClick={() => deleteInvestor(i)} title="Hapus investor">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
               </div>
             ))}
             {investors.length === 0 && (
@@ -231,15 +272,16 @@ export default function Investor() {
       {/* Add Investor */}
       <Dialog open={showInvForm} onOpenChange={setShowInvForm}>
         <DialogContent>
-          <DialogHeader><DialogTitle>Tambah Investor</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle>{editingInvestor ? "Edit Investor" : "Tambah Investor"}</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div><Label>Nama</Label><Input data-testid="inv-name-input" value={invForm.name} onChange={(e) => setInvForm({ ...invForm, name: e.target.value })} /></div>
             <div><Label>No. HP</Label><Input data-testid="inv-phone-input" value={invForm.phone} onChange={(e) => setInvForm({ ...invForm, phone: e.target.value })} /></div>
             <div><Label>Alamat</Label><Input value={invForm.address} onChange={(e) => setInvForm({ ...invForm, address: e.target.value })} /></div>
+            <div><Label>Catatan</Label><Input value={invForm.notes} onChange={(e) => setInvForm({ ...invForm, notes: e.target.value })} /></div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setShowInvForm(false)}>Batal</Button>
-            <Button onClick={addInvestor} data-testid="save-investor-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan</Button>
+            <Button variant="outline" onClick={() => { setShowInvForm(false); setEditingInvestor(null); }}>Batal</Button>
+            <Button onClick={saveInvestor} data-testid="save-investor-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">{editingInvestor ? "Simpan Perubahan" : "Simpan"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

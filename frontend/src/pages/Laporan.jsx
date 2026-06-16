@@ -67,7 +67,13 @@ export default function Laporan() {
   useEffect(() => { load(); }, []);
   useEffect(() => {
     const h = (e) => { const k = e.detail?.type; if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) { window.__awFinanceSummaryCache = null; load({ force: true }); } };
-    window.addEventListener("aw:ws", h); return () => window.removeEventListener("aw:ws", h);
+    const financeH = () => { window.__awFinanceSummaryCache = null; load({ force: true }); };
+    window.addEventListener("aw:ws", h);
+    window.addEventListener("aw:finance-mutated", financeH);
+    return () => {
+      window.removeEventListener("aw:ws", h);
+      window.removeEventListener("aw:finance-mutated", financeH);
+    };
   }, []);
 
   if (loading && !summary) return <div className="text-center py-20 text-gray-500">Memuat laporan...</div>;

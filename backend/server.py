@@ -685,7 +685,45 @@ async def get_investors(user: dict = Depends(get_current_user)):
 
 @api.post("/investors")
 async def create_investor(body: InvestorIn, user: dict = Depends(get_current_user)):
-    return await insert_doc("investors", body.model_dump())
+    data = body.model_dump()
+    data["updated_at"] = now_iso()
+    return await insert_doc("investors", data)
+
+
+@api.put("/investors/{investor_id}")
+async def update_investor(investor_id: str, body: InvestorIn, user: dict = Depends(get_current_user)):
+    existing = await db.investors.find_one({"id": investor_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Investor tidak ditemukan")
+    data = body.model_dump()
+    data["updated_at"] = now_iso()
+    await db.investors.update_one({"id": investor_id}, {"$set": data})
+    invalidate_finance_summary_cache()
+    updated = await db.investors.find_one({"id": investor_id}, {"_id": 0})
+    return clean_doc(updated)
+
+
+@api.delete("/investors/{investor_id}")
+async def delete_investor(investor_id: str, user: dict = Depends(get_current_user)):
+    existing = await db.investors.find_one({"id": investor_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Investor tidak ditemukan")
+
+    related_capital = await db.capital_injections.count_documents({"investor_id": investor_id})
+    related_land = await db.land_rental.count_documents({"investor_id": investor_id})
+    related_dividend = await db.dividends.count_documents({"items.investor_id": investor_id})
+    if related_capital or related_land or related_dividend:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Investor sudah terhubung dengan setoran modal/dividen/sewa lahan. "
+                "Untuk menjaga laporan tidak rusak, edit nama investor atau hapus transaksi modal terkait terlebih dahulu."
+            ),
+        )
+
+    await db.investors.delete_one({"id": investor_id})
+    invalidate_finance_summary_cache()
+    return {"ok": True, "deleted_id": investor_id}
 
 
 class CapitalIn(BaseModel):
@@ -2400,6 +2438,42 @@ async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)
     return doc
 
 
+@api.put("/expenses/{eid}")
+async def update_expense(eid: str, body: ExpenseIn, user: dict = Depends(require_roles("super_admin", "manager"))):
+    existing = await db.expenses.find_one({"id": eid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Pengeluaran tidak ditemukan")
+    ref = (existing.get("reference") or "").strip()
+    if ref and ref not in ("expense", "manual", "manual_expense"):
+        raise HTTPException(400, "Pengeluaran ini berasal dari modul lain. Edit/hapus dari modul asalnya agar laporan tetap sinkron.")
+    if body.amount <= 0:
+        raise HTTPException(400, "Jumlah harus lebih dari 0")
+    data = body.model_dump()
+    data["date"] = data.get("date") or existing.get("date") or now_iso()
+    data["updated_at"] = now_iso()
+    await db.expenses.update_one({"id": eid}, {"$set": data})
+    # Ganti jurnal asli supaya Keuangan, Dashboard, dan Laporan membaca angka yang sama.
+    await db.journal_entries.delete_many({"reference": "expense", "reference_id": eid})
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": data["date"],
+        "description": f"Biaya {body.category}",
+        "lines": [
+            {"account": body.category, "debit": body.amount, "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": body.amount},
+        ],
+        "reference": "expense",
+        "reference_id": eid,
+        "unit": body.unit,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    })
+    invalidate_finance_summary_cache()
+    await write_audit(user, "update", "expense", eid, {"before": existing, "after": data})
+    updated = await db.expenses.find_one({"id": eid}, {"_id": 0})
+    return clean_doc(updated)
+
+
 # ---------- Incomes (Non-POS revenue: cashback, tax refund, donation, etc.) ----------
 class IncomeIn(BaseModel):
     amount: int
@@ -2441,27 +2515,67 @@ async def create_income(body: IncomeIn, user: dict = Depends(get_current_user)):
     return doc
 
 
+@api.put("/incomes/{income_id}")
+async def update_income(income_id: str, body: IncomeIn, user: dict = Depends(require_roles("super_admin", "manager"))):
+    existing = await db.incomes.find_one({"id": income_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Pemasukan tidak ditemukan")
+    ref = (existing.get("reference") or "").strip()
+    if ref and ref not in ("income", "manual", "manual_income"):
+        raise HTTPException(400, "Pemasukan ini berasal dari modul lain. Edit/hapus dari modul asalnya agar laporan tetap sinkron.")
+    if body.amount <= 0:
+        raise HTTPException(400, "Jumlah harus lebih dari 0")
+    data = body.model_dump()
+    data["date"] = data.get("date") or existing.get("date") or now_iso()
+    data["updated_at"] = now_iso()
+    await db.incomes.update_one({"id": income_id}, {"$set": data})
+    await db.journal_entries.delete_many({"reference": "income", "reference_id": income_id})
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": data["date"],
+        "description": f"Pemasukan {body.category}" + (f" - {body.source}" if body.source else ""),
+        "lines": [
+            {"account": "Kas", "debit": body.amount, "credit": 0},
+            {"account": body.category, "debit": 0, "credit": body.amount},
+        ],
+        "reference": "income",
+        "reference_id": income_id,
+        "unit": body.unit,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    })
+    invalidate_finance_summary_cache()
+    await write_audit(user, "update", "income", income_id, {"before": existing, "after": data})
+    updated = await db.incomes.find_one({"id": income_id}, {"_id": 0})
+    return clean_doc(updated)
+
+
 @api.delete("/incomes/{income_id}")
-async def delete_income(income_id: str, user: dict = Depends(get_current_user)):
-    inc = await db.incomes.find_one({"id": income_id})
+async def delete_income(income_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    inc = await db.incomes.find_one({"id": income_id}, {"_id": 0})
     if not inc:
         raise HTTPException(404, "Pemasukan tidak ditemukan")
+    ref = (inc.get("reference") or "").strip()
+    if ref and ref not in ("income", "manual", "manual_income"):
+        raise HTTPException(400, "Pemasukan ini berasal dari modul lain. Hapus dari modul asalnya agar laporan tetap sinkron.")
     await db.incomes.delete_one({"id": income_id})
-    # Reverse journal: Debit category / Credit Kas
+    await db.journal_entries.delete_many({"reference": "income", "reference_id": income_id})
+    # Reverse journal: Debit category / Credit Kas untuk audit kas.
     await db.journal_entries.insert_one({
         "id": gen_id(),
         "date": now_iso(),
         "description": f"Pembatalan pemasukan {inc.get('category')}",
         "lines": [
-            {"account": inc.get("category"), "debit": inc["amount"], "credit": 0},
-            {"account": "Kas", "debit": 0, "credit": inc["amount"]},
+            {"account": inc.get("category"), "debit": inc.get("amount", 0), "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": inc.get("amount", 0)},
         ],
         "reference": "income_void",
         "reference_id": income_id,
         "unit": inc.get("unit", "umum"),
         "created_at": now_iso(),
     })
-    await write_audit(user, "delete", "income", income_id, {"amount": inc["amount"]})
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "income", income_id, {"amount": inc.get("amount")})
     return {"ok": True}
 
 
@@ -5571,65 +5685,8 @@ class ResetTransactionFinanceIn(BaseModel):
 
 @api.post("/system/reset-transaction-finance-data")
 async def reset_transaction_finance_data(body: ResetTransactionFinanceIn, user: dict = Depends(require_roles("super_admin"))):
-    """Reset khusus data transaksi/keuangan operasional.
-
-    Sengaja tidak menghapus users, inventori master, supplier, lini bisnis, meja, atau pengaturan.
-    Dipakai saat data uji transaksi/bon sudah tumpang tindih dan perlu mulai bersih.
-    """
-    if (body.confirm or "").strip().upper() != "RESET TRANSAKSI":
-        raise HTTPException(400, "Ketik RESET TRANSAKSI untuk konfirmasi")
-    # Balikkan efek stok dari transaksi yang belum pernah dibatalkan, lalu hapus
-    # stock movement khusus transaksi. Ini membuat Kasir/Keuangan/Dashboard/Laporan
-    # bersih tanpa meninggalkan stok yang sudah berkurang karena data uji.
-    trx_rows = await db.transactions.find({}, {"_id": 0}).to_list(10000)
-    trx_refs = []
-    restored_stock = 0.0
-    for trx in trx_rows:
-        trx_refs.extend([x for x in [trx.get("id"), trx.get("trx_no")] if x])
-        if _is_debt_settlement_document(trx):
-            continue
-        if trx.get("cancel_reason") in ("manual_cancel", "user_cancel", "void") or trx.get("payment_status") == "CANCELLED":
-            continue
-        for it in trx.get("items") or []:
-            item_id = it.get("item_id")
-            qty = float(it.get("quantity") or 0)
-            if not item_id or qty <= 0:
-                continue
-            await db.inventory_items.update_one({"id": item_id}, {"$inc": {"current_stock": qty}})
-            restored_stock += qty
-            moves = await db.stock_movements.find({"reference_id": {"$in": [trx.get("trx_no"), trx.get("id")]}, "item_id": item_id}, {"_id": 0}).to_list(50)
-            for mv in moves:
-                for cb in mv.get("consumed_batches") or []:
-                    bid = cb.get("batch_id")
-                    bno = cb.get("batch_no")
-                    qout = float(cb.get("qty_out") or 0)
-                    if qout > 0:
-                        await db.inventory_batches.update_one({"$or": [{"id": bid}, {"batch_no": bno}], "item_id": item_id}, {"$inc": {"remaining_quantity": qout}, "$set": {"updated_at": now_iso()}})
-
-    deleted = {"restored_stock_qty": restored_stock}
-    if trx_refs:
-        res = await db.stock_movements.delete_many({"$or": [{"reference_id": {"$in": trx_refs}}, {"reference": "transaction_cancel"}]})
-        deleted["stock_movements"] = int(getattr(res, "deleted_count", 0) or 0)
-
-    collections = [
-        "transactions", "customer_debts", "debt_payments", "incomes", "expenses",
-        "journal_entries", "bank_transactions", "bank_reconciliations", "notifications",
-    ]
-    for coll in collections:
-        try:
-            res = await db[coll].delete_many({})
-            deleted[coll] = int(getattr(res, "deleted_count", 0) or 0)
-        except Exception:
-            deleted[coll] = 0
-    # Order yang sudah test juga dibersihkan supaya Kasir/Warung tidak nyangkut status lama.
-    try:
-        res = await db.orders.delete_many({})
-        deleted["orders"] = int(getattr(res, "deleted_count", 0) or 0)
-    except Exception:
-        deleted["orders"] = 0
-    invalidate_finance_summary_cache()
-    await write_audit(user, "delete", "system", "reset_transaction_finance_data", {"deleted": deleted})
-    return {"ok": True, "deleted": deleted, "message": "Data transaksi, bon, dan keuangan operasional sudah direset."}
+    """Reset transaksi/keuangan dinonaktifkan agar tidak ada risiko data hilang massal."""
+    raise HTTPException(410, "Reset transaksi & keuangan dinonaktifkan. Gunakan edit/hapus per item dari menu masing-masing.")
 
 
 @api.post("/system/reset-module/{module}")
@@ -5734,10 +5791,14 @@ async def delete_online_order(oid: str, user: dict = Depends(require_roles("supe
 
 @api.delete("/expenses/{eid}")
 async def delete_expense(eid: str, user: dict = Depends(require_roles("super_admin", "manager"))):
-    exp = await db.expenses.find_one({"id": eid})
+    exp = await db.expenses.find_one({"id": eid}, {"_id": 0})
     if not exp:
         raise HTTPException(404, "Pengeluaran tidak ditemukan")
-    # Reverse journal: Debit Kas / Credit (category)
+    ref = (exp.get("reference") or "").strip()
+    if ref and ref not in ("expense", "manual", "manual_expense"):
+        raise HTTPException(400, "Pengeluaran ini berasal dari modul lain. Hapus dari modul asalnya agar laporan tetap sinkron.")
+    await db.journal_entries.delete_many({"reference": "expense", "reference_id": eid})
+    # Reverse journal: Debit Kas / Credit (category) untuk audit kas.
     await db.journal_entries.insert_one({
         "id": gen_id(), "date": now_iso(),
         "description": f"Pembatalan biaya {exp.get('category', '')}",
@@ -5749,6 +5810,7 @@ async def delete_expense(eid: str, user: dict = Depends(require_roles("super_adm
         "unit": exp.get("unit", "umum"), "created_at": now_iso(),
     })
     await db.expenses.delete_one({"id": eid})
+    invalidate_finance_summary_cache()
     await write_audit(user, "delete", "expense", eid, {"amount": exp.get("amount"), "category": exp.get("category")})
     return {"ok": True}
 
