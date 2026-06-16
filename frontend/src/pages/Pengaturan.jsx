@@ -3,7 +3,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { KeyRound, User as UserIcon, CreditCard, ShieldCheck, Info } from "lucide-react";
+import { KeyRound, User as UserIcon, CreditCard, Info } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 
@@ -73,14 +73,6 @@ export default function Pengaturan() {
       <div>
         <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Pengaturan Sistem</h1>
         <p className="text-sm text-gray-500 mt-0.5">Akun, pajak, dan integrasi. Struk dikelola per Lini Bisnis.</p>
-      </div>
-
-      <div className="bg-red-50 border border-red-100 rounded-xl p-4 flex gap-3 text-sm text-red-800">
-        <ShieldCheck className="w-5 h-5 shrink-0 mt-0.5" />
-        <div>
-          <div className="font-semibold">Reset massal dan reset transaksi dinonaktifkan.</div>
-          <div className="text-xs mt-1 leading-relaxed">Agar data tidak hilang tanpa sengaja, koreksi data dilakukan lewat edit/hapus per item di menu masing-masing. Pemasukan dan pengeluaran manual bisa diedit dari menu Keuangan.</div>
-        </div>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-5 space-y-4">

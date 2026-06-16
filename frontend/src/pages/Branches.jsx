@@ -44,12 +44,17 @@ export default function Branches() {
     <div className="space-y-4 fade-in">
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Cabang / Lokasi</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{branches.length} cabang aktif · Total {totalTx} transaksi · {formatRupiah(totalRev)}</p>
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Lokasi / Cabang</h1>
+          <p className="text-sm text-gray-500 mt-0.5">Opsional. Pakai hanya kalau satu bisnis punya beberapa lokasi fisik. Kalau aplikasi dipakai sendiri di satu tempat, cukup gunakan Cabang Utama.</p>
+          <p className="text-xs text-gray-400 mt-0.5">{branches.length} lokasi · Total {totalTx} transaksi · {formatRupiah(totalRev)}</p>
         </div>
         <Button data-testid="add-branch-btn" onClick={() => { setEditing(null); setForm(init); setShow(true); }} className="bg-[#1a6b3c] hover:bg-[#14522d]">
           <Plus className="w-4 h-4 mr-1.5" /> Cabang Baru
         </Button>
+      </div>
+
+      <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-sm text-blue-800 leading-relaxed">
+        Model cabang berguna jika nanti ada lokasi berbeda, misalnya Warung Boyolali dan Warung Solo, tetapi tetap memakai aplikasi yang sama. Hak akses per user/cabang bisa ditambahkan nanti. Untuk sekarang, cabang hanya penanda lokasi transaksi.
       </div>
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">

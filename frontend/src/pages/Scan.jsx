@@ -60,7 +60,7 @@ export default function Scan() {
         setStatus("Browser belum memberi akses kamera. Pastikan buka aplikasi lewat HTTPS Vercel dan izinkan kamera, atau input kode manual.");
         return;
       }
-      const { Html5Qrcode } = await import("html5-qrcode");
+      const { Html5Qrcode, Html5QrcodeSupportedFormats } = await import("html5-qrcode");
       const cameras = await Html5Qrcode.getCameras();
       if (!cameras?.length) {
         setManualOnly(true);
@@ -68,7 +68,14 @@ export default function Scan() {
         return;
       }
       await stopCamera();
-      const scanner = new Html5Qrcode(SCANNER_ID, { verbose: false });
+      const scanner = new Html5Qrcode(SCANNER_ID, { verbose: false, formatsToSupport: [
+        Html5QrcodeSupportedFormats.QR_CODE,
+        Html5QrcodeSupportedFormats.CODE_128,
+        Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.EAN_8,
+        Html5QrcodeSupportedFormats.UPC_A,
+        Html5QrcodeSupportedFormats.UPC_E,
+      ] });
       scannerRef.current = scanner;
       const backCamera = cameras.find((c) => /back|rear|environment/i.test(c.label || "")) || cameras[0];
       await scanner.start(
@@ -106,7 +113,7 @@ export default function Scan() {
             <p className="text-sm text-gray-500">Mode: {modeLabel}</p>
           </div>
         </div>
-        <p className="text-xs text-gray-500 leading-relaxed">Scan QR struk untuk membuka transaksi, scan QR batch untuk membuka inventori/batch, atau ketik nomor nota/batch manual.</p>
+        <p className="text-xs text-gray-500 leading-relaxed">Scan barcode/QR struk untuk membuka transaksi, scan barcode/QR batch untuk membuka inventori/batch, atau ketik nomor nota/batch manual. Scanner external USB/Bluetooth juga bisa karena bekerja seperti keyboard.</p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-3">

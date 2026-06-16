@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X } from "lucide-react";
+import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
 import { printViaIframe } from "@/lib/safePrint";
 import { resolveImageUrl } from "@/components/ImageUpload";
+import Barcode from "@/components/Barcode";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -59,6 +60,8 @@ export default function Kasir() {
   const [showCategoryManager, setShowCategoryManager] = useState(false);
   const [posCategoryName, setPosCategoryName] = useState("");
   const [posCategoryItems, setPosCategoryItems] = useState([]);
+  const [showProductScan, setShowProductScan] = useState(false);
+  const [productScan, setProductScan] = useState("");
 
   const getBonRemaining = (d) => {
     if (!d) return 0;
@@ -70,6 +73,25 @@ export default function Kasir() {
     // Schema lama: amount = total belanja, paid = DP. Fallback tetap aman.
     return Math.max(0, amount - paid);
   };
+
+  const compactPrice = (v) => {
+    const n = Number(v || 0);
+    if (!n) return "Rp 0";
+    if (n >= 1000000) return `${(n / 1000000).toFixed(n % 1000000 ? 1 : 0)}jt`;
+    if (n >= 1000) return `${(n / 1000).toFixed(n % 1000 ? 1 : 0)}k`;
+    return String(n);
+  };
+
+  const itemPriceLabel = (item) => {
+    const variants = (item?.variants || []).filter((v) => v && v.active !== false && v.name);
+    if (item?.has_variants && variants.length) {
+      const prices = [...new Set(variants.map((v) => Number(v.sell_price || item.sell_price || 0)).filter((n) => n > 0))].sort((a,b)=>a-b);
+      if (prices.length) return prices.map(compactPrice).join("/");
+    }
+    return formatRupiah(item?.sell_price || 0);
+  };
+
+  const itemScanCode = (item) => String(item?.barcode || item?.sku || item?.code || item?.id || item?.name || "").trim();
 
   const lookupMember = async () => {
     if (!memberQuery.trim()) return;
@@ -315,6 +337,7 @@ export default function Kasir() {
       phone: snap.phone || trxUnit.receipt_phone || "",
       footer: snap.footer || trxUnit.receipt_footer || "Terima kasih! 🙏",
       note: snap.note || trxUnit.receipt_note || "",
+      logo_url: snap.logo_url || snap.receipt_logo || trxUnit.receipt_logo || trxUnit.receipt_logo_url || "",
     };
   };
 
@@ -328,6 +351,7 @@ export default function Kasir() {
       cfg.phone ? `Telp: ${cfg.phone}` : "",
       "------------------------------",
       `No: ${trx.trx_no}`,
+      trx.queue_no ? `Antrian: ${trx.queue_no}` : "",
       isDebtSettlement && trx.original_trx_no ? `Pelunasan: ${trx.original_trx_no}` : "",
       new Date(trx.created_at).toLocaleString("id-ID"),
       trx.cashier_name ? `Kasir: ${trx.cashier_name}` : "",
@@ -382,6 +406,21 @@ export default function Kasir() {
       return;
     }
     addVariantToCart(item, null);
+  };
+
+  const handleProductScan = () => {
+    const q = String(productScan || "").trim();
+    if (!q) return;
+    const clean = q.replace(/^aw:(item|product):/i, "").trim().toLowerCase();
+    const found = unitFilteredItems.find((i) => {
+      const codes = [i.barcode, i.sku, i.code, i.id, i.name].filter(Boolean).map((x) => String(x).trim().toLowerCase());
+      return codes.includes(clean) || String(i.name || "").toLowerCase().includes(clean);
+    });
+    if (!found) return toast.error("Produk tidak ditemukan. Cek barcode/SKU/nama barang di Inventori.");
+    addToCart(found);
+    setProductScan("");
+    setShowProductScan(false);
+    toast.success(`${found.name} ditambahkan ke keranjang`);
   };
 
   const updateQty = (lineId, delta) => {
@@ -457,7 +496,10 @@ export default function Kasir() {
             <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Kasir POS</h1>
             <p className="text-sm text-gray-500 mt-0.5">{tableId ? "Pesanan untuk meja terpilih" : bonInfo ? `Pelunasan bon — ${bonInfo.customer_name}` : `Penjualan ${currentUnitInfo.name}`}</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
+            <Button data-testid="open-product-scan-btn" onClick={() => setShowProductScan(true)} variant="outline" className="border-emerald-300 text-emerald-800 hover:bg-emerald-50">
+              <ScanLine className="w-4 h-4 mr-1.5" /> Scan Produk
+            </Button>
             <Button data-testid="open-debt-finder-btn" onClick={openDebtFinder} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">
               <Search className="w-4 h-4 mr-1.5" /> Cari Transaksi
             </Button>
@@ -466,6 +508,22 @@ export default function Kasir() {
             </Button>
           </div>
         </div>
+
+        {showProductScan && !bonInfo && (
+          <div className="bg-white rounded-xl border border-emerald-200 p-3 space-y-2 shadow-sm">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-semibold text-emerald-900">Scan Produk untuk Kasir</div>
+                <div className="text-xs text-emerald-700">Colok scanner USB/Bluetooth seperti keyboard, klik kolom ini, lalu scan barcode. Bisa juga ketik nama/barcode manual.</div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => setShowProductScan(false)}>Tutup</Button>
+            </div>
+            <div className="flex gap-2">
+              <Input autoFocus value={productScan} onChange={(e) => setProductScan(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleProductScan()} placeholder="Scan barcode / ketik nama produk" className="h-11 font-mono" />
+              <Button onClick={handleProductScan} className="bg-[#1a6b3c] hover:bg-[#14522d]">Tambah</Button>
+            </div>
+          </div>
+        )}
 
         {showDebtFinder && !bonInfo && (
           <div className="bg-white rounded-xl border border-amber-200 p-3 space-y-3 shadow-sm">
@@ -591,7 +649,7 @@ export default function Kasir() {
               )}
               <div className="text-sm font-semibold text-gray-900 mb-1 line-clamp-2">{i.name}</div>
               <div className="text-xs text-gray-500 mb-2">{i.category}{i.has_variants ? " · ada varian" : ""}</div>
-              <div className="font-mono text-sm font-semibold text-[#1a6b3c]">{formatRupiah(i.sell_price)}</div>
+              <div className="font-mono text-base font-bold text-[#1a6b3c]">{itemPriceLabel(i)}</div>
             </button>
           ))}
           {filtered.length === 0 && (
@@ -613,18 +671,18 @@ export default function Kasir() {
             <div className="px-4 py-10 text-center text-gray-400 text-sm">Keranjang kosong</div>
           ) : (
             cart.map((c) => (
-              <div key={c.line_id || c.item_id} className="flex items-center gap-2 px-4 py-3 border-b border-gray-50 last:border-0">
+              <div key={c.line_id || c.item_id} className="flex items-center gap-3 px-4 py-3.5 border-b border-gray-50 last:border-0">
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">{c.name}</div>
-                  <div className="font-mono text-xs text-gray-500">{formatRupiah(c.unit_price)}</div>
+                  <div className="text-base font-semibold truncate">{c.name}</div>
+                  <div className="font-mono text-sm text-gray-500">{formatRupiah(c.unit_price)}</div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <button data-testid={`qty-minus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, -1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Minus className="w-3.5 h-3.5 mx-auto" /></button>
-                  <span className="w-7 text-center text-sm font-semibold">{c.quantity}</span>
-                  <button data-testid={`qty-plus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, 1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Plus className="w-3.5 h-3.5 mx-auto" /></button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button data-testid={`qty-minus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, -1)} className="w-9 h-9 rounded-lg border border-gray-200 hover:bg-gray-50"><Minus className="w-4 h-4 mx-auto" /></button>
+                  <span className="w-8 text-center text-base font-bold">{c.quantity}</span>
+                  <button data-testid={`qty-plus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, 1)} className="w-9 h-9 rounded-lg border border-gray-200 hover:bg-gray-50"><Plus className="w-4 h-4 mx-auto" /></button>
                 </div>
-                <button onClick={() => removeItem(c.line_id || c.item_id)} className="p-1 text-gray-400 hover:text-red-600">
-                  <Trash2 className="w-3.5 h-3.5" />
+                <button title="Hapus item" onClick={() => removeItem(c.line_id || c.item_id)} className="ml-2 w-10 h-10 rounded-lg border border-red-100 bg-red-50 text-red-600 hover:bg-red-100 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-4.5 h-4.5" />
                 </button>
               </div>
             ))
@@ -941,11 +999,13 @@ export default function Kasir() {
             const headerName = cfg.business_name;
             return (
             <div id="receipt-content" className="font-mono text-sm space-y-1 bg-gray-50 p-4 rounded-lg">
+              {cfg.logo_url && <img src={resolveImageUrl(cfg.logo_url)} alt="Logo struk" className="mx-auto max-h-16 max-w-[160px] object-contain mb-2" />}
               <div className="text-center font-semibold mb-2 uppercase" data-testid="receipt-header-name">{headerName}</div>
               {cfg.address && <div className="text-center text-xs mb-0.5">{cfg.address}</div>}
               {cfg.phone && <div className="text-center text-xs mb-2">Telp: {cfg.phone}</div>}
               <div className="border-t border-dashed border-gray-400 my-2" />
               <div className="text-xs">No: {showReceipt.trx_no}</div>
+              {showReceipt.queue_no && <div className="text-xs font-semibold">Antrian: {showReceipt.queue_no}</div>}
               {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && showReceipt.original_trx_no && <div className="text-xs">Pelunasan: {showReceipt.original_trx_no}</div>}
               {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && <div className="text-xs font-semibold">Jenis: PELUNASAN BON</div>}
               <div className="text-xs">{new Date(showReceipt.created_at).toLocaleString("id-ID")}</div>
@@ -993,8 +1053,8 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <img alt="QR cek transaksi" className="mx-auto w-24 h-24" src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(window.location.origin + '/scan?code=' + encodeURIComponent('aw:trx:' + showReceipt.trx_no))}`} />
-                  <div className="text-[10px] mt-1">Scan untuk cek transaksi: {showReceipt.trx_no}</div>
+                  <Barcode value={`aw:trx:${showReceipt.trx_no}`} height={42} fontSize={10} />
+                  <div className="text-[10px] mt-1">Barcode cek transaksi: {showReceipt.trx_no}</div>
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}

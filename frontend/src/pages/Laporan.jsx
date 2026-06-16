@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { HelpCircle, Download, Printer, FileSpreadsheet, FileText, Banknote, CreditCard, Smartphone, AlertTriangle } from "lucide-react";
+import { HelpCircle, Download, Printer, FileSpreadsheet, FileText, Banknote, CreditCard, Smartphone, AlertTriangle, Brain, TrendingUp, CalendarDays } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { exportTransactionsXLSX, exportTransactionsPDF, exportProfitLossXLSX, exportProfitLossPDF } from "@/lib/exports";
@@ -43,25 +43,43 @@ export default function Laporan() {
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [analytics, setAnalytics] = useState({ weekly: {}, monthly: {}, yearly: {} });
+  const [ai, setAi] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
 
   const load = async ({ force = false } = {}) => {
     setError("");
     const cached = window.__awFinanceSummaryCache;
     if (!force && cached?.data && Date.now() - cached.ts < FINANCE_CACHE_MS) {
       setSummary(cached.data);
+      api.get("/reports/sales-analytics").then(({data}) => setAnalytics(data || { weekly: {}, monthly: {}, yearly: {} })).catch(() => {});
       setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      const { data } = await api.get("/finance/system-summary?limit=500");
+      const [{ data }, analyticsRes] = await Promise.all([
+        api.get("/finance/system-summary?limit=500"),
+        api.get("/reports/sales-analytics").catch(() => ({ data: { weekly: {}, monthly: {}, yearly: {} } })),
+      ]);
       window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
       setSummary(data || {});
+      setAnalytics(analyticsRes.data || { weekly: {}, monthly: {}, yearly: {} });
     } catch (e) {
       console.error(e);
       setError(e?.response?.data?.detail || "Gagal memuat laporan. Coba restart backend HuggingFace lalu refresh.");
       setSummary({ profit_loss: {}, balance_sheet: { assets: {}, liabilities: {}, equity: {} }, cash_flow: {}, cash_balance: { by_method: {} }, cashier_ledger: [] });
     } finally { setLoading(false); }
+  };
+
+  const loadAi = async (useOpenAi = false) => {
+    setAiLoading(true);
+    try {
+      const { data } = await api.get(`/ai/inventory-insights?use_openai=${useOpenAi ? 'true' : 'false'}`);
+      setAi(data);
+    } catch (e) {
+      setAi({ openai_error: e?.response?.data?.detail || "Gagal memuat rekomendasi AI" });
+    } finally { setAiLoading(false); }
   };
 
   useEffect(() => { load(); }, []);
@@ -86,6 +104,7 @@ export default function Laporan() {
   const totals = summary?.totals || {};
   const bm = cb.by_method || {};
   const safeMethod = (m) => bm[m] || { balance: 0, inflow: 0, outflow: 0, in_count: 0, out_count: 0 };
+  const trendRows = (obj) => Object.entries(obj || {}).sort(([a],[b]) => String(b).localeCompare(String(a))).slice(0, 12);
 
   const exportPL = { ...pl, total_revenue: money(pl.total_revenue), net_profit: money(pl.net_profit) };
 
@@ -122,7 +141,7 @@ export default function Laporan() {
 
       <Tabs defaultValue="pl" className="bg-white rounded-xl border border-gray-100">
         <TabsList className="m-1 bg-gray-50 flex flex-wrap h-auto">
-          <TabsTrigger value="pl">Laba Rugi</TabsTrigger><TabsTrigger value="bs">Neraca</TabsTrigger><TabsTrigger value="cf">Arus Kas</TabsTrigger><TabsTrigger value="trx">Transaksi</TabsTrigger>
+          <TabsTrigger value="pl">Laba Rugi</TabsTrigger><TabsTrigger value="period">Mingguan/Tahunan</TabsTrigger><TabsTrigger value="ai">AI Rekomendasi</TabsTrigger><TabsTrigger value="bs">Neraca</TabsTrigger><TabsTrigger value="cf">Arus Kas</TabsTrigger><TabsTrigger value="trx">Transaksi</TabsTrigger>
         </TabsList>
         <TabsContent value="pl" className="p-4 sm:p-6">
           <div className="text-xs uppercase font-semibold text-gray-500 tracking-wider mb-3">Laporan Laba Rugi</div>
@@ -137,6 +156,33 @@ export default function Laporan() {
           <Row label="Total Beban" value={-money(pl.total_expense)} bold />
           <Row label="LABA BERSIH" value={pl.net_profit} bold accent={money(pl.net_profit) >= 0 ? "#1a6b3c" : "#e53e3e"} hint="Laba Bersih" />
         </TabsContent>
+        <TabsContent value="period" className="p-4 sm:p-6 space-y-4">
+          <div className="flex items-center gap-2 text-sm font-semibold text-gray-700"><CalendarDays className="w-4 h-4 text-[#1a6b3c]" /> Ringkasan Periode</div>
+          <div className="grid md:grid-cols-3 gap-3">
+            {[["Mingguan", analytics.weekly], ["Bulanan", analytics.monthly], ["Tahunan", analytics.yearly]].map(([title, rows]) => (
+              <div key={title} className="border border-gray-100 rounded-xl p-3">
+                <div className="text-xs uppercase font-bold text-gray-500 mb-2">{title}</div>
+                <div className="space-y-1.5">
+                  {trendRows(rows).length === 0 && <div className="text-xs text-gray-400">Belum ada data</div>}
+                  {trendRows(rows).map(([k, v]) => <div key={k} className="flex justify-between text-xs"><span className="font-mono text-gray-600">{k}</span><span className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(v.revenue || 0)}</span></div>)}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="text-xs text-gray-500 bg-gray-50 border border-gray-100 rounded-lg p-3">Konsepnya mirip reporting ERP: angka bisa dilihat per minggu, bulan, dan tahun tanpa mengubah sumber data Keuangan/Dashboard.</div>
+        </TabsContent>
+
+        <TabsContent value="ai" className="p-4 sm:p-6 space-y-4">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div><div className="flex items-center gap-2 text-sm font-semibold text-gray-700"><Brain className="w-4 h-4 text-purple-600" /> Rekomendasi Stok & Flow Barang</div><div className="text-xs text-gray-500 mt-1">Mode lokal berjalan tanpa API. Mode OpenAI aktif jika OPENAI_API_KEY diisi di HuggingFace.</div></div>
+            <div className="flex gap-2"><Button variant="outline" size="sm" onClick={() => loadAi(false)} disabled={aiLoading}>Analisa Lokal</Button><Button size="sm" onClick={() => loadAi(true)} disabled={aiLoading} className="bg-purple-600 hover:bg-purple-700">Pakai OpenAI</Button></div>
+          </div>
+          {!ai && <div className="text-sm text-gray-400 border border-dashed rounded-xl p-8 text-center">Klik Analisa Lokal untuk melihat rekomendasi restock cepat.</div>}
+          {ai?.openai_error && <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-sm text-amber-800">{ai.openai_error}</div>}
+          {ai?.ai_text && <div className="bg-purple-50 border border-purple-100 rounded-xl p-4 text-sm whitespace-pre-line text-purple-950">{ai.ai_text}</div>}
+          {Array.isArray(ai?.insights) && <div className="grid md:grid-cols-2 gap-3">{ai.insights.map((x, idx) => <div key={idx} className="bg-white border border-gray-100 rounded-xl p-3"><div className="font-semibold text-sm flex items-center gap-2"><TrendingUp className="w-4 h-4 text-[#1a6b3c]" /> {x.title}</div><div className="text-xs text-gray-600 mt-1">{x.message}</div></div>)}</div>}
+        </TabsContent>
+
         <TabsContent value="bs" className="p-4 sm:p-6"><div className="text-xs uppercase font-semibold text-gray-500 tracking-wider mb-3">Neraca</div><div className="text-sm font-semibold text-gray-700 mb-1">ASET <Glossary term="Aset" /></div>{Object.entries(bs.assets || {}).filter(([k])=>k!=="total").map(([k,v]) => <Row key={k} label={k} value={v} indent={1} />)}<Row label="Total Aset" value={bs.assets?.total || 0} bold accent="#1a6b3c" /><div className="text-sm font-semibold text-gray-700 mt-5 mb-1">KEWAJIBAN</div><Row label="Total Kewajiban" value={bs.liabilities?.total || 0} indent={1} /><div className="text-sm font-semibold text-gray-700 mt-5 mb-1">EKUITAS <Glossary term="Ekuitas" /></div>{Object.entries(bs.equity || {}).filter(([k])=>k!=="total").map(([k,v]) => <Row key={k} label={k} value={v} indent={1} />)}<Row label="Total Ekuitas" value={bs.equity?.total || 0} bold accent="#1a6b3c" /></TabsContent>
         <TabsContent value="cf" className="p-4 sm:p-6"><div className="text-xs uppercase font-semibold text-gray-500 tracking-wider mb-3">Arus Kas <Glossary term="Arus Kas" /></div><Row label="Kas Masuk Operasional" value={cf.operating?.in || 0} indent={1} /><Row label="Kas Keluar Operasional" value={-(cf.operating?.out || 0)} indent={1} /><Row label="Arus Kas Operasi" value={cf.operating?.net || 0} bold /><Row label="Setoran Modal" value={cf.financing?.in || 0} indent={1} /><Row label="ARUS KAS BERSIH" value={cf.net_cash_flow || 0} bold accent="#1a6b3c" /></TabsContent>
         <TabsContent value="trx" className="p-2"><div className="divide-y divide-gray-100">{trx.length === 0 ? <div className="text-center py-10 text-gray-400 text-sm">Belum ada transaksi</div> : trx.slice(0,100).map((t) => <div key={t.id} className="flex items-center gap-3 py-3 px-2"><div className={`w-2.5 h-2.5 rounded-full ${(t.debt_amount || 0) > 0 ? "bg-amber-500" : "bg-emerald-500"}`} /><div className="flex-1 min-w-0"><div className="text-sm font-medium">{t.trx_no || t.id}</div><div className="text-xs text-gray-500">{formatDate(t.created_at)} · {t.unit} · Struk {formatRupiah(t.transaction_total || t.total)} · Masuk {formatRupiah(t.cash_collected || t.paid_amount)}</div></div><div className="font-mono font-semibold text-[#1a6b3c]">{formatRupiah(t.cash_collected || t.paid_amount)}</div></div>)}</div></TabsContent>

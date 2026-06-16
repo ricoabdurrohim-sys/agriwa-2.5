@@ -80,7 +80,7 @@ export default function Warung() {
 
   // Table detail view
   if (activeTable) {
-    const order = ordersByTable[activeTable.id];
+    const order = activeTable.takeaway ? orders.find((o) => o.id === activeTable.order_id) : ordersByTable[activeTable.id];
     const cart = order?.items || [];
     const total = totalForOrder(order);
     const elapsed = order ? elapsedMin(order.created_at) : 0;
@@ -97,7 +97,7 @@ export default function Warung() {
       if (order) {
         await api.put(`/orders/${order.id}/items`, { items: next });
       } else {
-        await api.post("/orders", { table_id: activeTable.id, items: next });
+        await api.post("/orders", { table_id: activeTable.takeaway ? null : activeTable.id, items: next });
       }
       load();
     };
@@ -109,7 +109,7 @@ export default function Warung() {
     };
 
     const sendToKasir = () => {
-      nav(`/kasir?table=${activeTable.id}&order=${order.id}`);
+      nav(`/kasir?${activeTable.takeaway ? "" : `table=${activeTable.id}&`}order=${order.id}`);
     };
 
     const cancelOrder = async () => {
@@ -126,7 +126,7 @@ export default function Warung() {
           </button>
           <div>
             <h1 className="text-xl sm:text-2xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>{activeTable.name}</h1>
-            <p className="text-xs text-gray-500">{order ? `Order aktif · ${elapsed} menit yang lalu` : "Meja kosong — pilih menu untuk mulai"}</p>
+            <p className="text-xs text-gray-500">{order ? `${order.queue_no ? `Antrian ${order.queue_no} · ` : ""}Order aktif · ${elapsed} menit yang lalu` : (activeTable.takeaway ? "Takeaway baru — pilih menu untuk mulai" : "Meja kosong — pilih menu untuk mulai")}</p>
           </div>
         </div>
 
@@ -157,7 +157,7 @@ export default function Warung() {
                 <div className="font-semibold flex items-center gap-1.5" style={{ fontFamily: 'Poppins' }}>
                   <UtensilsCrossed className="w-4 h-4 text-[#1a6b3c]" /> Pesanan ({cart.length})
                 </div>
-                {order && <div className="text-xs text-gray-500 flex items-center gap-1 mt-0.5"><Clock className="w-3 h-3" /> {elapsed} menit · {servedCount(order)}/{cart.length} dilayani</div>}
+                {order && <div className="text-xs text-gray-500 flex items-center gap-1 mt-0.5"><Clock className="w-3 h-3" /> {order.queue_no ? `${order.queue_no} · ` : ""}{elapsed} menit · {servedCount(order)}/{cart.length} dilayani</div>}
               </div>
             </div>
 
@@ -231,7 +231,10 @@ export default function Warung() {
           <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Warung Makan</h1>
           <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · refresh otomatis tiap 8 detik</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
+          <Button data-testid="new-takeaway-btn" onClick={() => setActiveTable({ id: null, name: "Takeaway Baru", takeaway: true })} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">
+            <Plus className="w-4 h-4 mr-1.5" /> Takeaway / Antrian
+          </Button>
           <Button data-testid="add-table-btn" onClick={() => setShowAdd(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Meja Baru
           </Button>
@@ -243,6 +246,21 @@ export default function Warung() {
           <span key={s.l} className="flex items-center gap-1.5"><span className={`w-2.5 h-2.5 rounded-full ${s.c}`} />{s.l}</span>
         ))}
       </div>
+
+      {orders.filter((o) => o.order_type === "takeaway" || !o.table_id).length > 0 && (
+        <div className="bg-white rounded-xl border border-amber-100 p-3">
+          <div className="text-sm font-semibold text-amber-900 mb-2">Antrian Takeaway Aktif</div>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {orders.filter((o) => o.order_type === "takeaway" || !o.table_id).map((o) => (
+              <button key={o.id} onClick={() => setActiveTable({ id: null, name: `Takeaway ${o.queue_no || ''}`.trim(), takeaway: true, order_id: o.id })} className="text-left rounded-lg border border-amber-100 bg-amber-50 p-3 hover:bg-amber-100">
+                <div className="flex justify-between gap-2"><span className="font-semibold text-sm">{o.queue_no || 'Takeaway'}</span><span className="text-xs text-amber-700">{elapsedMin(o.created_at)}m</span></div>
+                <div className="text-xs text-gray-600 mt-1">{o.items?.length || 0} item · {formatRupiah(totalForOrder(o))}</div>
+                <div className="text-[10px] text-gray-500 mt-1">Klik untuk proses/checkout</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3" data-testid="tables-grid">
         {sortedTables.map((t) => {

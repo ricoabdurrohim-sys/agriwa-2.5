@@ -124,6 +124,19 @@ function escposQr(data, size = 5) {
   );
 }
 
+function escposCode128(data) {
+  const text = String(data || '').slice(0, 60);
+  if (!text) return new Uint8Array([]);
+  const payload = concat(bytes(0x7b, 0x42), strBytes(text)); // Code128 subset B
+  return concat(
+    bytes(GS, 0x68, 0x50), // height
+    bytes(GS, 0x77, 0x02), // width
+    bytes(GS, 0x48, 0x02), // HRI below
+    bytes(GS, 0x6b, 0x49, payload.length),
+    payload
+  );
+}
+
 async function writeEscPos(data) {
   let printer = window.__awPrinter;
   if (!printer?.characteristic) {
@@ -138,7 +151,7 @@ async function writeEscPos(data) {
   }
 }
 
-export async function printThermalLabel({ title = "LABEL", subtitle = "", lines = [], qrData = "", footer = "" } = {}) {
+export async function printThermalLabel({ title = "LABEL", subtitle = "", lines = [], qrData = "", barcodeData = "", footer = "" } = {}) {
   const safeLines = Array.isArray(lines) ? lines : [];
   const cmds = [];
   cmds.push(bytes(ESC, 0x40));

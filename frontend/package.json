@@ -63,7 +63,8 @@
     "vaul": "1.1.2",
     "xlsx": "^0.18.5",
     "zod": "3.24.4",
-    "html5-qrcode": "^2.3.8"
+    "html5-qrcode": "^2.3.8",
+    "jsbarcode": "^3.12.1"
   },
   "scripts": {
     "start": "craco start",

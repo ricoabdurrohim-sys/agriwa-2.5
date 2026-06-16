@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer } from "lucide-react";
+import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { exportInventoryXLSX, exportInventoryPDF } from "@/lib/exports";
 import ImageUpload, { resolveImageUrl } from "@/components/ImageUpload";
@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { printViaIframe } from "@/lib/safePrint";
 import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
+import Barcode from "@/components/Barcode";
 
 const CATEGORIES = [
   "Bahan Baku Warung", "Bahan Baku Pupuk", "Bahan Baku Kebun",
@@ -22,7 +23,7 @@ const UNITS = ["pcs", "gram", "kg", "liter", "ml", "porsi", "gelas", "batang", "
 const FALLBACK_BIZ = ["warung", "anggur", "pupuk", "pembibitan", "gudang"];
 
 const initial = {
-  name: "", category: CATEGORIES[0], unit: "pcs",
+  name: "", category: CATEGORIES[0], unit: "pcs", barcode: "", sku: "",
   current_stock: "", min_stock: "", cost_price: "", sell_price: "",
   business_unit: "warung", location: "", notes: "",
   has_variants: false, variants: [],
@@ -135,7 +136,7 @@ export default function Inventori() {
     if (!item) return;
     setForm({
       ...initial,
-      name: item.name || "", category: item.category || initial.category, unit: item.unit || "pcs",
+      name: item.name || "", category: item.category || initial.category, unit: item.unit || "pcs", barcode: item.barcode || "", sku: item.sku || "",
       business_unit: item.business_unit || "warung", min_stock: item.min_stock || "",
       cost_price: item.cost_price || "", sell_price: item.sell_price || "",
       location: item.location || "", supplier_name: item.last_supplier_name || "",
@@ -150,12 +151,11 @@ export default function Inventori() {
   };
 
   const printBatchLabel = (b) => {
-    const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:batch:' + (b.batch_no || b.id))}`;
-    const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(target)}`;
+    const code = `aw:batch:${b.batch_no || b.id}`;
     printViaIframe({
       title: `Label Batch ${b.batch_no}`,
-      css: "body{font-family:monospace;font-size:12px;padding:8px;width:58mm}.center{text-align:center}.big{font-weight:700;font-size:14px}.qr{width:92px;height:92px}.small{font-size:10px}",
-      bodyHtml: `<div class='center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><img class='qr' src='${qr}'/><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
+      css: "body{font-family:monospace;font-size:12px;padding:8px;width:80mm}.center{text-align:center}.big{font-weight:700;font-size:14px}.small{font-size:10px} svg{max-width:100%;}",
+      bodyHtml: `<div class='center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><svg id='barcode'></svg><script src='https://cdn.jsdelivr.net/npm/jsbarcode@3.12.1/dist/JsBarcode.all.min.js'></script><script>JsBarcode('#barcode','${code}',{format:'CODE128',height:48,width:1.4,fontSize:10,margin:4});</script><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
     });
   };
   const printBatchLabelThermal = async (b) => {
@@ -171,6 +171,7 @@ export default function Inventori() {
           b.purchase_date ? `Tanggal: ${new Date(b.purchase_date).toLocaleDateString('id-ID')}` : '',
         ].filter(Boolean),
         qrData: target,
+        barcodeData: `aw:batch:${b.batch_no || b.id}`,
         footer: 'AgriWarung Batch'
       });
       toast.success("Label batch dikirim ke printer thermal");
@@ -194,6 +195,8 @@ export default function Inventori() {
         cost_price: parseInt(form.cost_price) || 0,
         sell_price: parseInt(form.sell_price) || 0,
         has_variants: !!form.has_variants && (form.variants || []).some((v) => String(v.name || "").trim()),
+        barcode: String(form.barcode || form.sku || "").trim(),
+        sku: String(form.sku || form.barcode || "").trim(),
         variants: (form.has_variants ? (form.variants || []) : []).filter((v) => String(v.name || "").trim()).map((v, idx) => ({
           id: v.id || `var-${idx + 1}`,
           name: String(v.name || "").trim(),

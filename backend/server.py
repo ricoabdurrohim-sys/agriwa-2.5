@@ -143,7 +143,7 @@ async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
         "phone": unit.get("receipt_phone") or "",
         "footer": unit.get("receipt_footer") or "Terima kasih! 🙏",
         "note": unit.get("receipt_note") or "",
-        "logo_url": unit.get("receipt_logo") or "",
+        "logo_url": unit.get("receipt_logo") or unit.get("receipt_logo_url") or "",
     }
 
 
@@ -161,6 +161,7 @@ def receipt_cfg_from_trx(trx: dict) -> dict:
         "phone": snap.get("phone", ""),
         "footer": snap.get("footer") or "Terima kasih! 🙏",
         "note": snap.get("note", ""),
+        "logo_url": snap.get("logo_url") or snap.get("receipt_logo") or "",
     }
 
 
@@ -173,6 +174,8 @@ def generate_receipt_text(trx: dict) -> str:
     if cfg.get("phone"):
         lines.append(f"Telp: {cfg['phone']}")
     lines += ["-" * 32, f"No: {trx.get('trx_no', '-')}", f"Tanggal: {trx.get('created_at', '-')}"]
+    if trx.get("queue_no"):
+        lines.append(f"Antrian: {trx.get('queue_no')}")
     if trx.get("cashier_name"):
         lines.append(f"Kasir: {trx.get('cashier_name')}")
     if trx.get("customer_name"):
@@ -1512,11 +1515,22 @@ async def active_orders(user: dict = Depends(get_current_user)):
     ).sort("created_at", 1).to_list(200)
 
 
+
+async def _next_takeaway_queue_no() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix = f"TA-{today}-"
+    count = await db.orders.count_documents({"queue_no": {"$regex": f"^{prefix}"}})
+    return f"{prefix}{count + 1:03d}"
+
 @api.post("/orders")
 async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
+    is_takeaway = not body.table_id or str(body.table_id).lower() in ("takeaway", "_takeaway")
+    queue_no = await _next_takeaway_queue_no() if is_takeaway else ""
     doc = {
         "id": gen_id(),
-        "table_id": body.table_id,
+        "table_id": None if is_takeaway else body.table_id,
+        "order_type": "takeaway" if is_takeaway else "dine_in",
+        "queue_no": queue_no,
         "items": [i.model_dump() for i in body.items],
         "notes": body.notes,
         "status": "sent",
@@ -1611,6 +1625,7 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
     )
     change = (cash_received - sale_total) if (is_sale and body.payment_method == "cash") else 0
     receipt_snapshot = await build_receipt_snapshot(body.unit)
+    source_order = await db.orders.find_one({"id": body.order_id}, {"_id": 0}) if body.order_id else None
     settings_doc = await db.settings.find_one({}, {"_id": 0}) or {}
     tax_rate = float(settings_doc.get("tax_rate") or 0)
     tax_receipt_enabled = bool(settings_doc.get("tax_receipt_enabled", True))
@@ -1631,6 +1646,8 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
         "lookup_key": trx_no,
         "order_id": body.order_id,
         "table_id": body.table_id,
+        "queue_no": (source_order or {}).get("queue_no", ""),
+        "order_type": (source_order or {}).get("order_type", ""),
         "branch_id": body.branch_id,
         "items": [i.model_dump() for i in body.items],
         "subtotal": retail_subtotal,
@@ -3441,6 +3458,24 @@ async def finance_refresh_summary(user: dict = Depends(get_current_user)):
     return {"ok": True, "message": "Ringkasan keuangan akan dihitung ulang pada request berikutnya."}
 
 # ---------- Reports ----------
+
+
+@api.get("/reports/sales-analytics")
+async def sales_analytics(user: dict = Depends(get_current_user)):
+    rows = await db.transactions.find({"cancelled": {"$ne": True}, "transaction_type": "SALE"}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    def bucket(dt, fmt):
+        try: return datetime.fromisoformat(str(dt).replace('Z','+00:00')).strftime(fmt)
+        except Exception: return "Tanpa tanggal"
+    weekly, monthly, yearly = {}, {}, {}
+    for r in rows:
+        paid = int(r.get("cash_collected") or r.get("paid_amount") or (0 if r.get("is_bon") else r.get("total") or 0))
+        for target, fmt in [(weekly, "%G-W%V"), (monthly, "%Y-%m"), (yearly, "%Y")]:
+            key = bucket(r.get("created_at"), fmt)
+            target.setdefault(key, {"revenue": 0, "count": 0})
+            target[key]["revenue"] += paid
+            target[key]["count"] += 1
+    return {"weekly": weekly, "monthly": monthly, "yearly": yearly}
+
 @api.get("/reports/profit-loss")
 async def profit_loss(user: dict = Depends(get_current_user)):
     summary = await _build_unified_finance_summary(limit=5000)
@@ -4835,7 +4870,10 @@ async def kds_orders(user: dict = Depends(get_current_user)):
     ).sort("created_at", 1).to_list(200)
     tables = {t["id"]: t for t in await list_collection("tables")}
     for o in orders:
-        o["table_name"] = tables.get(o.get("table_id"), {}).get("name", "Takeaway")
+        if o.get("order_type") == "takeaway" or not o.get("table_id"):
+            o["table_name"] = f"Takeaway {o.get('queue_no') or ''}".strip()
+        else:
+            o["table_name"] = tables.get(o.get("table_id"), {}).get("name", "Takeaway")
     return orders
 
 
@@ -6294,6 +6332,59 @@ async def delete_branch(bid: str, user: dict = Depends(require_roles("super_admi
     await db.branches.delete_one({"id": bid})
     return {"ok": True}
 
+
+
+
+# ---------- AI / Smart Insights ----------
+def _simple_inventory_insights(items: list, tx: list) -> list:
+    sold = {}
+    for t in tx:
+        if t.get("cancelled") or (t.get("transaction_type") or "SALE") != "SALE":
+            continue
+        for it in t.get("items", []):
+            sold[it.get("item_id")] = sold.get(it.get("item_id"), 0) + float(it.get("quantity") or 0)
+    out = []
+    for i in items:
+        stock = float(i.get("current_stock") or 0)
+        min_stock = float(i.get("min_stock") or 0)
+        qty7 = sold.get(i.get("id"), 0)
+        if min_stock > 0 and stock <= min_stock:
+            out.append({"level": "urgent", "title": f"Stok menipis: {i.get('name')}", "message": f"Sisa {stock:g} {i.get('unit','')}, di bawah/sama minimum {min_stock:g}. Pertimbangkan restock."})
+        elif qty7 > 0 and stock <= max(min_stock, qty7 * 1.5):
+            out.append({"level": "warning", "title": f"Potensi segera habis: {i.get('name')}", "message": f"Terjual sekitar {qty7:g} dalam data terbaru, stok tinggal {stock:g}."})
+    if not out:
+        out.append({"level": "ok", "title": "Belum ada risiko stok besar", "message": "Data penjualan/stok terbaru belum menunjukkan barang yang perlu segera dibeli."})
+    return out[:10]
+
+@api.get("/ai/inventory-insights")
+async def ai_inventory_insights(use_openai: bool = False, user: dict = Depends(get_current_user)):
+    since = datetime.now(timezone.utc) - timedelta(days=14)
+    items = await db.inventory_items.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    tx = await db.transactions.find({"created_at_dt": {"$gte": since}}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    insights = _simple_inventory_insights(items, tx)
+    result = {"mode": "local_rules", "insights": insights, "notes": "Analisis lokal memakai stok minimum dan pola transaksi terbaru."}
+    if use_openai:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            result["openai_error"] = "OPENAI_API_KEY belum diisi di HuggingFace Secrets. ChatGPT Plus tidak otomatis menjadi API key."
+            return result
+        try:
+            import httpx
+            top = [{"name": i.get("name"), "stock": i.get("current_stock"), "min": i.get("min_stock"), "unit": i.get("unit"), "sold_recent": sum(float(it.get("quantity") or 0) for t in tx for it in t.get("items", []) if it.get("item_id") == i.get("id"))} for i in items[:80]]
+            prompt = "Beri rekomendasi restock UMKM singkat dalam Bahasa Indonesia dari data stok dan penjualan ini. Jangan mengarang angka. Data: " + str(top[:80])
+            async with httpx.AsyncClient(timeout=25) as http:
+                r = await http.post("https://api.openai.com/v1/responses", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json={"model": os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"), "input": prompt})
+                data = r.json()
+            text = data.get("output_text") or ""
+            if not text and data.get("output"):
+                try:
+                    text = "\n".join(c.get("text", "") for o in data.get("output", []) for c in o.get("content", []) if c.get("type") in ("output_text", "text"))
+                except Exception:
+                    text = ""
+            result.update({"mode": "openai", "ai_text": text.strip(), "raw_status": r.status_code})
+        except Exception as e:
+            result["openai_error"] = str(e)
+    return result
 
 # ---------- Audit Log ----------
 async def write_audit(user: dict, action: str, entity_type: str, entity_id: str = None, payload: dict = None):

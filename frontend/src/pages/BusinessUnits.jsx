@@ -6,12 +6,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import ImageUpload from "@/components/ImageUpload";
 import { toast } from "sonner";
 
 const DEFAULT_CODES = ["warung", "anggur", "pupuk", "pembibitan", "gudang"];
 const COLORS = ["#1a6b3c", "#ea580c", "#6b46c1", "#b45309", "#059669", "#2563eb", "#dc2626", "#0891b2", "#7c3aed", "#db2777"];
 
-const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", description: "", color: "#1a6b3c", active: true, auto_batch_enabled: true, batch_on_purchase: true, batch_on_production: false, batch_on_harvest: true, batch_on_farm: true };
+const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", receipt_logo: "", description: "", color: "#1a6b3c", active: true, auto_batch_enabled: true, batch_on_purchase: true, batch_on_production: false, batch_on_harvest: true, batch_on_farm: true };
 
 export default function BusinessUnits() {
   const [units, setUnits] = useState([]);
@@ -94,6 +95,7 @@ export default function BusinessUnits() {
             <div><Label>Telepon di Struk</Label><Input data-testid="unit-receipt-phone-input" value={form.receipt_phone || ""} onChange={(e) => setForm({ ...form, receipt_phone: e.target.value })} placeholder="08xxx / 0276..." /></div>
             <div><Label>Footer Struk</Label><Input data-testid="unit-receipt-footer-input" value={form.receipt_footer || ""} onChange={(e) => setForm({ ...form, receipt_footer: e.target.value })} placeholder="Terima kasih / promo / kebijakan retur" /></div>
             <div><Label>Catatan Struk</Label><Input data-testid="unit-receipt-note-input" value={form.receipt_note || ""} onChange={(e) => setForm({ ...form, receipt_note: e.target.value })} placeholder="Catatan tambahan di bawah struk" /></div>
+            <ImageUpload value={form.receipt_logo || ""} onChange={(v) => setForm({ ...form, receipt_logo: v })} label="Logo/Gambar di Struk (opsional)" testid="unit-receipt-logo" />
             <div><Label>Deskripsi</Label><Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
             <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 space-y-2">
               <div className="text-sm font-semibold text-emerald-900">Pengaturan Batch Otomatis</div>
