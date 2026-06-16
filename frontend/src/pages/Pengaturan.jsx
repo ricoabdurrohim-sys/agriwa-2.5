@@ -3,7 +3,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { KeyRound, User as UserIcon, CreditCard, ShieldCheck, Info } from "lucide-react";
+import { KeyRound, User as UserIcon, CreditCard, ShieldCheck, Info, Trash2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 
@@ -14,6 +14,8 @@ export default function Pengaturan() {
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "", confirm: "" });
   const [gateways, setGateways] = useState([]);
   const [gatewayForm, setGatewayForm] = useState({ name: "Midtrans", provider: "midtrans", active: false, server_key: "", client_key: "", webhook_secret: "" });
+  const [resetConfirm, setResetConfirm] = useState("");
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     api.get("/settings").then(({ data }) => setS((prev) => ({ ...prev, ...data }))).catch(() => {});
@@ -67,6 +69,21 @@ export default function Pengaturan() {
     } catch (e) { toast.error(e?.response?.data?.detail || "Gagal mengganti password"); }
   };
 
+  const resetTransactionFinance = async () => {
+    if (resetConfirm.trim().toUpperCase() !== "RESET TRANSAKSI") {
+      return toast.error("Ketik RESET TRANSAKSI untuk konfirmasi");
+    }
+    if (!window.confirm("Reset data transaksi, bon, pemasukan, pengeluaran, jurnal, dan order test? Inventori master tidak dihapus. Lanjut?")) return;
+    setResetting(true);
+    try {
+      await api.post("/system/reset-transaction-finance-data", { confirm: resetConfirm });
+      window.__awFinanceSummaryCache = null;
+      toast.success("Data transaksi & keuangan operasional sudah direset");
+      setResetConfirm("");
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal reset transaksi"); }
+    finally { setResetting(false); }
+  };
+
   return (
     <div className="space-y-4 fade-in max-w-3xl">
       <div>
@@ -77,8 +94,8 @@ export default function Pengaturan() {
       <div className="bg-red-50 border border-red-100 rounded-xl p-4 flex gap-3 text-sm text-red-800">
         <ShieldCheck className="w-5 h-5 shrink-0 mt-0.5" />
         <div>
-          <div className="font-semibold">Reset/hapus data massal sudah dihapus dari aplikasi.</div>
-          <div className="text-xs mt-1 leading-relaxed">Semua data produksi hanya bisa diedit atau dihapus per item di menu masing-masing. Ini mencegah inventori/meja/transaksi terhapus karena salah klik.</div>
+          <div className="font-semibold">Reset massal tetap dikunci.</div>
+          <div className="text-xs mt-1 leading-relaxed">Yang tersedia hanya reset khusus transaksi/bon/keuangan operasional untuk membersihkan data uji yang tumpang tindih. Inventori master, user, supplier, lini bisnis, dan pengaturan tidak ikut dihapus.</div>
         </div>
       </div>
 
@@ -123,6 +140,15 @@ export default function Pengaturan() {
         <Button onClick={saveGateway} className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan Gateway</Button>
         <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg p-3">Webhook backend: <code>/api/payment-webhooks/{gatewayForm.provider}</code>. Setelah daftar provider, arahkan URL webhook provider ke endpoint backend HuggingFace Anda.</div>
         {gateways.length > 0 && <div className="divide-y divide-gray-100 border border-gray-100 rounded-lg">{gateways.map((g) => <div key={g.id} className="p-3 flex justify-between gap-3 text-sm"><div><div className="font-semibold">{g.name} <span className="text-xs text-gray-500 uppercase">{g.provider}</span></div><div className="text-xs text-gray-500">Server: {g.server_key ? "tersimpan" : "belum diisi"} · Client: {g.client_key ? "tersimpan" : "belum diisi"}</div></div><span className={`text-xs font-bold px-2 py-1 rounded ${g.active ? "bg-emerald-100 text-emerald-700" : "bg-gray-100 text-gray-600"}`}>{g.active ? "AKTIF" : "NONAKTIF"}</span></div>)}</div>}
+      </div>
+
+      <div className="bg-white rounded-xl border border-red-100 p-5 space-y-4">
+        <h2 className="font-semibold text-red-800 flex items-center gap-2"><AlertTriangle className="w-4 h-4" /> Reset Transaksi & Keuangan</h2>
+        <p className="text-xs text-gray-600 leading-relaxed">Gunakan hanya untuk membersihkan data uji transaksi yang sudah tidak sinkron. Yang dihapus: transaksi kasir, bon/piutang, pelunasan bon, pemasukan, pengeluaran, jurnal, bank transaction, notifikasi, dan order test. Inventori barang tetap ada.</p>
+        <div><Label>Ketik RESET TRANSAKSI</Label><Input value={resetConfirm} onChange={(e) => setResetConfirm(e.target.value)} placeholder="RESET TRANSAKSI" /></div>
+        <Button onClick={resetTransactionFinance} disabled={resetting || resetConfirm.trim().toUpperCase() !== "RESET TRANSAKSI"} variant="destructive" className="bg-red-600 hover:bg-red-700">
+          <Trash2 className="w-4 h-4 mr-1.5" /> {resetting ? "Mereset..." : "Reset Transaksi & Keuangan"}
+        </Button>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-5 space-y-2">

@@ -19,7 +19,7 @@ import hashlib
 from urllib.parse import quote
 from typing import List, Optional, Literal, Dict
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, BackgroundTasks
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
@@ -981,7 +981,7 @@ async def list_inventory(user: dict = Depends(get_current_user), include_batches
     riwayat batch dan tetap cepat. Menu Inventori/Produksi tetap memakai batch.
     """
     safe_limit = max(100, min(int(limit or 3000), 5000))
-    items = await db.inventory_items.find({}, {"_id": 0}).sort("created_at", -1).to_list(safe_limit)
+    items = await db.inventory_items.find({}, {"_id": 0}).sort([("name_key", 1), ("name", 1), ("created_at", -1)]).to_list(safe_limit)
     if not include_batches:
         for item in items:
             item["recent_batches"] = []
@@ -1311,7 +1311,7 @@ class TransactionIn(BaseModel):
 
 
 @api.post("/transactions")
-async def create_transaction(body: TransactionIn, user: dict = Depends(get_current_user)):
+async def create_transaction(body: TransactionIn, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     if not body.items:
         raise HTTPException(400, "Item transaksi kosong")
     trx_type = (body.transaction_type or "SALE").upper()
@@ -1350,7 +1350,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
                 "consumed_batches": consumed_batches if 'consumed_batches' in locals() else [],
                 "created_at": now_iso(),
             })
-            await check_low_stock_and_notify(it.item_id)
+            background_tasks.add_task(check_low_stock_and_notify, it.item_id)
 
     is_sale = trx_type == "SALE"
     auto_debt = is_sale and body.payment_method == "cash" and cash_received < sale_total
@@ -1440,7 +1440,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
             "unit": body.unit,
             "created_at": now_iso(),
         })
-        await write_notification("DEBT", "Transaksi menjadi hutang", f"{doc['trx_no']} kurang {format_rp_short(debt_amount)}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"], priority="high")
+        background_tasks.add_task(write_notification, "DEBT", "Transaksi menjadi hutang", f"{doc['trx_no']} kurang {format_rp_short(debt_amount)}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"], priority="high")
 
     # Journal entries ringan ala Odoo.
     if is_sale:
@@ -1484,9 +1484,10 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
                 "reference": trx_type.lower(), "reference_id": doc["id"], "unit": body.unit, "created_at": now_iso(),
             })
 
-    await broadcast_event("transaction_created", {"id": doc["id"], "total": doc["total"], "unit": body.unit, "transaction_type": trx_type})
-    await write_notification("TRANSACTION", "Transaksi baru", f"{trx_no} · {format_rp_short(doc['total'])} · {payment_status}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"])
-    await write_audit(user, "create", "transaction", doc["id"], {"trx_no": trx_no, "total": doc["total"], "type": trx_type, "payment_status": payment_status})
+    invalidate_finance_summary_cache()
+    background_tasks.add_task(broadcast_event, "transaction_created", {"id": doc["id"], "total": doc["total"], "unit": body.unit, "transaction_type": trx_type})
+    background_tasks.add_task(write_notification, "TRANSACTION", "Transaksi baru", f"{trx_no} · {format_rp_short(doc['total'])} · {payment_status}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"])
+    background_tasks.add_task(write_audit, user, "create", "transaction", doc["id"], {"trx_no": trx_no, "total": doc["total"], "type": trx_type, "payment_status": payment_status})
     return doc
 
 
@@ -1585,7 +1586,7 @@ def _normalize_debt_for_response(d: dict) -> dict:
 
 @api.get("/customer-debts")
 async def list_debts(user: dict = Depends(get_current_user)):
-    debts = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    debts = await db.customer_debts.find({"status": {"$nin": ["cancelled", "void", "deleted"]}}, {"_id": 0}).sort("created_at", -1).to_list(500)
     return [_normalize_debt_for_response(d) for d in debts]
 
 
@@ -1593,7 +1594,7 @@ async def list_debts(user: dict = Depends(get_current_user)):
 async def search_debts(q: str = "", include_paid: bool = False, user: dict = Depends(get_current_user)):
     query = {}
     if not include_paid:
-        query["status"] = {"$ne": "paid"}
+        query["status"] = {"$nin": ["paid", "cancelled", "void", "deleted"]}
     q = (q or "").strip()
     if q:
         query["$or"] = [
@@ -1607,7 +1608,7 @@ async def search_debts(q: str = "", include_paid: bool = False, user: dict = Dep
     normalized = [_normalize_debt_for_response(r) for r in rows]
     # Fallback: beberapa data lama hanya ada di transaksi, belum tersalin sempurna ke customer_debts.
     if q and len(normalized) < 10:
-        trx_q = {"debt_amount": {"$gt": 0}, "$or": [
+        trx_q = {"debt_amount": {"$gt": 0}, "payment_status": {"$ne": "CANCELLED"}, "cancel_reason": {"$nin": ["manual_cancel", "user_cancel", "void"]}, "$or": [
             {"trx_no": {"$regex": re.escape(q), "$options": "i"}},
             {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
             {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
@@ -1722,6 +1723,8 @@ async def mark_paid_full(debt_id: str, user: dict = Depends(get_current_user)):
     debt = await db.customer_debts.find_one({"id": debt_id})
     if not debt:
         raise HTTPException(404, "Bon tidak ditemukan")
+    if str(debt.get("status") or "").lower() in ("cancelled", "void", "deleted"):
+        raise HTTPException(400, "Bon ini sudah dibatalkan dan tidak boleh dilunasi")
     if debt.get("status") == "paid":
         return {"ok": True, "already_paid": True}
     remaining = debt["amount"] - debt.get("paid", 0)
@@ -1824,6 +1827,8 @@ async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends
     debt = await db.customer_debts.find_one({"id": debt_id})
     if not debt:
         raise HTTPException(404, "Bon tidak ditemukan")
+    if str(debt.get("status") or "").lower() in ("cancelled", "void", "deleted"):
+        raise HTTPException(400, "Bon ini sudah dibatalkan dan tidak boleh dilunasi")
     if debt.get("status") == "paid":
         raise HTTPException(400, "Bon sudah lunas")
 
@@ -2625,6 +2630,42 @@ def _enrich_transaction_financial_fields(t: dict, debt_ctx: Optional[dict] = Non
     return row
 
 
+async def _repair_cancelled_transaction_finance_leaks() -> int:
+    """Pastikan transaksi yang dibatalkan tidak menyisakan piutang/pelunasan di Keuangan.
+
+    Ini memperbaiki data dari patch sebelumnya: transaksi sudah CANCELLED di Kasir,
+    tetapi customer_debts/debt_payments lama masih aktif sehingga Dashboard,
+    Keuangan, dan Laporan tetap membaca piutang bon.
+    """
+    fixed = 0
+    q = {"$or": [
+        {"cancel_reason": {"$in": ["manual_cancel", "user_cancel", "void"]}},
+        {"payment_status": "CANCELLED"},
+    ]}
+    async for t in db.transactions.find(q, {"_id": 0, "id": 1, "trx_no": 1}):
+        trx_id = t.get("id")
+        trx_no = t.get("trx_no")
+        ors = []
+        if trx_id:
+            ors += [{"transaction_id": trx_id}, {"original_transaction_id": trx_id}, {"trx_id": trx_id}]
+        if trx_no:
+            ors += [{"original_trx_no": trx_no}, {"trx_no": trx_no}]
+        if not ors:
+            continue
+        debt_res = await db.customer_debts.update_many(
+            {"$or": ors, "status": {"$nin": ["cancelled", "void", "deleted"]}},
+            {"$set": {"status": "cancelled", "paid": 0, "remaining": 0, "payment_due": 0, "cancel_reason": "linked_transaction_cancelled", "cancelled_at": now_iso()}},
+        )
+        pay_res = await db.debt_payments.update_many(
+            {"$or": ors, "voided": {"$ne": True}},
+            {"$set": {"voided": True, "void_reason": "linked_transaction_cancelled", "voided_at": now_iso()}},
+        )
+        fixed += int(getattr(debt_res, "modified_count", 0) or 0) + int(getattr(pay_res, "modified_count", 0) or 0)
+    if fixed:
+        invalidate_finance_summary_cache()
+    return fixed
+
+
 async def _repair_legacy_bon_settlement_transactions() -> int:
     """Perbaiki data bon dari patch lama.
 
@@ -2636,12 +2677,16 @@ async def _repair_legacy_bon_settlement_transactions() -> int:
     repaired = 0
     debts = await db.customer_debts.find({"transaction_id": {"$exists": True}}, {"_id": 0}).to_list(5000)
     for debt in debts:
+        if str(debt.get("status") or "").lower() in ("cancelled", "void", "deleted"):
+            continue
         debt_id = debt.get("id")
         original_id = debt.get("transaction_id")
         if not original_id:
             continue
         original = await db.transactions.find_one({"id": original_id})
         if not original:
+            continue
+        if original.get("cancel_reason") in ("manual_cancel", "user_cancel", "void") or original.get("payment_status") == "CANCELLED":
             continue
 
         settlement_docs = []
@@ -2822,6 +2867,7 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     global _finance_repair_done
     if not _finance_repair_done:
         try:
+            await _repair_cancelled_transaction_finance_leaks()
             await _repair_legacy_bon_settlement_transactions()
         except Exception:
             # Repair tidak boleh membuat halaman crash. Data tetap diringkas best-effort.
@@ -2907,7 +2953,15 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     total_other_income = sum(other_income_by_category.values())
     total_expense = sum(expense_by_category.values())
     total_capital = sum(_money(c.get("amount")) for c in capital)
-    total_debt = sum(max(0, _money(d.get("amount")) - _money(d.get("paid"))) for d in debts_raw if d.get("status") != "paid")
+    cancelled_trx_ids = {t.get("id") for t in raw_transactions if t.get("cancel_reason") in ("manual_cancel", "user_cancel", "void") or t.get("payment_status") == "CANCELLED"}
+    def _active_debt(d: dict) -> bool:
+        status = str(d.get("status") or "").lower()
+        if status in ("paid", "cancelled", "void", "deleted"):
+            return False
+        if d.get("transaction_id") in cancelled_trx_ids:
+            return False
+        return True
+    total_debt = sum(max(0, _money(d.get("amount")) - _money(d.get("paid"))) for d in debts_raw if _active_debt(d))
 
     total_revenue = total_pos_income + total_other_income
     gross_profit = total_revenue - total_cogs
@@ -2960,7 +3014,7 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     retained = total_revenue - total_expense
 
     safe_limit = max(1, min(_money(limit, 1000), 5000))
-    normalized_debts = [_normalize_debt_for_response(d) for d in debts_raw]
+    normalized_debts = [_normalize_debt_for_response(d) for d in debts_raw if _active_debt(d)]
 
     return {
         "ok": True,
@@ -5509,6 +5563,73 @@ MODULE_COLLECTIONS = {
     "audit":      ["audit_logs"],
     "opname":     ["opname_sessions"],
 }
+
+
+class ResetTransactionFinanceIn(BaseModel):
+    confirm: str
+
+
+@api.post("/system/reset-transaction-finance-data")
+async def reset_transaction_finance_data(body: ResetTransactionFinanceIn, user: dict = Depends(require_roles("super_admin"))):
+    """Reset khusus data transaksi/keuangan operasional.
+
+    Sengaja tidak menghapus users, inventori master, supplier, lini bisnis, meja, atau pengaturan.
+    Dipakai saat data uji transaksi/bon sudah tumpang tindih dan perlu mulai bersih.
+    """
+    if (body.confirm or "").strip().upper() != "RESET TRANSAKSI":
+        raise HTTPException(400, "Ketik RESET TRANSAKSI untuk konfirmasi")
+    # Balikkan efek stok dari transaksi yang belum pernah dibatalkan, lalu hapus
+    # stock movement khusus transaksi. Ini membuat Kasir/Keuangan/Dashboard/Laporan
+    # bersih tanpa meninggalkan stok yang sudah berkurang karena data uji.
+    trx_rows = await db.transactions.find({}, {"_id": 0}).to_list(10000)
+    trx_refs = []
+    restored_stock = 0.0
+    for trx in trx_rows:
+        trx_refs.extend([x for x in [trx.get("id"), trx.get("trx_no")] if x])
+        if _is_debt_settlement_document(trx):
+            continue
+        if trx.get("cancel_reason") in ("manual_cancel", "user_cancel", "void") or trx.get("payment_status") == "CANCELLED":
+            continue
+        for it in trx.get("items") or []:
+            item_id = it.get("item_id")
+            qty = float(it.get("quantity") or 0)
+            if not item_id or qty <= 0:
+                continue
+            await db.inventory_items.update_one({"id": item_id}, {"$inc": {"current_stock": qty}})
+            restored_stock += qty
+            moves = await db.stock_movements.find({"reference_id": {"$in": [trx.get("trx_no"), trx.get("id")]}, "item_id": item_id}, {"_id": 0}).to_list(50)
+            for mv in moves:
+                for cb in mv.get("consumed_batches") or []:
+                    bid = cb.get("batch_id")
+                    bno = cb.get("batch_no")
+                    qout = float(cb.get("qty_out") or 0)
+                    if qout > 0:
+                        await db.inventory_batches.update_one({"$or": [{"id": bid}, {"batch_no": bno}], "item_id": item_id}, {"$inc": {"remaining_quantity": qout}, "$set": {"updated_at": now_iso()}})
+
+    deleted = {"restored_stock_qty": restored_stock}
+    if trx_refs:
+        res = await db.stock_movements.delete_many({"$or": [{"reference_id": {"$in": trx_refs}}, {"reference": "transaction_cancel"}]})
+        deleted["stock_movements"] = int(getattr(res, "deleted_count", 0) or 0)
+
+    collections = [
+        "transactions", "customer_debts", "debt_payments", "incomes", "expenses",
+        "journal_entries", "bank_transactions", "bank_reconciliations", "notifications",
+    ]
+    for coll in collections:
+        try:
+            res = await db[coll].delete_many({})
+            deleted[coll] = int(getattr(res, "deleted_count", 0) or 0)
+        except Exception:
+            deleted[coll] = 0
+    # Order yang sudah test juga dibersihkan supaya Kasir/Warung tidak nyangkut status lama.
+    try:
+        res = await db.orders.delete_many({})
+        deleted["orders"] = int(getattr(res, "deleted_count", 0) or 0)
+    except Exception:
+        deleted["orders"] = 0
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "system", "reset_transaction_finance_data", {"deleted": deleted})
+    return {"ok": True, "deleted": deleted, "message": "Data transaksi, bon, dan keuangan operasional sudah direset."}
 
 
 @api.post("/system/reset-module/{module}")

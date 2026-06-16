@@ -47,9 +47,11 @@ export default function Inventori() {
   const [batchRows, setBatchRows] = useState([]);
   const [templateId, setTemplateId] = useState("new");
 
+  const sortItemsAZ = (rows = []) => [...rows].sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "id", { sensitivity: "base" }));
+
   const load = async () => {
     const { data } = await api.get("/inventory");
-    setItems(data);
+    setItems(sortItemsAZ(Array.isArray(data) ? data : []));
   };
   const loadBoms = async () => {
     try { const { data } = await api.get("/bom"); setBoms(data); } catch (err) { /* ignore */ }
@@ -105,8 +107,8 @@ export default function Inventori() {
     let f = items;
     if (filter === "low") f = f.filter((i) => i.current_stock <= i.min_stock && i.min_stock > 0);
     else if (filter !== "all") f = f.filter((i) => i.business_unit === filter);
-    if (search) f = f.filter((i) => i.name.toLowerCase().includes(search.toLowerCase()));
-    return f;
+    if (search) f = f.filter((i) => String(i.name || "").toLowerCase().includes(search.toLowerCase()));
+    return sortItemsAZ(f);
   }, [items, filter, search]);
 
   const openNew = () => { setEditing(null); setTemplateId("new"); setForm(initial); setShowForm(true); };

@@ -16,6 +16,7 @@ const FALLBACK_UNITS = ["umum", "warung", "anggur", "pupuk", "pembibitan", "guda
 
 const asArray = (v) => Array.isArray(v) ? v : [];
 const money = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
+const FINANCE_CACHE_MS = 30000;
 
 export default function Keuangan() {
   const navigate = useNavigate();
@@ -28,11 +29,18 @@ export default function Keuangan() {
   const [form, setForm] = useState({ amount: 0, category: CATEGORIES[0], unit: "warung", notes: "", payment_method: "cash" });
   const [incForm, setIncForm] = useState({ amount: 0, category: INCOME_CATEGORIES[0], unit: "umum", source: "", notes: "", payment_method: "cash" });
 
-  const load = async () => {
-    setLoading(true);
+  const load = async ({ force = false } = {}) => {
     setError("");
+    const cached = window.__awFinanceSummaryCache;
+    if (!force && cached?.data && Date.now() - cached.ts < FINANCE_CACHE_MS) {
+      setSummary(cached.data);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     try {
-      const { data } = await api.get("/finance/system-summary?limit=2000");
+      const { data } = await api.get("/finance/system-summary?limit=500");
+      window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
       setSummary(data || {});
     } catch (err) {
       console.error("finance/system-summary failed", err);
@@ -55,7 +63,8 @@ export default function Keuangan() {
     const h = (e) => {
       const k = e.detail?.type;
       if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) {
-        load(); loadBizUnits();
+        window.__awFinanceSummaryCache = null;
+        load({ force: true }); loadBizUnits();
       }
     };
     window.addEventListener("aw:ws", h);

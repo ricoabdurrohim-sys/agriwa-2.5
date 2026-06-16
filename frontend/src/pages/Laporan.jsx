@@ -18,6 +18,7 @@ const GLOSSARY = {
 
 const money = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
 const asArray = (v) => Array.isArray(v) ? v : [];
+const FINANCE_CACHE_MS = 30000;
 
 function Glossary({ term }) {
   if (!GLOSSARY[term]) return null;
@@ -43,10 +44,18 @@ export default function Laporan() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
-  const load = async () => {
-    setLoading(true); setError("");
+  const load = async ({ force = false } = {}) => {
+    setError("");
+    const cached = window.__awFinanceSummaryCache;
+    if (!force && cached?.data && Date.now() - cached.ts < FINANCE_CACHE_MS) {
+      setSummary(cached.data);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     try {
-      const { data } = await api.get("/finance/system-summary?limit=2000");
+      const { data } = await api.get("/finance/system-summary?limit=500");
+      window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
       setSummary(data || {});
     } catch (e) {
       console.error(e);
@@ -57,7 +66,7 @@ export default function Laporan() {
 
   useEffect(() => { load(); }, []);
   useEffect(() => {
-    const h = (e) => { const k = e.detail?.type; if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) load(); };
+    const h = (e) => { const k = e.detail?.type; if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) { window.__awFinanceSummaryCache = null; load({ force: true }); } };
     window.addEventListener("aw:ws", h); return () => window.removeEventListener("aw:ws", h);
   }, []);
 
