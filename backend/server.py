@@ -661,6 +661,41 @@ async def insert_doc(coll: str, data: dict):
     return data
 
 
+
+# ---------- Investor finance lock helpers ----------
+async def _has_active_dividends(investor_id: str = None) -> bool:
+    """Returns true once dividends have been distributed/finalized.
+    During building/testing, investor and capital data can still be edited freely
+    until an active dividend exists. Cancelled/voided dividends do not lock.
+    """
+    q = {"status": {"$nin": ["cancelled", "void", "deleted"]}}
+    if investor_id:
+        q["items.investor_id"] = investor_id
+    return (await db.dividends.count_documents(q)) > 0
+
+async def _active_dividend_count(investor_id: str = None) -> int:
+    q = {"status": {"$nin": ["cancelled", "void", "deleted"]}}
+    if investor_id:
+        q["items.investor_id"] = investor_id
+    return await db.dividends.count_documents(q)
+
+async def _create_expense_journal(exp_doc: dict):
+    await db.journal_entries.delete_many({"reference": exp_doc.get("reference", "expense"), "reference_id": exp_doc.get("id")})
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": exp_doc.get("date") or now_iso(),
+        "description": f"Biaya {exp_doc.get('category', 'Pengeluaran')}",
+        "lines": [
+            {"account": exp_doc.get("category", "Pengeluaran"), "debit": _money(exp_doc.get("amount")), "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": _money(exp_doc.get("amount"))},
+        ],
+        "reference": exp_doc.get("reference", "expense"),
+        "reference_id": exp_doc.get("reference_id") or exp_doc.get("id"),
+        "expense_id": exp_doc.get("id"),
+        "unit": exp_doc.get("unit", "umum"),
+        "created_at": now_iso(),
+    })
+
 # ---------- Investors & Capital ----------
 class InvestorIn(BaseModel):
     name: str
@@ -704,26 +739,29 @@ async def update_investor(investor_id: str, body: InvestorIn, user: dict = Depen
 
 
 @api.delete("/investors/{investor_id}")
-async def delete_investor(investor_id: str, user: dict = Depends(get_current_user)):
+async def delete_investor(investor_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
     existing = await db.investors.find_one({"id": investor_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Investor tidak ditemukan")
 
-    related_capital = await db.capital_injections.count_documents({"investor_id": investor_id})
-    related_land = await db.land_rental.count_documents({"investor_id": investor_id})
-    related_dividend = await db.dividends.count_documents({"items.investor_id": investor_id})
-    if related_capital or related_land or related_dividend:
+    # Tahap building: investor/modal boleh dibersihkan selama belum ada dividen aktif.
+    # Setelah dividen dibagikan, data investor dan modal menjadi dasar audit dan dikunci.
+    if await _has_active_dividends(investor_id):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Investor sudah terhubung dengan setoran modal/dividen/sewa lahan. "
-                "Untuk menjaga laporan tidak rusak, edit nama investor atau hapus transaksi modal terkait terlebih dahulu."
-            ),
+            detail="Investor sudah menerima pembagian dividen aktif. Batalkan dividen dulu sebelum menghapus investor/modalnya.",
         )
 
+    caps = await db.capital_injections.find({"investor_id": investor_id}, {"_id": 0, "id": 1}).to_list(1000)
+    cap_ids = [c.get("id") for c in caps if c.get("id")]
+    if cap_ids:
+        await db.journal_entries.delete_many({"reference": "capital_injection", "reference_id": {"$in": cap_ids}})
+        await db.capital_injections.delete_many({"id": {"$in": cap_ids}})
+    await db.land_rental.delete_many({"investor_id": investor_id})
     await db.investors.delete_one({"id": investor_id})
     invalidate_finance_summary_cache()
-    return {"ok": True, "deleted_id": investor_id}
+    await write_audit(user, "delete", "investor", investor_id, {"name": existing.get("name"), "capital_deleted": len(cap_ids)})
+    return {"ok": True, "deleted_id": investor_id, "capital_deleted": len(cap_ids)}
 
 
 class CapitalIn(BaseModel):
@@ -743,18 +781,63 @@ async def get_capital(user: dict = Depends(get_current_user)):
 async def add_capital(body: CapitalIn, user: dict = Depends(get_current_user)):
     data = body.model_dump()
     data["date"] = data.get("date") or now_iso()
+    doc = await insert_doc("capital_injections", data)
     # create journal entry: Debit Kas / Credit Modal Disetor
     await insert_doc("journal_entries", {
-        "date": data["date"],
-        "description": f"Setoran modal - {data['notes'] or 'modal'}",
+        "date": doc["date"],
+        "description": f"Setoran modal - {doc.get('notes') or 'modal'}",
         "lines": [
-            {"account": "Kas", "debit": data["amount"], "credit": 0},
-            {"account": "Modal Disetor", "debit": 0, "credit": data["amount"]},
+            {"account": "Kas", "debit": _money(doc.get("amount")), "credit": 0},
+            {"account": "Modal Disetor", "debit": 0, "credit": _money(doc.get("amount"))},
         ],
         "reference": "capital_injection",
+        "reference_id": doc["id"],
+        "unit": doc.get("unit", "umum"),
+    })
+    invalidate_finance_summary_cache()
+    return doc
+
+
+@api.put("/capital-injections/{capital_id}")
+async def update_capital(capital_id: str, body: CapitalIn, user: dict = Depends(require_roles("super_admin", "manager"))):
+    existing = await db.capital_injections.find_one({"id": capital_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Setoran modal tidak ditemukan")
+    if await _has_active_dividends(existing.get("investor_id")):
+        raise HTTPException(400, "Modal investor ini sudah dipakai pembagian dividen aktif. Batalkan dividen dulu sebelum edit modal.")
+    data = body.model_dump()
+    data["date"] = data.get("date") or existing.get("date") or now_iso()
+    data["updated_at"] = now_iso()
+    await db.capital_injections.update_one({"id": capital_id}, {"$set": data})
+    await db.journal_entries.delete_many({"reference": "capital_injection", "reference_id": capital_id})
+    await insert_doc("journal_entries", {
+        "date": data["date"],
+        "description": f"Setoran modal - {data.get('notes') or 'modal'}",
+        "lines": [
+            {"account": "Kas", "debit": _money(data.get("amount")), "credit": 0},
+            {"account": "Modal Disetor", "debit": 0, "credit": _money(data.get("amount"))},
+        ],
+        "reference": "capital_injection",
+        "reference_id": capital_id,
         "unit": data.get("unit", "umum"),
     })
-    return await insert_doc("capital_injections", data)
+    invalidate_finance_summary_cache()
+    await write_audit(user, "update", "capital_injection", capital_id, {"before": existing, "after": data})
+    return clean_doc(await db.capital_injections.find_one({"id": capital_id}, {"_id": 0}))
+
+
+@api.delete("/capital-injections/{capital_id}")
+async def delete_capital(capital_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    existing = await db.capital_injections.find_one({"id": capital_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Setoran modal tidak ditemukan")
+    if await _has_active_dividends(existing.get("investor_id")):
+        raise HTTPException(400, "Modal investor ini sudah dipakai pembagian dividen aktif. Batalkan dividen dulu sebelum hapus modal.")
+    await db.capital_injections.delete_one({"id": capital_id})
+    await db.journal_entries.delete_many({"reference": "capital_injection", "reference_id": capital_id})
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "capital_injection", capital_id, {"amount": existing.get("amount"), "investor_id": existing.get("investor_id")})
+    return {"ok": True, "deleted_id": capital_id}
 
 
 # ---------- Land Rental ----------
@@ -800,12 +883,108 @@ async def calc_dividends(body: DividendIn, user: dict = Depends(get_current_user
 
 @api.get("/dividends")
 async def list_dividends(user: dict = Depends(get_current_user)):
-    return await list_collection("dividends")
+    return await db.dividends.find({"status": {"$nin": ["cancelled", "void", "deleted"]}}, {"_id": 0}).sort("created_at", -1).to_list(1000)
 
 
 @api.post("/dividends")
 async def record_dividend(body: dict, user: dict = Depends(get_current_user)):
-    return await insert_doc("dividends", body)
+    # Legacy/manual record. Prefer /dividends/distribute because it creates the matching expense.
+    body["status"] = body.get("status") or "recorded"
+    doc = await insert_doc("dividends", body)
+    invalidate_finance_summary_cache()
+    return doc
+
+
+class DividendDistributeIn(BaseModel):
+    unit: str = "all"
+    month: int
+    year: int
+    total_profit: int
+    payment_method: str = "cash"
+    date: Optional[str] = None
+    notes: Optional[str] = ""
+    items: Optional[List[dict]] = None
+
+
+@api.post("/dividends/distribute")
+async def distribute_dividend(body: DividendDistributeIn, user: dict = Depends(require_roles("super_admin", "manager"))):
+    if body.total_profit <= 0:
+        raise HTTPException(400, "Laba bersih harus lebih dari 0")
+    if body.items:
+        items = [dict(x) for x in body.items if _money(x.get("share")) > 0]
+        total_dividend = sum(_money(x.get("share")) for x in items)
+    else:
+        calc = await calc_dividend_unit(DividendUnitIn(unit=body.unit, month=body.month, year=body.year, total_profit=body.total_profit), user)
+        items = [dict(x) for x in calc.get("items", []) if _money(x.get("share")) > 0]
+        total_dividend = sum(_money(x.get("share")) for x in items)
+    if not items or total_dividend <= 0:
+        raise HTTPException(400, "Tidak ada investor dengan porsi dividen")
+
+    date = body.date or now_iso()
+    div_doc = {
+        "id": gen_id(),
+        "unit": body.unit,
+        "month": body.month,
+        "year": body.year,
+        "total_profit": _money(body.total_profit),
+        "amount": total_dividend,
+        "items": items,
+        "payment_method": body.payment_method,
+        "date": date,
+        "notes": body.notes or "",
+        "status": "distributed",
+        "created_at": now_iso(),
+        "created_by": user.get("id"),
+    }
+    exp_doc = {
+        "id": gen_id(),
+        "amount": total_dividend,
+        "category": "Pembagian Dividen",
+        "unit": body.unit if body.unit != "all" else "umum",
+        "notes": body.notes or f"Dividen {body.month:02d}/{body.year}",
+        "date": date,
+        "payment_method": body.payment_method,
+        "reference": "dividend_distribution",
+        "reference_id": div_doc["id"],
+        "created_at": now_iso(),
+        "created_by": user.get("id"),
+    }
+    div_doc["expense_id"] = exp_doc["id"]
+    await db.dividends.insert_one(div_doc)
+    await db.expenses.insert_one(exp_doc)
+    await db.journal_entries.insert_one({
+        "id": gen_id(),
+        "date": date,
+        "description": f"Pembagian Dividen {body.month:02d}/{body.year}",
+        "lines": [
+            {"account": "Dividen / Prive Investor", "debit": total_dividend, "credit": 0},
+            {"account": "Kas", "debit": 0, "credit": total_dividend},
+        ],
+        "reference": "dividend_distribution",
+        "reference_id": div_doc["id"],
+        "expense_id": exp_doc["id"],
+        "unit": exp_doc["unit"],
+        "created_at": now_iso(),
+    })
+    invalidate_finance_summary_cache()
+    await write_audit(user, "create", "dividend_distribution", div_doc["id"], {"amount": total_dividend, "expense_id": exp_doc["id"]})
+    for d in (div_doc, exp_doc):
+        d.pop("_id", None)
+    return {"ok": True, "dividend": clean_doc(div_doc), "expense": clean_doc(exp_doc)}
+
+
+@api.delete("/dividends/{dividend_id}")
+async def delete_dividend(dividend_id: str, user: dict = Depends(require_roles("super_admin", "manager"))):
+    div = await db.dividends.find_one({"id": dividend_id}, {"_id": 0})
+    if not div:
+        raise HTTPException(404, "Catatan dividen tidak ditemukan")
+    exp_id = div.get("expense_id")
+    await db.expenses.delete_many({"$or": [{"id": exp_id}, {"reference": "dividend_distribution", "reference_id": dividend_id}]})
+    await db.journal_entries.delete_many({"reference": "dividend_distribution", "reference_id": dividend_id})
+    await db.dividends.delete_one({"id": dividend_id})
+    invalidate_finance_summary_cache()
+    await write_audit(user, "delete", "dividend_distribution", dividend_id, {"amount": div.get("amount"), "expense_id": exp_id})
+    return {"ok": True, "deleted_id": dividend_id, "expense_id": exp_id}
 
 
 # ---------- Inventory ----------
@@ -5795,6 +5974,15 @@ async def delete_expense(eid: str, user: dict = Depends(require_roles("super_adm
     if not exp:
         raise HTTPException(404, "Pengeluaran tidak ditemukan")
     ref = (exp.get("reference") or "").strip()
+    if ref in ("dividend_distribution", "dividend"):
+        dividend_id = exp.get("reference_id")
+        if dividend_id:
+            await db.dividends.delete_many({"id": dividend_id})
+            await db.journal_entries.delete_many({"reference": {"$in": ["dividend_distribution", "dividend"]}, "reference_id": dividend_id})
+        await db.expenses.delete_one({"id": eid})
+        invalidate_finance_summary_cache()
+        await write_audit(user, "delete", "dividend_expense", eid, {"dividend_id": dividend_id, "amount": exp.get("amount")})
+        return {"ok": True, "deleted_id": eid, "dividend_deleted": dividend_id}
     if ref and ref not in ("expense", "manual", "manual_expense"):
         raise HTTPException(400, "Pengeluaran ini berasal dari modul lain. Hapus dari modul asalnya agar laporan tetap sinkron.")
     await db.journal_entries.delete_many({"reference": "expense", "reference_id": eid})
