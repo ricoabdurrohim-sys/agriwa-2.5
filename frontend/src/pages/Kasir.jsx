@@ -45,7 +45,7 @@ export default function Kasir() {
   const [showHistory, setShowHistory] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [editTrx, setEditTrx] = useState(null);
-  const [settings, setSettings] = useState({ business_name: "", address: "", phone: "", receipt_footer: "" });
+  const [settings, setSettings] = useState({ business_name: "", address: "", phone: "", receipt_footer: "", tax_rate: 11, tax_receipt_enabled: true, tax_inclusive: true });
   const [transactionType, setTransactionType] = useState("SALE");
   const [redirectAfterReceipt, setRedirectAfterReceipt] = useState(false);
   const [bonInfo, setBonInfo] = useState(null); // {id, customer_name, amount, paid, customer_phone}
@@ -55,6 +55,10 @@ export default function Kasir() {
   const [trxMatches, setTrxMatches] = useState([]);
   const [debtSearch, setDebtSearch] = useState("");
   const [showDebtFinder, setShowDebtFinder] = useState(false);
+  const [variantPicker, setVariantPicker] = useState(null);
+  const [showCategoryManager, setShowCategoryManager] = useState(false);
+  const [posCategoryName, setPosCategoryName] = useState("");
+  const [posCategoryItems, setPosCategoryItems] = useState([]);
 
   const getBonRemaining = (d) => {
     if (!d) return 0;
@@ -185,8 +189,10 @@ export default function Kasir() {
       api.get("/orders").then(({ data }) => {
         const o = data.find((x) => x.id === orderId);
         if (o && o.items) {
-          setCart(o.items.map((it) => ({
+          setCart(o.items.map((it, idx) => ({
+            line_id: it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`,
             item_id: it.item_id, name: it.name, unit_price: it.unit_price, quantity: it.quantity, notes: it.notes || "",
+            variant_id: it.variant_id || "", variant_name: it.variant_name || "",
           })));
         }
       }).catch(() => {});
@@ -201,8 +207,10 @@ export default function Kasir() {
         setCustomerName(data.customer_name || "");
         setCustomerPhone(data.customer_phone || "");
         if (data.original_items?.length) {
-          setCart(data.original_items.map((it) => ({
+          setCart(data.original_items.map((it, idx) => ({
+            line_id: it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`,
             item_id: it.item_id, name: it.name, unit_price: it.unit_price, quantity: it.quantity, notes: it.notes || "",
+            variant_id: it.variant_id || "", variant_name: it.variant_name || "",
           })));
         }
         setIsBon(false);
@@ -254,9 +262,30 @@ export default function Kasir() {
   const unitFilteredItems = items.filter((i) => (i.business_unit || "warung") === unit);
 
   const categories = useMemo(() => {
-    const set = new Set(unitFilteredItems.map((i) => i.category));
-    return ["all", ...Array.from(set)];
+    const set = new Set(unitFilteredItems.map((i) => i.category).filter(Boolean));
+    return ["all", ...Array.from(set).sort((a, b) => String(a).localeCompare(String(b), "id", { sensitivity: "base" }))];
   }, [unitFilteredItems]);
+
+  const openCategoryManager = () => {
+    setPosCategoryName(category === "all" ? "" : category);
+    setPosCategoryItems([]);
+    setShowCategoryManager(true);
+  };
+
+  const savePosCategory = async () => {
+    const name = posCategoryName.trim();
+    if (!name) return toast.error("Nama kategori wajib diisi");
+    if (posCategoryItems.length === 0) return toast.error("Pilih minimal 1 barang untuk kategori ini");
+    try {
+      await Promise.all(posCategoryItems.map((id) => api.put(`/inventory/${id}`, { category: name })));
+      toast.success("Kategori POS disimpan dan kategori Inventori ikut berubah");
+      setShowCategoryManager(false);
+      setCategory(name);
+      await load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Gagal menyimpan kategori");
+    }
+  };
 
   const filtered = unitFilteredItems.filter((i) =>
     (category === "all" || i.category === category) &&
@@ -310,6 +339,8 @@ export default function Kasir() {
       trx.subtotal ? `${isDebtSettlement ? "Total Belanja" : "Subtotal"}: ${formatRupiah(trx.subtotal)}` : "",
       trx.discount && !isDebtSettlement ? `Diskon: -${formatRupiah(trx.discount)}` : "",
       isDebtSettlement ? `Sudah Dibayar: ${formatRupiah(trx.previous_paid || 0)}` : "",
+      !isDebtSettlement && trxType === "SALE" && trx.tax_receipt_enabled && Number(trx.tax_amount || 0) > 0 ? `DPP: ${formatRupiah(trx.taxable_amount || 0)}` : "",
+      !isDebtSettlement && trxType === "SALE" && trx.tax_receipt_enabled && Number(trx.tax_amount || 0) > 0 ? `PPN ${Number(trx.tax_rate || 0)}% ${trx.tax_inclusive ? "(termasuk)" : ""}: ${formatRupiah(trx.tax_amount || 0)}` : "",
       isDebtSettlement ? `Bayar Bon: ${formatRupiah(trx.payment_amount || 0)}` : (trxType === "SALE" ? `Total: ${formatRupiah(trx.total)}` : `Nilai HPP: ${formatRupiah(trx.cost_total || 0)}`),
       trxType === "SALE" ? `Metode: ${String(trx.payment_method || "-").toUpperCase()}` : "Pendapatan: Rp 0",
       trx.payment_method === "cash" ? `Uang Diterima: ${formatRupiah(trx.cash_received)}` : "",
@@ -331,22 +362,40 @@ export default function Kasir() {
     }
   };
 
-  const addToCart = (item) => {
+  const addVariantToCart = (item, variant = null) => {
+    const vid = variant?.id || "base";
+    const lineId = `${item.id}::${vid}`;
+    const price = Number(variant?.sell_price || item.sell_price || 0);
+    const displayName = variant ? `${item.name} (${variant.name})` : item.name;
     setCart((c) => {
-      const ex = c.find((x) => x.item_id === item.id);
-      if (ex) return c.map((x) => x.item_id === item.id ? { ...x, quantity: x.quantity + 1 } : x);
-      return [...c, { item_id: item.id, name: item.name, unit_price: item.sell_price, quantity: 1, notes: "" }];
+      const ex = c.find((x) => x.line_id === lineId);
+      if (ex) return c.map((x) => x.line_id === lineId ? { ...x, quantity: x.quantity + 1 } : x);
+      return [...c, { line_id: lineId, item_id: item.id, name: displayName, unit_price: price, quantity: 1, notes: "", variant_id: variant?.id || "", variant_name: variant?.name || "" }];
     });
+    setVariantPicker(null);
   };
 
-  const updateQty = (id, delta) => {
-    setCart((c) => c.map((x) => x.item_id === id ? { ...x, quantity: Math.max(0, x.quantity + delta) } : x).filter((x) => x.quantity > 0));
+  const addToCart = (item) => {
+    const variants = (item.variants || []).filter((v) => v && v.active !== false && v.name);
+    if (item.has_variants && variants.length > 0) {
+      setVariantPicker({ ...item, variants });
+      return;
+    }
+    addVariantToCart(item, null);
   };
 
-  const removeItem = (id) => setCart((c) => c.filter((x) => x.item_id !== id));
+  const updateQty = (lineId, delta) => {
+    setCart((c) => c.map((x) => x.line_id === lineId ? { ...x, quantity: Math.max(0, x.quantity + delta) } : x).filter((x) => x.quantity > 0));
+  };
+
+  const removeItem = (lineId) => setCart((c) => c.filter((x) => x.line_id !== lineId));
 
   const subtotal = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const total = Math.max(0, subtotal - discount - redeemDiscount);
+  const taxRate = Number(settings.tax_rate || 0);
+  const showTaxBreakdown = !!settings.tax_receipt_enabled && taxRate > 0 && transactionType === "SALE";
+  const taxAmount = showTaxBreakdown ? Math.round(total * taxRate / (100 + taxRate)) : 0;
+  const taxableAmount = showTaxBreakdown ? Math.max(0, total - taxAmount) : total;
   const bonRemaining = bonInfo ? getBonRemaining(bonInfo) : 0;
   const paymentDue = bonInfo ? bonRemaining : total;
   const cashReceivedNum = parseInt(cashReceived) || 0;
@@ -527,6 +576,7 @@ export default function Kasir() {
                 {c === "all" ? "Semua" : c}
               </button>
             ))}
+            <button onClick={openCategoryManager} data-testid="manage-pos-category-btn" className="px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap bg-amber-50 text-amber-800 border border-amber-200 hover:bg-amber-100">+ Kategori</button>
           </div>
         </div>
 
@@ -540,7 +590,7 @@ export default function Kasir() {
                 <div className="w-full h-20 bg-gradient-to-br from-emerald-50 to-amber-50 rounded-lg mb-2 flex items-center justify-center text-2xl">🍽️</div>
               )}
               <div className="text-sm font-semibold text-gray-900 mb-1 line-clamp-2">{i.name}</div>
-              <div className="text-xs text-gray-500 mb-2">{i.category}</div>
+              <div className="text-xs text-gray-500 mb-2">{i.category}{i.has_variants ? " · ada varian" : ""}</div>
               <div className="font-mono text-sm font-semibold text-[#1a6b3c]">{formatRupiah(i.sell_price)}</div>
             </button>
           ))}
@@ -563,17 +613,17 @@ export default function Kasir() {
             <div className="px-4 py-10 text-center text-gray-400 text-sm">Keranjang kosong</div>
           ) : (
             cart.map((c) => (
-              <div key={c.item_id} className="flex items-center gap-2 px-4 py-3 border-b border-gray-50 last:border-0">
+              <div key={c.line_id || c.item_id} className="flex items-center gap-2 px-4 py-3 border-b border-gray-50 last:border-0">
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium truncate">{c.name}</div>
                   <div className="font-mono text-xs text-gray-500">{formatRupiah(c.unit_price)}</div>
                 </div>
                 <div className="flex items-center gap-1">
-                  <button data-testid={`qty-minus-${c.item_id}`} onClick={() => updateQty(c.item_id, -1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Minus className="w-3.5 h-3.5 mx-auto" /></button>
+                  <button data-testid={`qty-minus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, -1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Minus className="w-3.5 h-3.5 mx-auto" /></button>
                   <span className="w-7 text-center text-sm font-semibold">{c.quantity}</span>
-                  <button data-testid={`qty-plus-${c.item_id}`} onClick={() => updateQty(c.item_id, 1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Plus className="w-3.5 h-3.5 mx-auto" /></button>
+                  <button data-testid={`qty-plus-${c.line_id || c.item_id}`} onClick={() => updateQty(c.line_id || c.item_id, 1)} className="w-7 h-7 rounded border border-gray-200 hover:bg-gray-50"><Plus className="w-3.5 h-3.5 mx-auto" /></button>
                 </div>
-                <button onClick={() => removeItem(c.item_id)} className="p-1 text-gray-400 hover:text-red-600">
+                <button onClick={() => removeItem(c.line_id || c.item_id)} className="p-1 text-gray-400 hover:text-red-600">
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -590,6 +640,12 @@ export default function Kasir() {
             <span className="text-sm text-gray-600">Diskon</span>
             <Input data-testid="discount-input" type="number" value={discount || ""} onChange={(e) => setDiscount(parseInt(e.target.value) || 0)} className="h-9 w-24 text-right font-mono" />
           </div>
+          {showTaxBreakdown && (
+            <div className="text-xs bg-emerald-50 border border-emerald-100 rounded-lg p-2 space-y-1">
+              <div className="flex justify-between"><span>DPP</span><span className="font-mono">{formatRupiah(taxableAmount)}</span></div>
+              <div className="flex justify-between"><span>PPN {taxRate}% termasuk harga</span><span className="font-mono">{formatRupiah(taxAmount)}</span></div>
+            </div>
+          )}
 
           {/* Promo Code */}
           {appliedPromo ? (
@@ -743,6 +799,51 @@ export default function Kasir() {
         </div>
       </div>
 
+      {/* Variant Picker */}
+      <Dialog open={!!variantPicker} onOpenChange={(o) => { if (!o) setVariantPicker(null); }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader><DialogTitle>Pilih Varian</DialogTitle></DialogHeader>
+          {variantPicker && <div className="space-y-2">
+            <div className="text-sm font-semibold">{variantPicker.name}</div>
+            <div className="grid grid-cols-1 gap-2">
+              {(variantPicker.variants || []).map((v) => (
+                <button key={v.id || v.name} onClick={() => addVariantToCart(variantPicker, v)} className="w-full text-left border border-gray-200 rounded-lg p-3 hover:border-[#1a6b3c] hover:bg-emerald-50">
+                  <div className="font-semibold text-sm">{v.name}</div>
+                  <div className="font-mono text-xs text-[#1a6b3c]">{formatRupiah(v.sell_price || variantPicker.sell_price)}</div>
+                </button>
+              ))}
+            </div>
+          </div>}
+        </DialogContent>
+      </Dialog>
+
+      {/* POS Category Manager */}
+      <Dialog open={showCategoryManager} onOpenChange={setShowCategoryManager}>
+        <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>Atur Kategori POS</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium text-gray-600">Nama kategori</label>
+              <Input value={posCategoryName} onChange={(e) => setPosCategoryName(e.target.value)} placeholder="Mis. Minuman Dingin / Snack / Paket Hemat" className="mt-1" />
+              <p className="text-[11px] text-gray-500 mt-1">Kategori ini langsung mengubah kategori barang di Inventori juga, jadi Kasir dan Inventori tetap sinkron.</p>
+            </div>
+            <div className="border rounded-lg divide-y divide-gray-100 max-h-72 overflow-y-auto">
+              {unitFilteredItems.map((i) => (
+                <label key={i.id} className="flex items-center gap-2 p-2 text-sm hover:bg-gray-50 cursor-pointer">
+                  <input type="checkbox" checked={posCategoryItems.includes(i.id)} onChange={(e) => setPosCategoryItems((prev) => e.target.checked ? [...prev, i.id] : prev.filter((id) => id !== i.id))} className="w-4 h-4 accent-[#1a6b3c]" />
+                  <span className="flex-1">{i.name}</span>
+                  <span className="text-[10px] text-gray-400">{i.category}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowCategoryManager(false)}>Batal</Button>
+            <Button onClick={savePosCategory} className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan Kategori</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* History / Cancel Dialog */}
       <Dialog open={showHistory} onOpenChange={setShowHistory}>
         <DialogContent className="max-w-2xl max-h-[80vh] flex flex-col">
@@ -871,6 +972,12 @@ export default function Kasir() {
                 <>
                   <div className="flex justify-between text-xs"><span>Subtotal</span><span>{formatRupiah(showReceipt.subtotal)}</span></div>
                   {showReceipt.discount > 0 && <div className="flex justify-between text-xs"><span>Diskon</span><span>-{formatRupiah(showReceipt.discount)}</span></div>}
+                  {showReceipt.tax_receipt_enabled && Number(showReceipt.tax_amount || 0) > 0 && (
+                    <>
+                      <div className="flex justify-between text-xs"><span>DPP</span><span>{formatRupiah(showReceipt.taxable_amount || 0)}</span></div>
+                      <div className="flex justify-between text-xs"><span>PPN {Number(showReceipt.tax_rate || 0)}% termasuk</span><span>{formatRupiah(showReceipt.tax_amount || 0)}</span></div>
+                    </>
+                  )}
                   <div className="flex justify-between font-semibold"><span>Total</span><span>{formatRupiah(showReceipt.total)}</span></div>
                   {showReceipt.payment_method === "cash" && (
                     <>

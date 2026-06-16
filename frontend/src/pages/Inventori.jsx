@@ -25,6 +25,7 @@ const initial = {
   name: "", category: CATEGORIES[0], unit: "pcs",
   current_stock: "", min_stock: "", cost_price: "", sell_price: "",
   business_unit: "warung", location: "", notes: "",
+  has_variants: false, variants: [],
   supplier_name: "", batch_no: "", purchase_ref: "", purchase_url: "", expiry_date: "",
 };
 
@@ -93,6 +94,21 @@ export default function Inventori() {
     ? bizUnits.map((u) => ({ code: u.code, name: u.name, color: u.color || "#1a6b3c" }))
     : FALLBACK_BIZ.map((c) => ({ code: c, name: c, color: "#1a6b3c" }));
 
+  const allCategories = useMemo(() => {
+    const set = new Set([...CATEGORIES, ...items.map((i) => i.category).filter(Boolean)]);
+    return Array.from(set).sort((a, b) => String(a).localeCompare(String(b), "id", { sensitivity: "base" }));
+  }, [items]);
+
+  const updateVariant = (idx, patch) => {
+    setForm((prev) => {
+      const rows = [...(prev.variants || [])];
+      rows[idx] = { ...rows[idx], ...patch };
+      return { ...prev, variants: rows };
+    });
+  };
+  const addVariantRow = () => setForm((prev) => ({ ...prev, has_variants: true, variants: [...(prev.variants || []), { id: `var-${Date.now()}`, name: "", sell_price: prev.sell_price || 0, active: true }] }));
+  const removeVariantRow = (idx) => setForm((prev) => ({ ...prev, variants: (prev.variants || []).filter((_, i) => i !== idx) }));
+
   const bomByOutput = useMemo(() => {
     const map = {};
     for (const b of boms) map[b.output_item_id] = b;
@@ -124,6 +140,7 @@ export default function Inventori() {
       cost_price: item.cost_price || "", sell_price: item.sell_price || "",
       location: item.location || "", supplier_name: item.last_supplier_name || "",
       current_stock: "", batch_no: "", notes: "", image_url: item.image_url || "",
+      has_variants: !!item.has_variants, variants: item.variants || [],
     });
   };
   const openBatches = async (item) => {
@@ -176,6 +193,13 @@ export default function Inventori() {
         min_stock: parseFloat(form.min_stock) || 0,
         cost_price: parseInt(form.cost_price) || 0,
         sell_price: parseInt(form.sell_price) || 0,
+        has_variants: !!form.has_variants && (form.variants || []).some((v) => String(v.name || "").trim()),
+        variants: (form.has_variants ? (form.variants || []) : []).filter((v) => String(v.name || "").trim()).map((v, idx) => ({
+          id: v.id || `var-${idx + 1}`,
+          name: String(v.name || "").trim(),
+          sell_price: parseInt(v.sell_price) || parseInt(form.sell_price) || 0,
+          active: v.active !== false,
+        })),
       };
       const same = !editing && items.find((i) => String(i.name || '').toLowerCase().trim() === String(form.name || '').toLowerCase().trim() && i.unit === form.unit && i.business_unit === form.business_unit);
       if (same && !window.confirm(`Barang "${form.name}" sudah ada. Sistem akan menambah stok ke item lama dan mencatat batch/supplier baru. Lanjut?`)) return;
@@ -345,10 +369,10 @@ export default function Inventori() {
             </div>
             <div>
               <Label>Kategori</Label>
-              <Select value={form.category} onValueChange={(v) => setForm({ ...form, category: v })}>
-                <SelectTrigger data-testid="form-category"><SelectValue /></SelectTrigger>
-                <SelectContent>{CATEGORIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
-              </Select>
+              <Input data-testid="form-category" value={form.category || ""} onChange={(e) => setForm({ ...form, category: e.target.value })} placeholder="Ketik kategori manual" />
+              <div className="flex gap-1 flex-wrap mt-1">
+                {allCategories.slice(0, 8).map(c => <button type="button" key={c} onClick={() => setForm({ ...form, category: c })} className="text-[10px] px-2 py-0.5 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-600">{c}</button>)}
+              </div>
             </div>
             <div>
               <Label>Unit Bisnis</Label>
@@ -395,6 +419,23 @@ export default function Inventori() {
             <div>
               <Label>Harga Jual (Rp)</Label>
               <Input type="number" inputMode="numeric" value={form.sell_price ?? ""} onChange={(e) => setForm({ ...form, sell_price: e.target.value })} />
+            </div>
+            <div className="col-span-2 rounded-lg border border-amber-100 bg-amber-50 p-3 space-y-2">
+              <label className="flex items-center gap-2 text-sm font-medium text-amber-900 cursor-pointer">
+                <input type="checkbox" checked={!!form.has_variants} onChange={(e) => setForm({ ...form, has_variants: e.target.checked, variants: e.target.checked && (!form.variants || form.variants.length === 0) ? [{ id: `var-${Date.now()}`, name: "", sell_price: form.sell_price || 0, active: true }] : form.variants })} className="w-4 h-4 accent-[#1a6b3c]" />
+                Produk ini punya varian POS
+              </label>
+              <p className="text-[11px] text-amber-800">Contoh: Es / Hangat, Kecil / Besar. Stok tetap memakai item utama, tetapi nama varian muncul di struk dan riwayat.</p>
+              {form.has_variants && <div className="space-y-2">
+                {(form.variants || []).map((v, idx) => (
+                  <div key={v.id || idx} className="grid grid-cols-12 gap-2 items-end">
+                    <div className="col-span-5"><Label className="text-[11px]">Nama Varian</Label><Input value={v.name || ""} onChange={(e) => updateVariant(idx, { name: e.target.value })} placeholder="Es / Hangat / Besar" /></div>
+                    <div className="col-span-5"><Label className="text-[11px]">Harga Jual</Label><Input type="number" value={v.sell_price ?? ""} onChange={(e) => updateVariant(idx, { sell_price: e.target.value })} placeholder={String(form.sell_price || 0)} /></div>
+                    <button type="button" onClick={() => removeVariantRow(idx)} className="col-span-2 h-10 rounded-md border border-red-200 text-red-600 hover:bg-red-50 text-xs">Hapus</button>
+                  </div>
+                ))}
+                <Button type="button" size="sm" variant="outline" onClick={addVariantRow}>+ Tambah Varian</Button>
+              </div>}
             </div>
           </div>
           <DialogFooter>

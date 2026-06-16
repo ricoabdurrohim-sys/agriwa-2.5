@@ -9,7 +9,7 @@ import { useAuth } from "@/context/AuthContext";
 
 export default function Pengaturan() {
   const { user, refreshUser } = useAuth();
-  const [s, setS] = useState({ tax_rate: 11 });
+  const [s, setS] = useState({ tax_rate: 11, tax_receipt_enabled: true, tax_inclusive: true });
   const [profile, setProfile] = useState({ name: "", email: "" });
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "", confirm: "" });
   const [gateways, setGateways] = useState([]);
@@ -26,7 +26,7 @@ export default function Pengaturan() {
 
   const save = async () => {
     try {
-      await api.put("/settings", { tax_rate: Number(s.tax_rate || 0) });
+      await api.put("/settings", { tax_rate: Number(s.tax_rate || 0), tax_receipt_enabled: !!s.tax_receipt_enabled, tax_inclusive: !!s.tax_inclusive });
       toast.success("Pengaturan umum disimpan");
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Gagal menyimpan pengaturan");
@@ -105,6 +105,14 @@ export default function Pengaturan() {
           <div>Nama usaha, alamat, nomor telepon, footer, dan catatan struk hanya diatur dari menu <b>Lini Bisnis</b>. Pengaturan global struk dihapus agar struk Warung, Pupuk, Kebun Anggur, dan unit lain tidak saling menimpa.</div>
         </div>
         <div><Label>Pajak PPN (%)</Label><Input type="number" value={s.tax_rate || 0} onChange={(e) => setS({ ...s, tax_rate: parseFloat(e.target.value) })} /></div>
+        <label className="flex items-start gap-2 text-sm cursor-pointer rounded-lg border border-gray-100 p-3 bg-gray-50">
+          <input type="checkbox" checked={!!s.tax_receipt_enabled} onChange={(e) => setS({ ...s, tax_receipt_enabled: e.target.checked })} className="w-4 h-4 mt-0.5 accent-[#1a6b3c]" />
+          <span><b>Tampilkan rincian pajak di struk</b><br/><span className="text-xs text-gray-500">Tidak mengubah total bayar. Hanya memecah total menjadi DPP + PPN di struk.</span></span>
+        </label>
+        <label className="flex items-start gap-2 text-sm cursor-pointer rounded-lg border border-gray-100 p-3 bg-gray-50">
+          <input type="checkbox" checked={!!s.tax_inclusive} onChange={(e) => setS({ ...s, tax_inclusive: e.target.checked })} className="w-4 h-4 mt-0.5 accent-[#1a6b3c]" />
+          <span><b>Harga jual sudah termasuk pajak</b><br/><span className="text-xs text-gray-500">Cocok untuk kasus kamu: harga jual di Inventori/Kasir sudah final termasuk pajak.</span></span>
+        </label>
         <Button onClick={save} data-testid="save-settings-btn" className="bg-[#1a6b3c] hover:bg-[#14522d]">Simpan Pengaturan Umum</Button>
       </div>
 

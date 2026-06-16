@@ -1000,6 +1000,8 @@ class InventoryIn(BaseModel):
     location: Optional[str] = ""
     notes: Optional[str] = ""
     image_url: Optional[str] = ""
+    has_variants: bool = False
+    variants: List[dict] = []  # POS variants: panas/es, kecil/besar, dll. Stok tetap memakai item utama.
     supplier_name: Optional[str] = ""
     batch_no: Optional[str] = ""
     purchase_ref: Optional[str] = ""
@@ -1226,9 +1228,29 @@ async def list_inventory(user: dict = Depends(get_current_user), include_batches
     return items
 
 
+def _sanitize_pos_variants(rows):
+    clean = []
+    for idx, v in enumerate(rows or []):
+        if not isinstance(v, dict):
+            continue
+        name = str(v.get("name") or v.get("label") or "").strip()
+        if not name:
+            continue
+        price = int(float(v.get("sell_price") or v.get("price") or 0))
+        clean.append({
+            "id": str(v.get("id") or f"var-{idx+1}"),
+            "name": name,
+            "sell_price": max(0, price),
+            "active": False if v.get("active") is False else True,
+        })
+    return clean
+
+
 @api.post("/inventory")
 async def create_inventory(body: InventoryIn, user: dict = Depends(get_current_user)):
     data = body.model_dump()
+    data["variants"] = _sanitize_pos_variants(data.get("variants") or [])
+    data["has_variants"] = bool(data.get("has_variants") and data["variants"])
     name_key = _inventory_name_key(data.get("name"))
     # v2.5.7: jika nama+unit+unit bisnis sama, jangan bikin duplikat.
     # Tambahkan stok ke item lama dan simpan batch/supplier agar bisa trace retur.
@@ -1253,6 +1275,8 @@ async def create_inventory(body: InventoryIn, user: dict = Depends(get_current_u
             "location": data.get("location", existing.get("location", "")),
             "notes": data.get("notes", existing.get("notes", "")),
             "image_url": data.get("image_url", existing.get("image_url", "")),
+            "has_variants": data.get("has_variants", existing.get("has_variants", False)),
+            "variants": data.get("variants", existing.get("variants", [])),
             "updated_at": now_iso(),
             "name_key": name_key,
         }
@@ -1272,6 +1296,9 @@ async def create_inventory(body: InventoryIn, user: dict = Depends(get_current_u
 async def update_inventory(item_id: str, body: dict, user: dict = Depends(get_current_user)):
     body.pop("_id", None)
     body.pop("id", None)
+    if "variants" in body:
+        body["variants"] = _sanitize_pos_variants(body.get("variants") or [])
+        body["has_variants"] = bool(body.get("has_variants") and body["variants"])
     if body.get("name"):
         body["name_key"] = _inventory_name_key(body.get("name"))
     body["updated_at"] = now_iso()
@@ -1463,6 +1490,8 @@ class OrderItemIn(BaseModel):
     quantity: int
     unit_price: int
     notes: Optional[str] = ""
+    variant_id: Optional[str] = ""
+    variant_name: Optional[str] = ""
 
 
 class OrderIn(BaseModel):
@@ -1582,6 +1611,19 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
     )
     change = (cash_received - sale_total) if (is_sale and body.payment_method == "cash") else 0
     receipt_snapshot = await build_receipt_snapshot(body.unit)
+    settings_doc = await db.settings.find_one({}, {"_id": 0}) or {}
+    tax_rate = float(settings_doc.get("tax_rate") or 0)
+    tax_receipt_enabled = bool(settings_doc.get("tax_receipt_enabled", True))
+    tax_inclusive = bool(settings_doc.get("tax_inclusive", True))
+    tax_amount = 0
+    taxable_amount = sale_total
+    if is_sale and tax_receipt_enabled and tax_rate > 0:
+        if tax_inclusive:
+            tax_amount = int(round(sale_total * tax_rate / (100 + tax_rate)))
+            taxable_amount = max(0, sale_total - tax_amount)
+        else:
+            tax_amount = int(round(sale_total * tax_rate / 100))
+            taxable_amount = sale_total
 
     doc = {
         "id": gen_id(),
@@ -1594,6 +1636,11 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
         "subtotal": retail_subtotal,
         "discount": discount,
         "total": sale_total if is_sale else 0,
+        "tax_rate": tax_rate if is_sale else 0,
+        "tax_receipt_enabled": tax_receipt_enabled if is_sale else False,
+        "tax_inclusive": tax_inclusive if is_sale else True,
+        "tax_amount": tax_amount if is_sale else 0,
+        "taxable_amount": taxable_amount if is_sale else 0,
         "cost_total": int(cost_total),
         "transaction_type": trx_type,
         "payment_method": body.payment_method if is_sale else trx_type.lower(),
@@ -3586,6 +3633,8 @@ async def get_settings(user: dict = Depends(get_current_user)):
         "phone": "",
         "currency": "Rp",
         "tax_rate": 11,
+        "tax_receipt_enabled": True,
+        "tax_inclusive": True,
     }
 
 
