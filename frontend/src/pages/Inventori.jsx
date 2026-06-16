@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer, QrCode } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { exportInventoryXLSX, exportInventoryPDF } from "@/lib/exports";
@@ -11,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { printViaIframe } from "@/lib/safePrint";
+import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
 
 const CATEGORIES = [
   "Bahan Baku Warung", "Bahan Baku Pupuk", "Bahan Baku Kebun",
@@ -27,6 +29,9 @@ const initial = {
 };
 
 export default function Inventori() {
+  const nav = useNavigate();
+  const [params] = useSearchParams();
+  const batchLookup = params.get("batch") || "";
   const [items, setItems] = useState([]);
   const [boms, setBoms] = useState([]);
   const [bizUnits, setBizUnits] = useState([]);
@@ -56,6 +61,20 @@ export default function Inventori() {
     } catch (err) { /* ignore */ }
   };
   useEffect(() => { load(); loadBoms(); loadBizUnits(); }, []);
+
+  useEffect(() => {
+    if (!batchLookup) return;
+    api.get(`/scan/resolve?code=${encodeURIComponent("aw:batch:" + batchLookup)}`).then(({ data }) => {
+      const itemId = data?.item?.item_id;
+      const batchNo = data?.item?.batch_no || batchLookup;
+      if (!itemId) return;
+      api.get(`/inventory/${itemId}/batches`).then((res) => {
+        setBatchRows(res.data);
+        setBatchItem({ id: itemId, name: data.item.item_name || data.item.name || "Batch" });
+        setSearch(batchNo);
+      });
+    }).catch(() => toast.error("Batch dari scan tidak ditemukan"));
+  }, [batchLookup]);
 
   useEffect(() => {
     const h = (e) => {
@@ -112,13 +131,31 @@ export default function Inventori() {
   };
 
   const printBatchLabel = (b) => {
-    const target = `${window.location.origin}/inventori?batch=${encodeURIComponent(b.batch_no || b.id)}`;
+    const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:batch:' + (b.batch_no || b.id))}`;
     const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(target)}`;
     printViaIframe({
       title: `Label Batch ${b.batch_no}`,
       css: "body{font-family:monospace;font-size:12px;padding:8px;width:58mm}.center{text-align:center}.big{font-weight:700;font-size:14px}.qr{width:92px;height:92px}.small{font-size:10px}",
       bodyHtml: `<div class='center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><img class='qr' src='${qr}'/><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
     });
+  };
+  const printBatchLabelThermal = async (b) => {
+    try {
+      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung. Gunakan Chrome/Edge dengan printer Bluetooth.");
+      const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:batch:' + (b.batch_no || b.id))}`;
+      await printThermalLabel({
+        title: b.item_name || batchItem?.name || 'ITEM',
+        subtitle: `Batch ${b.batch_no || '-'}`,
+        lines: [
+          `Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}`,
+          b.supplier_name ? `Supplier: ${b.supplier_name}` : '',
+          b.purchase_date ? `Tanggal: ${new Date(b.purchase_date).toLocaleDateString('id-ID')}` : '',
+        ].filter(Boolean),
+        qrData: target,
+        footer: 'AgriWarung Batch'
+      });
+      toast.success("Label batch dikirim ke printer thermal");
+    } catch (e) { toast.error(e?.message || "Gagal print thermal"); }
   };
   const openEdit = (item) => {
     setEditing(item);
@@ -183,6 +220,9 @@ export default function Inventori() {
           <p className="text-sm text-gray-500 mt-0.5">{items.length} barang · {lowCount} stok menipis</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button data-testid="scan-inventory-btn" variant="outline" onClick={() => nav('/scan?mode=inventory')}>
+            <QrCode className="w-4 h-4 mr-1.5" /> Scan QR
+          </Button>
           <Button data-testid="add-inventory-btn" onClick={openNew} className="bg-[#1a6b3c] hover:bg-[#14522d]">
             <Plus className="w-4 h-4 mr-1.5" /> Barang Baru
           </Button>
@@ -377,7 +417,7 @@ export default function Inventori() {
                 <div><div className="text-[10px] text-gray-500 uppercase">Sisa</div><div className="font-mono font-bold text-emerald-700">{Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} {b.unit}</div></div>
                 <div className="sm:col-span-4 flex items-center justify-between gap-2 text-xs text-gray-500">
                   <div>{b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''} {b.purchase_ref && `· Ref ${b.purchase_ref}`} {b.purchase_url && <a className="text-blue-600 underline" href={b.purchase_url} target="_blank" rel="noreferrer">· Link</a>} {b.notes && `· ${b.notes}`}</div>
-                  <Button size="sm" variant="outline" onClick={() => printBatchLabel(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Print Label</Button>
+                  <div className="flex gap-1"><Button size="sm" variant="outline" onClick={() => printBatchLabel(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Browser</Button><Button size="sm" onClick={() => printBatchLabelThermal(b)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><Printer className="w-3.5 h-3.5 mr-1" /> Thermal</Button></div>
                 </div>
               </div>
             ))}

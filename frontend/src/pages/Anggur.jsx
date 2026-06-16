@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ClipboardList, Edit2, FileText, Grape, Leaf, MapPin, Plus, Printer, Sprout, Trash2, Wallet, Wheat } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
 import { printViaIframe } from "@/lib/safePrint";
+import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,6 +22,9 @@ const initAct = { plot_id: "", activity_type: "perawatan", labor_hours: 0, cost:
 const initInput = { plot_id: "", item_id: "", quantity: 0, purpose: "Perawatan kebun", notes: "" };
 
 export default function Anggur() {
+  const [params] = useSearchParams();
+  const focusHarvest = params.get("harvest") || "";
+  const focusActivity = params.get("activity") || "";
   const [plots, setPlots] = useState([]);
   const [harvests, setHarvests] = useState([]);
   const [customers, setCustomers] = useState([]);
@@ -34,6 +39,7 @@ export default function Anggur() {
   const [showAct, setShowAct] = useState(false);
   const [showInput, setShowInput] = useState(false);
   const [editPlot, setEditPlot] = useState(null);
+  const [editActivity, setEditActivity] = useState(null);
   const [plotForm, setPlotForm] = useState(initPlot);
   const [harvForm, setHarvForm] = useState(initHarv);
   const [custForm, setCustForm] = useState(initCust);
@@ -92,10 +98,13 @@ export default function Anggur() {
     if (!window.confirm("Hapus catatan panen ini? Stok gudang akan dikurangi kembali.")) return;
     await api.delete(`/vineyard/harvests/${h.id}`); load(); toast.success("Panen dihapus dan stok dibalik");
   };
+  const openEditActivity = (a) => { setEditActivity(a); setActForm({ ...initAct, ...a }); setShowAct(true); };
   const saveActivity = async () => {
     if (!actForm.plot_id) return toast.error("Pilih plot");
-    await api.post("/vineyard/activities", { ...actForm, labor_hours: parseFloat(actForm.labor_hours) || 0, cost: parseInt(actForm.cost) || 0 });
-    setActForm(initAct); setShowAct(false); load(); toast.success("Aktivitas kebun dicatat");
+    const payload = { ...actForm, labor_hours: parseFloat(actForm.labor_hours) || 0, cost: parseInt(actForm.cost) || 0 };
+    if (editActivity) await api.put(`/vineyard/activities/${editActivity.id}`, payload);
+    else await api.post("/vineyard/activities", payload);
+    setActForm(initAct); setEditActivity(null); setShowAct(false); load(); toast.success(editActivity ? "Aktivitas diperbarui" : "Aktivitas kebun dicatat");
   };
   const deleteActivity = async (a) => {
     if (!window.confirm("Hapus aktivitas kebun ini?")) return;
@@ -133,6 +142,22 @@ export default function Anggur() {
       d.innerHTML = `<h2>INVOICE KEBUN</h2><p>No: ${inv.invoice_no}</p><p>Pelanggan: ${inv.customer_name || "-"}</p><hr/>${(inv.items||[]).map(it=>`<div class='r'><span>${it.name} ${it.quantity}x</span><b>${formatRupiah(it.quantity*it.unit_price)}</b></div>`).join("")}<h3>Total: ${formatRupiah(inv.total)}</h3><p>Dibayar: ${formatRupiah(inv.paid || 0)}</p><p>Sisa: ${formatRupiah(inv.total - (inv.paid || 0))}</p>`;
       return d;
     }});
+  };
+  const printFarmActivityThermal = async (a) => {
+    try {
+      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung");
+      const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:activity:' + a.id)}`;
+      await printThermalLabel({ title: 'Aktivitas Kebun', subtitle: a.plot_name || 'Plot', lines: [`Jenis: ${a.activity_type}`, `Tanggal: ${formatDate(a.date)}`, `Biaya: ${formatRupiah(a.cost || 0)}`], qrData: target, footer: 'AgriWarung Kebun' });
+      toast.success('Label aktivitas dikirim ke printer thermal');
+    } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
+  };
+  const printHarvestThermal = async (h) => {
+    try {
+      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung");
+      const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:harvest:' + h.id)}`;
+      await printThermalLabel({ title: h.inventory_item_name || 'Panen', subtitle: `Grade ${h.quality_grade || '-'}`, lines: [`Jumlah: ${h.quantity_kg} kg`, `Tanggal: ${formatDate(h.date)}`, h.batch_no ? `Batch: ${h.batch_no}` : ''], qrData: target, footer: 'AgriWarung Panen' });
+      toast.success('Label panen dikirim ke printer thermal');
+    } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
   };
 
   return (
@@ -180,7 +205,7 @@ export default function Anggur() {
 
         <TabsContent value="activities" className="p-4 space-y-3">
           <Button onClick={() => setShowAct(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><ClipboardList className="w-4 h-4 mr-1.5" /> Catat Aktivitas</Button>
-          <List rows={activities} empty="Belum ada aktivitas" render={(a) => <Row key={a.id} icon={<Leaf />} title={`${a.plot_name || 'Plot'} · ${a.activity_type}`} subtitle={`${formatDate(a.date)} · ${a.labor_hours || 0} jam · ${formatRupiah(a.cost || 0)}`} right={<button onClick={() => deleteActivity(a)} className="text-red-600"><Trash2 className="w-4 h-4" /></button>} />} />
+          <List rows={activities} empty="Belum ada aktivitas" render={(a) => <Row key={a.id} active={focusActivity === a.id} icon={<Leaf />} title={`${a.plot_name || 'Plot'} · ${a.activity_type}`} subtitle={`${formatDate(a.date)} · ${a.labor_hours || 0} jam · ${formatRupiah(a.cost || 0)}`} right={<div className="flex gap-2"><button onClick={() => printFarmActivityThermal(a)} className="text-gray-600"><Printer className="w-4 h-4" /></button><button onClick={() => openEditActivity(a)} className="text-[#1a6b3c]"><Edit2 className="w-4 h-4" /></button><button onClick={() => deleteActivity(a)} className="text-red-600"><Trash2 className="w-4 h-4" /></button></div>} />} />
         </TabsContent>
 
         <TabsContent value="inputs" className="p-4 space-y-3">
@@ -190,7 +215,7 @@ export default function Anggur() {
 
         <TabsContent value="harvests" className="p-4 space-y-3">
           <Button disabled={plots.length === 0} onClick={() => setShowHarv(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><Wheat className="w-4 h-4 mr-1.5" /> Catat Panen</Button>
-          <List rows={harvests} empty="Belum ada panen" render={(h) => <Row key={h.id} icon={<Grape />} title={`${h.plot_name || plots.find(x=>x.id===h.plot_id)?.name || 'Plot'} · ${h.quantity_kg} kg`} subtitle={`${formatDate(h.date)} · Kualitas ${h.quality_grade} · masuk: ${h.inventory_item_name || 'Inventori Panen'}`} right={<button onClick={() => deleteHarvest(h)} className="text-red-600"><Trash2 className="w-4 h-4" /></button>} />} />
+          <List rows={harvests} empty="Belum ada panen" render={(h) => <Row key={h.id} active={focusHarvest === h.id} icon={<Grape />} title={`${h.plot_name || plots.find(x=>x.id===h.plot_id)?.name || 'Plot'} · ${h.quantity_kg} kg`} subtitle={`${formatDate(h.date)} · Kualitas ${h.quality_grade} · masuk: ${h.inventory_item_name || 'Inventori Panen'}`} right={<div className="flex gap-2"><button onClick={() => printHarvestThermal(h)} className="text-gray-600"><Printer className="w-4 h-4" /></button><button onClick={() => deleteHarvest(h)} className="text-red-600"><Trash2 className="w-4 h-4" /></button></div>} />} />
         </TabsContent>
 
         <TabsContent value="b2b" className="p-4 space-y-3">
@@ -236,7 +261,7 @@ export default function Anggur() {
         <div className="text-xs bg-blue-50 border border-blue-100 text-blue-800 rounded-lg p-2">Kosongkan item inventori agar sistem membuat/memilih item otomatis: <b>{harvForm.variety || 'Nama Varietas'} Grade {harvForm.quality_grade}</b>. Batch juga dibuat otomatis dengan format singkatan + tanggal + urutan.</div>
         <SelectField label="Masukkan ke Item Inventori (opsional, kosong = otomatis)" value={harvForm.inventory_item_id || 'auto'} onChange={(v)=>setHarvForm({...harvForm,inventory_item_id:v === 'auto' ? '' : v})} items={[{value:'auto',label:'Otomatis sesuai varietas + grade'},...grapeItems.map(i=>({value:i.id,label:`${i.name} (${i.current_stock || 0} ${i.unit})`}))]}/><DialogFooter><Button variant="outline" onClick={()=>setShowHarv(false)}>Batal</Button><Button onClick={saveHarv}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={showAct} onOpenChange={setShowAct}><DialogContent><DialogHeader><DialogTitle>Aktivitas Kebun</DialogTitle></DialogHeader><SelectField label="Plot" value={actForm.plot_id} onChange={(v)=>setActForm({...actForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><SelectField label="Jenis" value={actForm.activity_type} onChange={(v)=>setActForm({...actForm,activity_type:v})} items={['pemangkasan','pemupukan','penyiraman','pengendalian hama','panen persiapan','perawatan'].map(x=>({value:x,label:x}))}/><Field label="Jam Kerja" type="number" value={actForm.labor_hours || ''} onChange={(v)=>setActForm({...actForm,labor_hours:v})}/><Field label="Biaya" type="number" value={actForm.cost || ''} onChange={(v)=>setActForm({...actForm,cost:v})}/><Label>Catatan</Label><Textarea value={actForm.notes} onChange={(e)=>setActForm({...actForm,notes:e.target.value})}/><DialogFooter><Button variant="outline" onClick={()=>setShowAct(false)}>Batal</Button><Button onClick={saveActivity}>Simpan</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={showAct} onOpenChange={(o)=>{setShowAct(o); if(!o){setEditActivity(null); setActForm(initAct);}}}><DialogContent><DialogHeader><DialogTitle>{editActivity ? "Edit Aktivitas Kebun" : "Aktivitas Kebun"}</DialogTitle></DialogHeader><SelectField label="Plot" value={actForm.plot_id} onChange={(v)=>setActForm({...actForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><SelectField label="Jenis" value={actForm.activity_type} onChange={(v)=>setActForm({...actForm,activity_type:v})} items={['pemangkasan','pemupukan','penyiraman','pengendalian hama','panen persiapan','perawatan'].map(x=>({value:x,label:x}))}/><Field label="Jam Kerja" type="number" value={actForm.labor_hours || ''} onChange={(v)=>setActForm({...actForm,labor_hours:v})}/><Field label="Biaya" type="number" value={actForm.cost || ''} onChange={(v)=>setActForm({...actForm,cost:v})}/><Label>Catatan</Label><Textarea value={actForm.notes} onChange={(e)=>setActForm({...actForm,notes:e.target.value})}/><DialogFooter><Button variant="outline" onClick={()=>setShowAct(false)}>Batal</Button><Button onClick={saveActivity}>{editActivity ? "Update" : "Simpan"}</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={showInput} onOpenChange={setShowInput}><DialogContent><DialogHeader><DialogTitle>Pemakaian Input Kebun</DialogTitle></DialogHeader><SelectField label="Plot" value={inputForm.plot_id} onChange={(v)=>setInputForm({...inputForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><SelectField label="Item Inventori" value={inputForm.item_id} onChange={(v)=>setInputForm({...inputForm,item_id:v})} items={inputItems.map(i=>({value:i.id,label:`${i.name} · stok ${i.current_stock || 0} ${i.unit}`}))}/><Field label="Jumlah" type="number" value={inputForm.quantity || ''} onChange={(v)=>setInputForm({...inputForm,quantity:v})}/><Field label="Keperluan" value={inputForm.purpose} onChange={(v)=>setInputForm({...inputForm,purpose:v})}/><DialogFooter><Button variant="outline" onClick={()=>setShowInput(false)}>Batal</Button><Button onClick={saveInputUsage}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 
@@ -250,6 +275,6 @@ export default function Anggur() {
 function Summary({ title, value, icon }) { return <div className="bg-white border rounded-xl p-4"><div className="text-xs text-gray-500">{title}</div><div className="flex items-center justify-between mt-1"><div className="font-bold text-lg">{value}</div><div className="w-9 h-9 rounded-lg bg-emerald-50 text-emerald-700 flex items-center justify-center">{React.cloneElement(icon,{className:'w-5 h-5'})}</div></div></div>; }
 function Empty({ text }) { return <div className="col-span-full text-center py-6 text-gray-400 text-sm">{text}</div>; }
 function List({ rows, empty, render }) { return <div className="divide-y divide-gray-100">{rows.length === 0 ? <div className="text-center py-6 text-gray-400 text-sm">{empty}</div> : rows.map(render)}</div>; }
-function Row({ icon, title, subtitle, right, badge }) { return <div className="flex items-center gap-3 py-3"><div className="p-2 bg-purple-50 rounded-lg text-purple-700">{React.cloneElement(icon,{className:'w-4 h-4'})}</div><div className="flex-1"><div className="text-sm font-semibold flex items-center gap-2">{title}{badge}</div><div className="text-xs text-gray-500">{subtitle}</div></div>{right}</div>; }
+function Row({ icon, title, subtitle, right, badge, active }) { return <div className={`flex items-center gap-3 py-3 ${active ? "bg-emerald-50 ring-1 ring-emerald-200 rounded-lg px-2" : ""}`}><div className="p-2 bg-purple-50 rounded-lg text-purple-700">{React.cloneElement(icon,{className:'w-4 h-4'})}</div><div className="flex-1"><div className="text-sm font-semibold flex items-center gap-2">{title}{badge}</div><div className="text-xs text-gray-500">{subtitle}</div></div>{right}</div>; }
 function Field({ label, value, onChange, type='text' }) { return <div><Label>{label}</Label><Input type={type} value={value} onChange={(e)=>onChange(e.target.value)} /></div>; }
 function SelectField({ label, value, onChange, items }) { return <div><Label>{label}</Label><Select value={value} onValueChange={onChange}><SelectTrigger><SelectValue placeholder="Pilih" /></SelectTrigger><SelectContent>{items.map((i)=><SelectItem key={i.value} value={i.value}>{i.label}</SelectItem>)}</SelectContent></Select></div>; }

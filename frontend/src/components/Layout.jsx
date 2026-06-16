@@ -6,7 +6,7 @@ import {
   HelpCircle, Menu, LogOut, Bell, ChefHat, Beaker, Truck,
   Briefcase, ClipboardCheck, Building2, Sparkles, Tag, Layers,
   Shield, MessageCircle, Activity, Crown, Building, Eye, EyeOff, Sliders, Check,
-  Package,
+  Package, ScanLine,
 } from "lucide-react";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
@@ -24,6 +24,7 @@ const mainNav = [
 const allModules = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, group: "Ringkasan", essential: true },
   { to: "/notifications", label: "Notifikasi", icon: MessageCircle, group: "Ringkasan" },
+  { to: "/scan", label: "Pintasan Scan", icon: ScanLine, group: "Ringkasan" },
   { to: "/onboarding", label: "Setup Wizard", icon: Sparkles, group: "Ringkasan" },
 
   { to: "/warung", label: "Warung & Meja", icon: UtensilsCrossed, group: "Operasional", essential: true },
@@ -35,7 +36,7 @@ const allModules = [
   { to: "/inventori", label: "Inventori & Gudang", icon: Warehouse, group: "Stok & Produksi", essential: true },
   { to: "/opname", label: "Stock Opname", icon: ClipboardCheck, group: "Stok & Produksi" },
   { to: "/bom", label: "Resep / BOM", icon: Package, group: "Stok & Produksi" },
-  { to: "/pupuk", label: "Produksi Pupuk", icon: Beaker, group: "Stok & Produksi" },
+  { to: "/pupuk", label: "Produksi", icon: Beaker, group: "Stok & Produksi" },
   { to: "/kebun", label: "Kebun & B2B", icon: Grape, group: "Stok & Produksi" },
   { to: "/peternakan", label: "Peternakan", icon: Activity, group: "Stok & Produksi" },
 
@@ -214,6 +215,7 @@ export default function Layout() {
               <span className={`w-1.5 h-1.5 rounded-full ${wsStatus === "connected" ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`} />
               {wsStatus === "connected" ? "Live · Sinkron" : "Menyambung..."}
             </div>
+            <NavLink to="/scan" className="p-2 rounded-md hover:bg-gray-100 relative" data-testid="scan-shortcut-btn"><ScanLine className="w-5 h-5 text-gray-700" /></NavLink>
             <NavLink to="/notifications" className="p-2 rounded-md hover:bg-gray-100 relative" data-testid="notifications-btn"><Bell className="w-5 h-5 text-gray-700" /></NavLink>
           </div>
         </div>

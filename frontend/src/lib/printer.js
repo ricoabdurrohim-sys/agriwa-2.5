@@ -103,6 +103,65 @@ export async function printReceipt(receipt, opts = {}) {
   }
 }
 
+
+function escposQr(data, size = 5) {
+  const payload = strBytes(String(data || ""));
+  const storeLen = payload.length + 3;
+  const pL = storeLen % 256;
+  const pH = Math.floor(storeLen / 256);
+  return concat(
+    // QR model 2
+    bytes(GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00),
+    // module size
+    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.max(3, Math.min(8, size))),
+    // correction level M
+    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31),
+    // store data
+    bytes(GS, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30),
+    payload,
+    // print
+    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30)
+  );
+}
+
+async function writeEscPos(data) {
+  let printer = window.__awPrinter;
+  if (!printer?.characteristic) {
+    await connectPrinter();
+    printer = window.__awPrinter;
+  }
+  const chunkSize = 100;
+  for (let i = 0; i < data.length; i += chunkSize) {
+    const chunk = data.slice(i, i + chunkSize);
+    await printer.characteristic.writeValueWithoutResponse(chunk);
+    await new Promise(r => setTimeout(r, 30));
+  }
+}
+
+export async function printThermalLabel({ title = "LABEL", subtitle = "", lines = [], qrData = "", footer = "" } = {}) {
+  const safeLines = Array.isArray(lines) ? lines : [];
+  const cmds = [];
+  cmds.push(bytes(ESC, 0x40));
+  cmds.push(bytes(ESC, 0x61, 0x01));
+  cmds.push(bytes(GS, 0x21, 0x11));
+  cmds.push(strBytes(String(title || "LABEL").slice(0, 32).toUpperCase() + "\n"));
+  cmds.push(bytes(GS, 0x21, 0x00));
+  if (subtitle) cmds.push(strBytes(String(subtitle).slice(0, 42) + "\n"));
+  cmds.push(strBytes("--------------------------------\n"));
+  cmds.push(bytes(ESC, 0x61, 0x00));
+  for (const line of safeLines) cmds.push(strBytes(String(line || "").slice(0, 42) + "\n"));
+  if (qrData) {
+    cmds.push(strBytes("--------------------------------\n"));
+    cmds.push(bytes(ESC, 0x61, 0x01));
+    cmds.push(escposQr(qrData, 5));
+    cmds.push(strBytes("Scan untuk cek detail\n"));
+  }
+  if (footer) cmds.push(strBytes(String(footer).slice(0, 42) + "\n"));
+  cmds.push(strBytes("\n\n"));
+  cmds.push(bytes(GS, 0x56, 0x00));
+  await writeEscPos(concat(...cmds));
+}
+
 function formatRp(n) {
   const abs = Math.abs(Math.round(n));
   return "Rp" + abs.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");

@@ -33,6 +33,7 @@ import Members from "@/pages/Members";
 import AuditLog from "@/pages/AuditLog";
 import PublicOrder from "@/pages/PublicOrder";
 import AuthCallback from "@/pages/AuthCallback";
+import Scan from "@/pages/Scan";
 
 function AppRouter() {
   // Synchronously route to AuthCallback if URL hash contains a session_id from Emergent OAuth
@@ -48,6 +49,7 @@ function AppRouter() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/warung" element={<Warung />} />
         <Route path="/kasir" element={<Kasir />} />
+        <Route path="/scan" element={<Scan />} />
         <Route path="/inventori" element={<Inventori />} />
         <Route path="/bom" element={<BOM />} />
         <Route path="/keuangan" element={<Keuangan />} />

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X } from "lucide-react";
+import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
 import { printViaIframe } from "@/lib/safePrint";
@@ -52,6 +52,7 @@ export default function Kasir() {
   const [bizUnits, setBizUnits] = useState([]);
   const [unit, setUnit] = useState("warung");
   const [debts, setDebts] = useState([]);
+  const [trxMatches, setTrxMatches] = useState([]);
   const [debtSearch, setDebtSearch] = useState("");
   const [showDebtFinder, setShowDebtFinder] = useState(false);
 
@@ -111,7 +112,7 @@ export default function Kasir() {
 
   const load = async () => {
     const { data } = await api.get("/inventory");
-    setItems(data.filter((i) => i.sell_price > 0));
+    setItems(data.filter((i) => !String(i.category || '').toLowerCase().includes('bahan baku')));
   };
   const loadBizUnits = async () => {
     try {
@@ -127,13 +128,31 @@ export default function Kasir() {
   };
   const loadDebts = async (q = debtSearch) => {
     try {
-      const { data } = await api.get(`/customer-debts/search?q=${encodeURIComponent(q || "")}`);
-      setDebts(data);
+      const query = encodeURIComponent(q || "");
+      const [debtRes, trxRes] = await Promise.all([
+        api.get(`/customer-debts/search?q=${query}`),
+        api.get(`/transactions/search?q=${query}&limit=30`),
+      ]);
+      setDebts(debtRes.data || []);
+      setTrxMatches(trxRes.data || []);
     } catch (err) {
-      toast.error("Gagal memuat daftar bon");
+      toast.error("Gagal memuat transaksi/bon");
     }
   };
   const openDebtFinder = () => { setShowDebtFinder((v) => !v); loadDebts(); };
+  const openTransactionResult = async (trx) => {
+    try {
+      if ((Number(trx.debt_amount) || 0) > 0 || String(trx.payment_status || '').toUpperCase().includes('PARTIAL')) {
+        const { data } = await api.get(`/customer-debts/search?q=${encodeURIComponent(trx.trx_no || trx.id || '')}`);
+        if (data?.length) return startDebtSettlement(data[0]);
+      }
+      const { data } = await api.get(`/transactions/${trx.id}`);
+      setShowReceipt(data);
+      setShowDebtFinder(false);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Gagal membuka transaksi");
+    }
+  };
   const startDebtSettlement = async (d) => {
     try {
       const { data } = await api.get(`/customer-debts/${d.id}`);
@@ -390,7 +409,10 @@ export default function Kasir() {
           </div>
           <div className="flex gap-2">
             <Button data-testid="open-debt-finder-btn" onClick={openDebtFinder} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">
-              <Search className="w-4 h-4 mr-1.5" /> Cari Bon
+              <Search className="w-4 h-4 mr-1.5" /> Cari Transaksi
+            </Button>
+            <Button data-testid="scan-transaction-btn" onClick={() => nav('/scan?mode=transaction')} variant="outline" className="border-emerald-300 text-emerald-800 hover:bg-emerald-50">
+              <ScanLine className="w-4 h-4 mr-1.5" /> Scan QR
             </Button>
             <Button data-testid="open-history-btn" onClick={() => { setShowHistory(true); loadRecent(); }} variant="outline" className="border-gray-300">
               <ReceiptIcon className="w-4 h-4 mr-1.5" /> Riwayat / Batal
@@ -402,25 +424,38 @@ export default function Kasir() {
           <div className="bg-white rounded-xl border border-amber-200 p-3 space-y-3 shadow-sm">
             <div className="flex items-center justify-between gap-2">
               <div>
-                <div className="text-sm font-semibold text-amber-900">Cari Bon Pelanggan</div>
-                <div className="text-xs text-amber-700">Cari nama/no HP, lalu lanjutkan pelunasan langsung dari Kasir.</div>
+                <div className="text-sm font-semibold text-amber-900">Cari Transaksi / Bon</div>
+                <div className="text-xs text-amber-700">Cari nomor nota, nama pelanggan, atau nomor HP. Bon bisa langsung dilunasi dari Kasir.</div>
               </div>
               <Button variant="ghost" size="sm" onClick={() => setShowDebtFinder(false)}>Tutup</Button>
             </div>
             <div className="flex gap-2">
-              <Input value={debtSearch} onChange={(e) => setDebtSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadDebts()} placeholder="Nama pelanggan / no HP / nomor nota" className="h-10" />
+              <Input value={debtSearch} onChange={(e) => setDebtSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadDebts()} placeholder="Nomor nota / nama pelanggan / no HP" className="h-10" />
               <Button onClick={() => loadDebts()} className="bg-amber-600 hover:bg-amber-700">Cari</Button>
             </div>
-            <div className="max-h-64 overflow-y-auto divide-y divide-amber-100 border border-amber-100 rounded-lg">
-              {debts.length === 0 ? <div className="p-4 text-center text-xs text-gray-400">Tidak ada bon aktif</div> : debts.map((d) => (
-                <button key={d.id} onClick={() => startDebtSettlement(d)} className="w-full text-left p-3 hover:bg-amber-50 flex items-center justify-between gap-3">
+            <div className="max-h-80 overflow-y-auto divide-y divide-amber-100 border border-amber-100 rounded-lg">
+              {debts.length === 0 && trxMatches.length === 0 ? <div className="p-4 text-center text-xs text-gray-400">Tidak ada transaksi/bon cocok</div> : null}
+              {debts.map((d) => (
+                <button key={`debt-${d.id}`} onClick={() => startDebtSettlement(d)} className="w-full text-left p-3 hover:bg-amber-50 flex items-center justify-between gap-3">
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-gray-900 truncate">{d.customer_name || 'Pelanggan'}</div>
-                    <div className="text-xs text-gray-500 truncate">{d.customer_phone || 'Tanpa HP'} · {d.original_trx_no || d.transaction_id || ''}</div>
+                    <div className="text-xs text-gray-500 truncate">BON · {d.customer_phone || 'Tanpa HP'} · {d.original_trx_no || d.transaction_id || ''}</div>
                   </div>
                   <div className="text-right shrink-0">
                     <div className="font-mono font-bold text-amber-700">{formatRupiah(getBonRemaining(d))}</div>
                     <div className="text-[10px] text-gray-500">Klik bayar</div>
+                  </div>
+                </button>
+              ))}
+              {trxMatches.map((t) => (
+                <button key={`trx-${t.id}`} onClick={() => openTransactionResult(t)} className="w-full text-left p-3 hover:bg-emerald-50 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-gray-900 truncate">{t.trx_no} · {t.customer_name || 'Pelanggan umum'}</div>
+                    <div className="text-xs text-gray-500 truncate">{t.customer_phone || 'Tanpa HP'} · {new Date(t.created_at).toLocaleString('id-ID')}</div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <div className="font-mono font-bold text-emerald-700">{formatRupiah(t.total || 0)}</div>
+                    <div className="text-[10px] text-gray-500">{Number(t.debt_amount || 0) > 0 ? 'Bon aktif' : 'Lihat struk'}</div>
                   </div>
                 </button>
               ))}
@@ -854,8 +889,8 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <img alt="QR cek transaksi" className="mx-auto w-24 h-24" src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(window.location.origin + '/kasir?lookup=' + showReceipt.trx_no)}`} />
-                  <div className="text-[10px] mt-1">Scan untuk cari transaksi: {showReceipt.trx_no}</div>
+                  <img alt="QR cek transaksi" className="mx-auto w-24 h-24" src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(window.location.origin + '/scan?code=' + encodeURIComponent('aw:trx:' + showReceipt.trx_no))}`} />
+                  <div className="text-[10px] mt-1">Scan untuk cek transaksi: {showReceipt.trx_no}</div>
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
@@ -886,19 +921,27 @@ export default function Kasir() {
                 }}>
                   <Bluetooth className="w-4 h-4 mr-1.5" /> Thermal
                 </Button>
-                <Button data-testid="receipt-whatsapp-btn" variant="outline" className="flex-1 w-full" onClick={() => {
-                  const text = encodeURIComponent(buildReceiptText(showReceipt));
-                  // Normalize phone: 08xxx → 628xxx
+                <Button data-testid="receipt-whatsapp-btn" variant="outline" className="flex-1 w-full" onClick={async () => {
                   let phone = (showReceipt.customer_phone || "").replace(/[^\d]/g, "");
                   if (!phone) {
-                    const manual = window.prompt("Masukkan nomor WhatsApp pelanggan (opsional, contoh 08123456789):", "");
+                    const manual = window.prompt("Masukkan nomor WhatsApp pelanggan (contoh 08123456789):", "");
                     phone = (manual || "").replace(/[^\d]/g, "");
                   }
-                  if (phone.startsWith("0")) phone = "62" + phone.slice(1);
-                  else if (phone && !phone.startsWith("62")) phone = "62" + phone;
-                  const url = phone ? `https://wa.me/${phone}?text=${text}` : `https://wa.me/?text=${text}`;
-                  window.open(url, "_blank");
-                  if (phone) toast.success(`Struk dikirim ke pelanggan (${phone})`);
+                  if (!phone) return toast.error("Nomor WhatsApp belum diisi");
+                  try {
+                    const { data } = await api.post(`/transactions/${showReceipt.id}/send-whatsapp`, { phone });
+                    if (data.sent) return toast.success("Struk benar-benar terkirim via WhatsApp API");
+                    if (data.wa_url) {
+                      window.open(data.wa_url, "_blank");
+                      return toast.info("WhatsApp API belum aktif. Jendela WhatsApp dibuka, tekan Kirim manual.");
+                    }
+                    toast.error(data.error || data.message || "Gagal mengirim WhatsApp");
+                  } catch (e) {
+                    const text = encodeURIComponent(buildReceiptText(showReceipt));
+                    let p = phone; if (p.startsWith("0")) p = "62" + p.slice(1); else if (p && !p.startsWith("62")) p = "62" + p;
+                    window.open(`https://wa.me/${p}?text=${text}`, "_blank");
+                    toast.info("Gagal akses API. WhatsApp dibuka untuk kirim manual.");
+                  }
                 }}>
                   <MessageCircle className="w-4 h-4 mr-1.5" /> WhatsApp{showReceipt?.customer_phone ? " Pelanggan" : ""}
                 </Button>

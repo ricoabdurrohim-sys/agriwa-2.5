@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { Beaker, Play, History, CheckCircle2, XCircle } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { Beaker, Play, History, CheckCircle2, XCircle, Printer, QrCode } from "lucide-react";
 import api, { formatRupiah, formatDateTime } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,8 +9,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
+import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
 
 export default function Pupuk() {
+  const [params] = useSearchParams();
+  const focusBatch = params.get("batch") || "";
   const [recipes, setRecipes] = useState([]);
   const [batches, setBatches] = useState([]);
   const [show, setShow] = useState(false);
@@ -42,6 +46,20 @@ export default function Pupuk() {
     } catch (e) { toast.error(e?.response?.data?.detail || "Gagal memproses"); }
   };
 
+  const printProductionThermal = async (b) => {
+    try {
+      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung di browser ini");
+      const code = `aw:production:${b.id || b.batch_no}`;
+      const target = `${window.location.origin}/scan?code=${encodeURIComponent(code)}`;
+      await printThermalLabel({
+        title: b.recipe_name || 'Produksi', subtitle: b.batch_no || b.id,
+        lines: [`Jumlah: ${b.quantity} unit`, `Biaya: ${formatRupiah(b.actual_cost || 0)}`, `Waktu: ${formatDateTime(b.created_at)}`],
+        qrData: target, footer: 'AgriWarung Produksi'
+      });
+      toast.success('Label produksi dikirim ke printer thermal');
+    } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
+  };
+
   return (
     <div className="space-y-4 fade-in">
       <div className="flex items-end justify-between gap-3 flex-wrap">
@@ -66,8 +84,8 @@ export default function Pupuk() {
             <div className="text-center py-12 text-gray-400 text-sm">Belum ada batch produksi</div>
           ) : (
             <div className="divide-y divide-gray-100">
-              {batches.map((b) => (
-                <div key={b.id} data-testid={`batch-${b.id}`} className="flex items-center gap-3 py-3 px-2">
+              {batches.map((b) => { const active = focusBatch && (focusBatch === b.id || focusBatch === b.batch_no); return (
+                <div key={b.id} data-testid={`batch-${b.id}`} className={`flex items-center gap-3 py-3 px-2 ${active ? 'bg-emerald-50 ring-1 ring-emerald-200' : ''}`}>
                   <div className="p-2 bg-amber-50 rounded-lg"><Beaker className="w-4 h-4 text-amber-700" /></div>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-semibold">{b.batch_no}</div>
@@ -77,8 +95,9 @@ export default function Pupuk() {
                     <div className="font-mono font-semibold">{b.quantity} unit</div>
                     <div className="text-xs text-gray-500 font-mono">{formatRupiah(b.actual_cost)}</div>
                   </div>
+                  <Button size="sm" variant="outline" onClick={() => printProductionThermal(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Thermal</Button>
                 </div>
-              ))}
+              );})}
             </div>
           )}
         </TabsContent>

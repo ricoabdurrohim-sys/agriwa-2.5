@@ -255,29 +255,149 @@ async def check_low_stock_and_notify(item_id: str):
 
 
 async def send_whatsapp_message(phone: str, text: str) -> dict:
+    """Send WhatsApp receipt.
+
+    Priority:
+    1) Official WhatsApp Cloud API when WHATSAPP_PHONE_NUMBER_ID + WHATSAPP_ACCESS_TOKEN are set.
+    2) Generic gateway when WHATSAPP_API_URL + WHATSAPP_API_KEY are set.
+    3) Manual wa.me fallback.
+    """
     normalized = normalize_phone(phone)
     if not normalized:
         raise HTTPException(400, "Nomor WhatsApp belum diisi")
+
+    cloud_phone_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    cloud_token = os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip() or os.environ.get("WHATSAPP_CLOUD_TOKEN", "").strip()
+    graph_version = os.environ.get("WHATSAPP_GRAPH_VERSION", "v20.0").strip() or "v20.0"
+    if cloud_phone_id and cloud_token:
+        try:
+            import httpx
+            url = f"https://graph.facebook.com/{graph_version}/{cloud_phone_id}/messages"
+            headers = {"Authorization": f"Bearer {cloud_token}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": normalized,
+                "type": "text",
+                "text": {"preview_url": False, "body": text[:4000]},
+            }
+            async with httpx.AsyncClient(timeout=20) as http:
+                res = await http.post(url, json=payload, headers=headers)
+            ok = 200 <= res.status_code < 300
+            return {
+                "sent": ok, "manual": False, "provider": "whatsapp_cloud",
+                "status_code": res.status_code, "response": res.text[:800], "phone": normalized,
+                "wa_url": f"https://wa.me/{normalized}?text={quote(text)}",
+            }
+        except Exception as e:
+            return {"sent": False, "manual": False, "provider": "whatsapp_cloud", "phone": normalized, "error": str(e), "wa_url": f"https://wa.me/{normalized}?text={quote(text)}"}
+
     url = os.environ.get("WHATSAPP_API_URL", "").strip()
     token = os.environ.get("WHATSAPP_API_KEY", "").strip()
-    if not url or not token:
-        return {
-            "sent": False,
-            "manual": True,
-            "phone": normalized,
-            "wa_url": f"https://wa.me/{normalized}?text={quote(text)}",
-            "message": "WHATSAPP_API_URL/WHATSAPP_API_KEY belum diatur. Gunakan wa_url untuk kirim manual.",
-        }
-    try:
-        import httpx
-        headers = {"Authorization": token, "Content-Type": "application/json"}
-        payload = {"target": normalized, "phone": normalized, "message": text}
-        async with httpx.AsyncClient(timeout=15) as http:
-            res = await http.post(url, json=payload, headers=headers)
-        return {"sent": 200 <= res.status_code < 300, "status_code": res.status_code, "response": res.text[:500], "phone": normalized}
-    except Exception as e:
-        return {"sent": False, "phone": normalized, "error": str(e)}
+    if url and token:
+        try:
+            import httpx
+            headers = {"Authorization": token, "Content-Type": "application/json"}
+            payload = {"target": normalized, "phone": normalized, "message": text}
+            async with httpx.AsyncClient(timeout=15) as http:
+                res = await http.post(url, json=payload, headers=headers)
+            return {"sent": 200 <= res.status_code < 300, "manual": False, "provider": "generic_gateway", "status_code": res.status_code, "response": res.text[:500], "phone": normalized}
+        except Exception as e:
+            return {"sent": False, "manual": False, "provider": "generic_gateway", "phone": normalized, "error": str(e)}
 
+    return {
+        "sent": False, "manual": True, "provider": "wa_me", "phone": normalized,
+        "wa_url": f"https://wa.me/{normalized}?text={quote(text)}",
+        "message": "WhatsApp API belum diatur. Browser akan membuka WhatsApp/wa.me dan user tetap perlu menekan tombol kirim.",
+    }
+
+
+def whatsapp_integration_status() -> dict:
+    cloud_ready = bool(os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip() and (os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip() or os.environ.get("WHATSAPP_CLOUD_TOKEN", "").strip()))
+    generic_ready = bool(os.environ.get("WHATSAPP_API_URL", "").strip() and os.environ.get("WHATSAPP_API_KEY", "").strip())
+    return {
+        "cloud_api_ready": cloud_ready,
+        "generic_gateway_ready": generic_ready,
+        "mode": "cloud_api" if cloud_ready else ("generic_gateway" if generic_ready else "manual_wa_me"),
+        "manual_fallback": not (cloud_ready or generic_ready),
+    }
+
+
+
+@api.get("/integrations/whatsapp/status")
+async def get_whatsapp_status(user: dict = Depends(get_current_user)):
+    return whatsapp_integration_status()
+
+
+@api.get("/scan/resolve")
+async def resolve_scan_code(code: str, user: dict = Depends(get_current_user)):
+    raw = (code or "").strip()
+    if not raw:
+        raise HTTPException(400, "Kode scan kosong")
+    decoded = raw
+    # Accept URLs generated by the app: /scan?code=..., /kasir?lookup=..., /inventori?batch=...
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        parsed = urlparse(raw)
+        qs = parse_qs(parsed.query or "")
+        if "code" in qs and qs["code"]:
+            decoded = unquote(qs["code"][0]).strip()
+        elif "lookup" in qs and qs["lookup"]:
+            decoded = "aw:trx:" + unquote(qs["lookup"][0]).strip()
+        elif "batch" in qs and qs["batch"]:
+            decoded = "aw:batch:" + unquote(qs["batch"][0]).strip()
+    except Exception:
+        decoded = raw
+
+    low = decoded.lower()
+    def payload(kind, target, item=None):
+        return {"ok": True, "kind": kind, "target": target, "item": item or {}, "code": decoded}
+
+    if low.startswith("aw:trx:"):
+        q = decoded.split(":", 2)[2]
+        trx = await db.transactions.find_one({"$or": [{"trx_no": q}, {"id": q}]}, {"_id": 0})
+        if trx:
+            return payload("transaction", f"/kasir?lookup={quote(trx.get('trx_no') or trx.get('id'))}", trx)
+    if low.startswith("aw:batch:"):
+        q = decoded.split(":", 2)[2]
+        b = await db.inventory_batches.find_one({"$or": [{"batch_no": q}, {"id": q}]}, {"_id": 0})
+        if b:
+            return payload("inventory_batch", f"/inventori?batch={quote(b.get('batch_no') or b.get('id'))}", b)
+    if low.startswith("aw:production:"):
+        q = decoded.split(":", 2)[2]
+        row = await db.production_batches.find_one({"$or": [{"id": q}, {"batch_no": q}]}, {"_id": 0})
+        if row:
+            return payload("production", f"/pupuk?batch={quote(row.get('id') or row.get('batch_no'))}", row)
+    if low.startswith("aw:harvest:"):
+        q = decoded.split(":", 2)[2]
+        row = await db.vineyard_harvests.find_one({"id": q}, {"_id": 0})
+        if row:
+            return payload("harvest", f"/kebun?harvest={quote(q)}", row)
+    if low.startswith("aw:activity:"):
+        q = decoded.split(":", 2)[2]
+        row = await db.vineyard_activities.find_one({"id": q}, {"_id": 0})
+        if row:
+            return payload("farm_activity", f"/kebun?activity={quote(q)}", row)
+    if low.startswith("aw:livestock:"):
+        q = decoded.split(":", 2)[2]
+        row = await db.livestock_productions.find_one({"id": q}, {"_id": 0})
+        if row:
+            return payload("livestock_production", f"/peternakan?production={quote(q)}", row)
+
+    # Smart fallback: try transaction number/name/phone and batch number in one place.
+    q = decoded.strip()
+    trx = await db.transactions.find_one({"$or": [
+        {"trx_no": {"$regex": re.escape(q), "$options": "i"}},
+        {"id": q},
+        {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
+        {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
+    ]}, {"_id": 0})
+    if trx:
+        return payload("transaction", f"/kasir?lookup={quote(trx.get('trx_no') or trx.get('id'))}", trx)
+    b = await db.inventory_batches.find_one({"$or": [{"batch_no": {"$regex": f"^{re.escape(q)}$", "$options": "i"}}, {"id": q}]}, {"_id": 0})
+    if b:
+        return payload("inventory_batch", f"/inventori?batch={quote(b.get('batch_no') or b.get('id'))}", b)
+    raise HTTPException(404, "Kode tidak ditemukan di transaksi/batch/produksi/kebun/peternakan")
 
 # ---------- Models ----------
 class LoginIn(BaseModel):
@@ -3452,6 +3572,30 @@ async def create_vineyard_activity(body: VineyardActivityIn, user: dict = Depend
             "reference": "vineyard_activity", "reference_id": doc["id"],
         })
     await write_audit(user, "create", "vineyard_activity", doc["id"], {"type": body.activity_type})
+    return doc
+
+
+@api.put("/vineyard/activities/{activity_id}")
+async def update_vineyard_activity(activity_id: str, body: VineyardActivityIn, user: dict = Depends(get_current_user)):
+    if not await db.vineyard_activities.find_one({"id": activity_id}):
+        raise HTTPException(404, "Aktivitas tidak ditemukan")
+    plot = await db.vineyard_plots.find_one({"id": body.plot_id}, {"_id": 0})
+    if not plot:
+        raise HTTPException(404, "Plot tidak ditemukan")
+    data = body.model_dump()
+    data["plot_name"] = plot.get("name")
+    data["updated_at"] = now_iso()
+    await db.vineyard_activities.update_one({"id": activity_id}, {"$set": data})
+    # Keep expense mirror aligned.
+    await db.expenses.delete_many({"reference": "vineyard_activity", "reference_id": activity_id})
+    if float(body.cost or 0) > 0:
+        await db.expenses.insert_one({
+            "id": gen_id(), "category": "Kebun", "amount": int(body.cost),
+            "description": f"Aktivitas kebun {body.activity_type} - {plot.get('name')}",
+            "date": data.get("date") or now_iso(), "reference": "vineyard_activity", "reference_id": activity_id, "created_at": now_iso(),
+        })
+    doc = await db.vineyard_activities.find_one({"id": activity_id}, {"_id": 0})
+    await write_audit(user, "update", "vineyard_activity", activity_id, {"type": body.activity_type})
     return doc
 
 
