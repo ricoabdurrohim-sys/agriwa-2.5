@@ -36,7 +36,8 @@ const allModules = [
   { to: "/opname", label: "Stock Opname", icon: ClipboardCheck, group: "Stok & Produksi" },
   { to: "/bom", label: "Resep / BOM", icon: Package, group: "Stok & Produksi" },
   { to: "/pupuk", label: "Produksi Pupuk", icon: Beaker, group: "Stok & Produksi" },
-  { to: "/anggur", label: "Kebun Anggur & B2B", icon: Grape, group: "Stok & Produksi" },
+  { to: "/kebun", label: "Kebun & B2B", icon: Grape, group: "Stok & Produksi" },
+  { to: "/peternakan", label: "Peternakan", icon: Activity, group: "Stok & Produksi" },
 
   { to: "/pembelian", label: "Pembelian & Supplier", icon: Truck, group: "Keuangan & Akuntansi" },
   { to: "/keuangan", label: "Keuangan", icon: HandCoins, group: "Keuangan & Akuntansi", essential: true },
@@ -159,7 +160,7 @@ export default function Layout() {
                         </div>
                         <div className="min-w-0">
                           <div className="font-semibold tracking-tight truncate text-lg" style={{ fontFamily: 'Poppins' }}>AgriWarung</div>
-                          <div className="text-xs text-white/65">Mini ERP · POS · Kebun · Akuntansi</div>
+                          <div className="text-xs text-white/65">Mini ERP · POS · Kebun · Ternak</div>
                         </div>
                       </div>
                       <button data-testid="edit-drawer-btn" onClick={() => setEditMode((v) => !v)} className={`p-2 rounded-xl transition-colors ${editMode ? "bg-[#f4a228] text-white" : "bg-white/10 text-white/80 hover:bg-white/20"}`} title="Atur tampilan menu">

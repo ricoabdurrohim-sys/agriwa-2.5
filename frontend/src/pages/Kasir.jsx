@@ -23,6 +23,7 @@ export default function Kasir() {
   const tableId = params.get("table");
   const orderId = params.get("order");
   const bonId = params.get("bon");
+  const lookupParam = params.get("lookup") || params.get("trx") || "";
   const [items, setItems] = useState([]);
   const [cart, setCart] = useState([]);
   const [search, setSearch] = useState("");
@@ -42,6 +43,7 @@ export default function Kasir() {
   const [redeemDiscount, setRedeemDiscount] = useState(0);
   const [recentTrx, setRecentTrx] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
   const [editTrx, setEditTrx] = useState(null);
   const [settings, setSettings] = useState({ business_name: "", address: "", phone: "", receipt_footer: "" });
   const [transactionType, setTransactionType] = useState("SALE");
@@ -194,6 +196,14 @@ export default function Kasir() {
       });
     }
   }, [bonId]);
+
+  useEffect(() => {
+    if (lookupParam) {
+      setShowHistory(true);
+      setHistorySearch(lookupParam);
+      loadRecent();
+    }
+  }, [lookupParam]);
 
   const cancelTransaction = async (trx) => {
     if (!window.confirm(`Batalkan transaksi ${trx.trx_no} (${formatRupiah(trx.total)})?\nStok akan dikembalikan.`)) return;
@@ -398,7 +408,7 @@ export default function Kasir() {
               <Button variant="ghost" size="sm" onClick={() => setShowDebtFinder(false)}>Tutup</Button>
             </div>
             <div className="flex gap-2">
-              <Input value={debtSearch} onChange={(e) => setDebtSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadDebts()} placeholder="Nama pelanggan / no HP" className="h-10" />
+              <Input value={debtSearch} onChange={(e) => setDebtSearch(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadDebts()} placeholder="Nama pelanggan / no HP / nomor nota" className="h-10" />
               <Button onClick={() => loadDebts()} className="bg-amber-600 hover:bg-amber-700">Cari</Button>
             </div>
             <div className="max-h-64 overflow-y-auto divide-y divide-amber-100 border border-amber-100 rounded-lg">
@@ -666,12 +676,21 @@ export default function Kasir() {
             </>
           )}
 
-          {/* Customer phone (for WA receipt) */}
-          {transactionType === "SALE" && <div>
-            <label className="text-xs font-medium text-gray-600">No. HP Pelanggan (opsional, untuk kirim struk WA)</label>
-            <Input data-testid="customer-phone-input" value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value)}
-              placeholder="08xxx" className="h-9 mt-1 font-mono text-xs" />
-          </div>}
+          {/* Customer identity (for receipt, bon search, and WhatsApp receipt) */}
+          {transactionType === "SALE" && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs font-medium text-gray-600">Nama Pelanggan (opsional, wajib untuk bon)</label>
+                <Input data-testid="customer-name-input" value={customerName} onChange={(e) => setCustomerName(e.target.value)}
+                  placeholder="Nama pelanggan" className="h-9 mt-1 text-xs" />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-gray-600">No. HP Pelanggan (opsional, untuk kirim struk WA)</label>
+                <Input data-testid="customer-phone-input" value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value)}
+                  placeholder="08xxx" className="h-9 mt-1 font-mono text-xs" />
+              </div>
+            </div>
+          )}
 
           {/* Bon toggle (disabled while settling existing bon) */}
           {transactionType === "SALE" && !bonInfo && (
@@ -680,9 +699,8 @@ export default function Kasir() {
               <span>Catat sebagai Bon / Hutang</span>
             </label>
           )}
-          {transactionType === "SALE" && isBon && !bonInfo && (
-            <Input data-testid="customer-name-input" value={customerName} onChange={(e) => setCustomerName(e.target.value)}
-              placeholder="Nama pelanggan" className="h-10" />
+          {transactionType === "SALE" && isBon && !bonInfo && !customerName.trim() && (
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">Nama pelanggan wajib diisi agar bon bisa dicari nanti.</div>
           )}
 
           <Button data-testid="checkout-btn" onClick={checkout} disabled={cart.length === 0 || (bonInfo && paymentDue <= 0)}
@@ -698,10 +716,13 @@ export default function Kasir() {
           <DialogHeader>
             <DialogTitle>Riwayat Transaksi · Detail / Print Ulang / Edit</DialogTitle>
           </DialogHeader>
+          <div className="mb-2">
+            <Input value={historySearch} onChange={(e) => setHistorySearch(e.target.value)} placeholder="Cari no nota / nama pelanggan / no HP" className="h-9" />
+          </div>
           <div className="overflow-y-auto divide-y divide-gray-100 -mx-2">
             {recentTrx.length === 0 ? (
               <div className="text-center text-gray-400 text-sm py-10">Belum ada transaksi</div>
-            ) : recentTrx.filter((t) => t.cancel_reason !== "replaced_by_payment").map((t) => (
+            ) : recentTrx.filter((t) => t.cancel_reason !== "replaced_by_payment").filter((t) => { const q = historySearch.trim().toLowerCase(); return !q || String(t.trx_no||'').toLowerCase().includes(q) || String(t.customer_name||'').toLowerCase().includes(q) || String(t.customer_phone||'').toLowerCase().includes(q); }).map((t) => (
               <div key={t.id} data-testid={`history-row-${t.id}`} className={`px-2 py-3 flex items-start gap-3 ${t.cancelled ? "opacity-60 bg-red-50/30" : ""}`}>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
@@ -795,6 +816,8 @@ export default function Kasir() {
               {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && showReceipt.original_trx_no && <div className="text-xs">Pelunasan: {showReceipt.original_trx_no}</div>}
               {showReceipt.receipt_kind === "DEBT_SETTLEMENT" && <div className="text-xs font-semibold">Jenis: PELUNASAN BON</div>}
               <div className="text-xs">{new Date(showReceipt.created_at).toLocaleString("id-ID")}</div>
+              {showReceipt.customer_name && <div className="text-xs">Pelanggan: {showReceipt.customer_name}</div>}
+              {showReceipt.customer_phone && <div className="text-xs">HP: {showReceipt.customer_phone}</div>}
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.items.map((it, i) => (
                 <div key={`${it.name}-${i}`} className="text-xs">
@@ -829,6 +852,12 @@ export default function Kasir() {
               {showReceipt.transaction_type && showReceipt.transaction_type !== "SALE" && <div className="flex justify-between text-xs"><span>HPP</span><span>{formatRupiah(showReceipt.cost_total || 0)}</span></div>}
               {showReceipt.payment_status && <div className="flex justify-between text-xs"><span>Status</span><span>{showReceipt.payment_status}</span></div>}
               <div className="border-t border-dashed border-gray-400 my-2" />
+              {showReceipt.trx_no && (
+                <div className="text-center my-2">
+                  <img alt="QR cek transaksi" className="mx-auto w-24 h-24" src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(window.location.origin + '/kasir?lookup=' + showReceipt.trx_no)}`} />
+                  <div className="text-[10px] mt-1">Scan untuk cari transaksi: {showReceipt.trx_no}</div>
+                </div>
+              )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
               <div className="text-center text-xs whitespace-pre-line">{cfg.footer || "Terima kasih! 🙏"}</div>
             </div>
@@ -861,6 +890,10 @@ export default function Kasir() {
                   const text = encodeURIComponent(buildReceiptText(showReceipt));
                   // Normalize phone: 08xxx → 628xxx
                   let phone = (showReceipt.customer_phone || "").replace(/[^\d]/g, "");
+                  if (!phone) {
+                    const manual = window.prompt("Masukkan nomor WhatsApp pelanggan (opsional, contoh 08123456789):", "");
+                    phone = (manual || "").replace(/[^\d]/g, "");
+                  }
                   if (phone.startsWith("0")) phone = "62" + phone.slice(1);
                   else if (phone && !phone.startsWith("62")) phone = "62" + phone;
                   const url = phone ? `https://wa.me/${phone}?text=${text}` : `https://wa.me/?text=${text}`;

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo } from "react";
-import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory } from "lucide-react";
+import { Plus, Search, AlertTriangle, Edit, Trash2, FileSpreadsheet, FileText, Image as ImageIcon, Factory, Printer, QrCode } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { exportInventoryXLSX, exportInventoryPDF } from "@/lib/exports";
 import ImageUpload, { resolveImageUrl } from "@/components/ImageUpload";
@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
+import { printViaIframe } from "@/lib/safePrint";
 
 const CATEGORIES = [
   "Bahan Baku Warung", "Bahan Baku Pupuk", "Bahan Baku Kebun",
@@ -108,6 +109,16 @@ export default function Inventori() {
     setBatchItem(item);
     try { const { data } = await api.get(`/inventory/${item.id}/batches`); setBatchRows(data); }
     catch { toast.error("Gagal memuat batch"); }
+  };
+
+  const printBatchLabel = (b) => {
+    const target = `${window.location.origin}/inventori?batch=${encodeURIComponent(b.batch_no || b.id)}`;
+    const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(target)}`;
+    printViaIframe({
+      title: `Label Batch ${b.batch_no}`,
+      css: "body{font-family:monospace;font-size:12px;padding:8px;width:58mm}.center{text-align:center}.big{font-weight:700;font-size:14px}.qr{width:92px;height:92px}.small{font-size:10px}",
+      bodyHtml: `<div class='center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><img class='qr' src='${qr}'/><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
+    });
   };
   const openEdit = (item) => {
     setEditing(item);
@@ -364,7 +375,10 @@ export default function Inventori() {
                 <div><div className="text-[10px] text-gray-500 uppercase">Supplier</div><div>{b.supplier_name || '—'}</div></div>
                 <div><div className="text-[10px] text-gray-500 uppercase">Masuk</div><div className="font-mono">{b.quantity} {b.unit}</div></div>
                 <div><div className="text-[10px] text-gray-500 uppercase">Sisa</div><div className="font-mono font-bold text-emerald-700">{Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} {b.unit}</div></div>
-                <div className="sm:col-span-4 text-xs text-gray-500">{b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''} {b.purchase_ref && `· Ref ${b.purchase_ref}`} {b.purchase_url && <a className="text-blue-600 underline" href={b.purchase_url} target="_blank" rel="noreferrer">· Link</a>} {b.notes && `· ${b.notes}`}</div>
+                <div className="sm:col-span-4 flex items-center justify-between gap-2 text-xs text-gray-500">
+                  <div>{b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''} {b.purchase_ref && `· Ref ${b.purchase_ref}`} {b.purchase_url && <a className="text-blue-600 underline" href={b.purchase_url} target="_blank" rel="noreferrer">· Link</a>} {b.notes && `· ${b.notes}`}</div>
+                  <Button size="sm" variant="outline" onClick={() => printBatchLabel(b)}><Printer className="w-3.5 h-3.5 mr-1" /> Print Label</Button>
+                </div>
               </div>
             ))}
           </div>

@@ -11,7 +11,7 @@ import { toast } from "sonner";
 const DEFAULT_CODES = ["warung", "anggur", "pupuk", "pembibitan", "gudang"];
 const COLORS = ["#1a6b3c", "#ea580c", "#6b46c1", "#b45309", "#059669", "#2563eb", "#dc2626", "#0891b2", "#7c3aed", "#db2777"];
 
-const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", description: "", color: "#1a6b3c", active: true };
+const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", description: "", color: "#1a6b3c", active: true, auto_batch_enabled: true, batch_on_purchase: true, batch_on_production: false, batch_on_harvest: true, batch_on_farm: true };
 
 export default function BusinessUnits() {
   const [units, setUnits] = useState([]);
@@ -95,6 +95,21 @@ export default function BusinessUnits() {
             <div><Label>Footer Struk</Label><Input data-testid="unit-receipt-footer-input" value={form.receipt_footer || ""} onChange={(e) => setForm({ ...form, receipt_footer: e.target.value })} placeholder="Terima kasih / promo / kebijakan retur" /></div>
             <div><Label>Catatan Struk</Label><Input data-testid="unit-receipt-note-input" value={form.receipt_note || ""} onChange={(e) => setForm({ ...form, receipt_note: e.target.value })} placeholder="Catatan tambahan di bawah struk" /></div>
             <div><Label>Deskripsi</Label><Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
+            <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 space-y-2">
+              <div className="text-sm font-semibold text-emerald-900">Pengaturan Batch Otomatis</div>
+              {[
+                ['auto_batch_enabled','Aktifkan batch otomatis untuk lini ini'],
+                ['batch_on_purchase','Batch saat pembelian/stok masuk'],
+                ['batch_on_production','Batch saat produksi'],
+                ['batch_on_harvest','Batch saat panen/hasil ternak'],
+              ].map(([key,label]) => (
+                <label key={key} className="flex items-center gap-2 text-xs text-emerald-900">
+                  <input type="checkbox" checked={form[key] !== false} onChange={(e)=>setForm({...form,[key]:e.target.checked})} className="accent-[#1a6b3c]" />
+                  {label}
+                </label>
+              ))}
+              <p className="text-[11px] text-emerald-800">Contoh: lini Pupuk/Kebun/Peternakan aktifkan produksi/panen agar setiap hasil otomatis punya batch dan bisa diprint label.</p>
+            </div>
             <div>
               <Label className="flex items-center gap-1"><Palette className="w-3.5 h-3.5" /> Warna</Label>
               <div className="flex gap-2 mt-1.5 flex-wrap">

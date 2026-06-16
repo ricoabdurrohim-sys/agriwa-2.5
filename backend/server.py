@@ -738,6 +738,46 @@ async def _record_inventory_batch(item: dict, qty: float, body: dict, source: st
     return batch
 
 
+async def _business_unit_allows_batch(unit_code: str, field: str = "batch_on_production") -> bool:
+    """Policy batch per lini bisnis. Default aman: produksi/panen/peternakan dibatch; warung normal tidak wajib."""
+    unit_code = (unit_code or "").strip()
+    unit = await db.business_units.find_one({"code": unit_code}, {"_id": 0}) if unit_code else None
+    if unit and unit.get("auto_batch_enabled") is False:
+        return False
+    if unit and field in unit:
+        return bool(unit.get(field))
+    return unit_code in ("anggur", "kebun", "pupuk", "peternakan", "pembibitan")
+
+
+async def _record_output_batch_if_enabled(item: dict, qty: float, source: str, ref: str = "", notes: str = "", date: str = ""):
+    if not item or not qty:
+        return None
+    unit_code = item.get("business_unit") or ""
+    field = "batch_on_harvest" if source in ("harvest", "vineyard_harvest", "livestock_production") else "batch_on_production"
+    if not await _business_unit_allows_batch(unit_code, field):
+        return None
+    return await _record_inventory_batch(item, float(qty), {
+        "supplier_name": "Produksi" if field == "batch_on_production" else "Panen/Hasil",
+        "purchase_ref": ref,
+        "notes": notes or f"Batch otomatis dari {source}",
+        "purchase_date": date or now_iso(),
+    }, source=source)
+
+
+async def _printable_batch_payload(batch: dict, base_url: str = "") -> dict:
+    target = f"{base_url.rstrip('/')}/inventori?batch={batch.get('batch_no')}" if base_url else f"agriwarung://batch/{batch.get('batch_no')}"
+    return {
+        "batch_no": batch.get("batch_no"),
+        "item_name": batch.get("item_name"),
+        "qty": batch.get("remaining_quantity", batch.get("quantity")),
+        "unit": batch.get("unit"),
+        "supplier_name": batch.get("supplier_name"),
+        "purchase_date": batch.get("purchase_date"),
+        "target_url": target,
+        "label_text": f"{batch.get('item_name','ITEM')}\nBatch: {batch.get('batch_no','-')}\nSisa: {batch.get('remaining_quantity', batch.get('quantity', 0))} {batch.get('unit','')}\nSumber: {batch.get('supplier_name') or batch.get('source') or '-'}",
+    }
+
+
 async def _consume_inventory_batches(item_id: str, qty: float, reference: str = "stock_out"):
     """Kurangi sisa batch secara FIFO agar sisa batch lama bisa dilihat di Inventori."""
     remaining = float(qty or 0)
@@ -844,6 +884,14 @@ async def list_inventory_batches(item_id: str, user: dict = Depends(get_current_
     return await db.inventory_batches.find({"item_id": item_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
+@api.get("/inventory/batches/{batch_no}/label")
+async def get_batch_label(batch_no: str, user: dict = Depends(get_current_user)):
+    b = await db.inventory_batches.find_one({"$or": [{"id": batch_no}, {"batch_no": batch_no}]}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Batch tidak ditemukan")
+    return await _printable_batch_payload(b)
+
+
 @api.delete("/inventory/{item_id}")
 async def delete_inventory(item_id: str, user: dict = Depends(get_current_user)):
     await db.inventory_items.delete_one({"id": item_id})
@@ -927,12 +975,14 @@ async def produce_item(item_id: str, body: ProduceIn, user: dict = Depends(get_c
                 {"id": ing["item_id"]},
                 {"$inc": {"current_stock": -qty_used}},
             )
+            used_batches = await _consume_inventory_batches(ing["item_id"], qty_used, reference=f"PRODUCE-{item_id}")
             await db.stock_movements.insert_one({
                 "id": gen_id(),
                 "item_id": ing["item_id"],
                 "type": "production_consume",
                 "quantity": -qty_used,
                 "reason": f"Produksi {body.quantity} {item['name']}",
+                "consumed_batches": used_batches,
                 "created_at": now_iso(),
             })
             consumed.append({"item_id": ing["item_id"], "quantity": qty_used})
@@ -941,12 +991,15 @@ async def produce_item(item_id: str, body: ProduceIn, user: dict = Depends(get_c
         {"id": item_id},
         {"$inc": {"current_stock": body.quantity}},
     )
+    output_after = await db.inventory_items.find_one({"id": item_id}, {"_id": 0})
+    output_batch = await _record_output_batch_if_enabled(output_after or item, body.quantity, "production", ref=f"PRODUCE-{item_id}", notes=f"Produksi {body.quantity:g} {item.get('name')}")
     await db.stock_movements.insert_one({
         "id": gen_id(),
         "item_id": item_id,
         "type": "production",
         "quantity": body.quantity,
         "reason": f"Produksi {body.quantity} unit",
+        "batch_no": (output_batch or {}).get("batch_no", ""),
         "created_at": now_iso(),
     })
     await write_audit(user, "update", "inventory", item_id, {"action": "produce", "quantity": body.quantity, "bom_used": bool(bom)})
@@ -1130,6 +1183,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
     doc = {
         "id": gen_id(),
         "trx_no": trx_no,
+        "lookup_key": trx_no,
         "order_id": body.order_id,
         "table_id": body.table_id,
         "branch_id": body.branch_id,
@@ -1359,9 +1413,45 @@ async def search_debts(q: str = "", include_paid: bool = False, user: dict = Dep
         query["$or"] = [
             {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
             {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
+            {"original_trx_no": {"$regex": re.escape(q), "$options": "i"}},
+            {"transaction_id": {"$regex": re.escape(q), "$options": "i"}},
+            {"trx_no": {"$regex": re.escape(q), "$options": "i"}},
         ]
     rows = await db.customer_debts.find(query, {"_id": 0}).sort("created_at", -1).to_list(50)
-    return [_normalize_debt_for_response(r) for r in rows]
+    normalized = [_normalize_debt_for_response(r) for r in rows]
+    # Fallback: beberapa data lama hanya ada di transaksi, belum tersalin sempurna ke customer_debts.
+    if q and len(normalized) < 10:
+        trx_q = {"debt_amount": {"$gt": 0}, "$or": [
+            {"trx_no": {"$regex": re.escape(q), "$options": "i"}},
+            {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
+            {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
+        ]}
+        trx_rows = await db.transactions.find(trx_q, {"_id": 0}).sort("created_at", -1).to_list(20)
+        existing_ids = {x.get("transaction_id") for x in normalized}
+        for t in trx_rows:
+            if t.get("id") in existing_ids:
+                continue
+            normalized.append({
+                "id": t.get("id"), "transaction_id": t.get("id"), "original_trx_no": t.get("trx_no"),
+                "customer_name": t.get("customer_name") or "Pelanggan", "customer_phone": t.get("customer_phone") or "",
+                "amount": int(t.get("total") or 0), "paid": int(t.get("paid_amount") or t.get("cash_collected") or t.get("cash_received") or 0),
+                "remaining": int(t.get("debt_amount") or 0), "status": t.get("payment_status") or "PARTIAL",
+                "created_at": t.get("created_at"), "original_items": t.get("items") or [], "original_total": int(t.get("total") or 0),
+            })
+    return normalized
+
+
+@api.get("/transactions/search")
+async def search_transactions(q: str = "", limit: int = 50, user: dict = Depends(get_current_user)):
+    q = (q or "").strip()
+    query = {}
+    if q:
+        query["$or"] = [
+            {"trx_no": {"$regex": re.escape(q), "$options": "i"}},
+            {"customer_name": {"$regex": re.escape(q), "$options": "i"}},
+            {"customer_phone": {"$regex": re.escape(q), "$options": "i"}},
+        ]
+    return await db.transactions.find(query, {"_id": 0}).sort("created_at", -1).to_list(min(max(int(limit or 50), 1), 200))
 
 
 class PayDebtIn(BaseModel):
@@ -2981,6 +3071,10 @@ async def startup():
     await db.inventory_items.create_index([("name_key", 1), ("unit", 1), ("business_unit", 1)])
     await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_batches.create_index([("batch_no", 1)])
+    await db.transactions.create_index([("trx_no", 1)])
+    await db.transactions.create_index([("customer_name", 1)])
+    await db.customer_debts.create_index([("customer_name", 1)])
+    await db.customer_debts.create_index([("customer_phone", 1)])
     await db.notifications.create_index([("is_read", 1), ("created_at", -1)])
     await db.audit_logs.create_index("timestamp")
     await db.debt_payments.create_index([("transaction_id", 1), ("created_at", -1)])
@@ -3101,23 +3195,30 @@ async def create_batch(body: ProductionBatchIn, user: dict = Depends(get_current
         required = ing["quantity"] * body.quantity
         actual_cost += int(required * inv.get("cost_price", 0))
         await db.inventory_items.update_one({"id": ing["item_id"]}, {"$inc": {"current_stock": -required}})
+        used_batches = await _consume_inventory_batches(ing["item_id"], required, reference=f"PROD-{body.recipe_id}")
         await db.stock_movements.insert_one({
             "id": gen_id(), "item_id": ing["item_id"], "type": "production_out",
             "quantity": -required, "reason": f"Produksi {bom.get('name')}",
+            "consumed_batches": used_batches,
             "created_at": now_iso(),
         })
     # Add output
     await db.inventory_items.update_one({"id": bom["output_item_id"]}, {"$inc": {"current_stock": body.quantity}})
+    output_item = await db.inventory_items.find_one({"id": bom["output_item_id"]}, {"_id": 0})
+    out_batch = await _record_output_batch_if_enabled(output_item, body.quantity, "production_batch", ref=body.recipe_id, notes=body.notes or f"Hasil produksi {bom.get('name')}")
     await db.stock_movements.insert_one({
         "id": gen_id(), "item_id": bom["output_item_id"], "type": "production_in",
         "quantity": body.quantity, "reason": f"Hasil produksi {bom.get('name')}",
+        "batch_no": (out_batch or {}).get("batch_no", ""),
         "created_at": now_iso(),
     })
-    batch_no = f"BATCH-{datetime.now().strftime('%Y%m')}-{str(uuid.uuid4())[:5].upper()}"
+    batch_no = (out_batch or {}).get("batch_no") or f"BATCH-{datetime.now().strftime('%Y%m')}-{str(uuid.uuid4())[:5].upper()}"
     doc = {
         "id": gen_id(), "batch_no": batch_no, "recipe_id": body.recipe_id,
         "recipe_name": bom.get("name"), "output_item_id": bom["output_item_id"],
         "quantity": body.quantity, "actual_cost": actual_cost,
+        "inventory_batch_id": (out_batch or {}).get("id", ""),
+        "inventory_batch_no": (out_batch or {}).get("batch_no", ""),
         "notes": body.notes, "created_by": user["id"], "created_at": now_iso(),
     }
     await db.production_batches.insert_one(doc)
@@ -3130,7 +3231,7 @@ async def list_batches(user: dict = Depends(get_current_user)):
     return await db.production_batches.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
-# ---------- Vineyard (Anggur/Kebun) ----------
+# ---------- Kebun / Farm (generic, formerly vineyard) ----------
 class PlotIn(BaseModel):
     name: str
     location: Optional[str] = ""
@@ -3172,7 +3273,7 @@ async def _attach_plot_to_inventory(plot: dict, previous: Optional[dict] = None)
                 "id": gen_id(), "name": name, "name_key": _inventory_name_key(name),
                 "category": "Tanaman Kebun", "unit": "pohon", "current_stock": 0, "min_stock": 0,
                 "cost_price": 0, "sell_price": 0, "business_unit": "anggur",
-                "location": plot.get("location") or "Kebun Anggur",
+                "location": plot.get("location") or "Kebun",
                 "notes": f"Dibuat otomatis dari plot {plot.get('name')}", "created_at": now_iso(),
             }
             await db.inventory_items.insert_one(doc)
@@ -3255,13 +3356,13 @@ async def _get_or_create_harvest_inventory_item(grade: str, item_id: str = "", p
     variety = ((plot or {}).get("variety") or (plot or {}).get("crop_type") or (plot or {}).get("name") or "Panen").strip()
     # Nama dibuat generik supaya bisa anggur, kelengkeng, ayam/telur, dll.
     name = f"{variety} Grade {grade}"
-    existing = await db.inventory_items.find_one({"name_key": _inventory_name_key(name), "business_unit": "anggur"}, {"_id": 0})
+    existing = await db.inventory_items.find_one({"name_key": _inventory_name_key(name), "business_unit": {"$in": ["anggur", "kebun"]}}, {"_id": 0})
     if existing:
         return existing
     doc = {
         "id": gen_id(), "name": name, "name_key": _inventory_name_key(name), "category": "Hasil Panen", "unit": "kg",
         "current_stock": 0, "min_stock": 0, "cost_price": 0, "sell_price": 0,
-        "business_unit": "anggur", "location": "Gudang Panen",
+        "business_unit": (plot or {}).get("business_unit") or "anggur", "location": "Gudang Panen",
         "notes": f"Dibuat otomatis saat catat panen {variety}", "created_at": now_iso(),
     }
     await db.inventory_items.insert_one(doc)
@@ -3524,6 +3625,139 @@ async def pay_b2b(inv_id: str, body: B2BPayIn, user: dict = Depends(get_current_
     new_paid = inv.get("paid", 0) + body.amount
     status = "paid" if new_paid >= inv["total"] else "partial"
     await db.b2b_invoices.update_one({"id": inv_id}, {"$set": {"paid": new_paid, "status": status}})
+    return {"ok": True}
+
+
+@api.delete("/b2b/invoices/{inv_id}")
+async def delete_b2b_invoice(inv_id: str, user: dict = Depends(get_current_user)):
+    inv = await db.b2b_invoices.find_one({"id": inv_id}, {"_id": 0})
+    if not inv:
+        raise HTTPException(404, "Invoice tidak ditemukan")
+    if int(inv.get("paid") or 0) > 0:
+        raise HTTPException(400, "Invoice sudah memiliki pembayaran. Batalkan/adjust di Keuangan agar audit aman.")
+    await db.b2b_invoices.delete_one({"id": inv_id})
+    await db.journal_entries.delete_many({"reference": "b2b_invoice", "reference_id": inv_id})
+    await write_audit(user, "delete", "b2b_invoice", inv_id, {"invoice_no": inv.get("invoice_no"), "total": inv.get("total")})
+    return {"ok": True}
+
+
+# ---------- Peternakan ----------
+class LivestockAssetIn(BaseModel):
+    name: str
+    animal_type: Optional[str] = "ayam"
+    count: float = 0
+    unit: Optional[str] = "ekor"
+    location: Optional[str] = "Kandang"
+    notes: Optional[str] = ""
+    inventory_item_id: Optional[str] = ""
+
+
+class LivestockProductionIn(BaseModel):
+    asset_id: Optional[str] = ""
+    product_name: str
+    quantity: float
+    unit: Optional[str] = "pcs"
+    grade: Optional[str] = "A"
+    date: Optional[str] = None
+    notes: Optional[str] = ""
+    inventory_item_id: Optional[str] = ""
+
+
+@api.get("/livestock/assets")
+async def list_livestock_assets(user: dict = Depends(get_current_user)):
+    return await db.livestock_assets.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/livestock/assets")
+async def create_livestock_asset(body: LivestockAssetIn, user: dict = Depends(get_current_user)):
+    data = body.model_dump()
+    data["id"] = gen_id()
+    data["created_at"] = now_iso()
+    item = None
+    if body.inventory_item_id:
+        item = await db.inventory_items.find_one({"id": body.inventory_item_id}, {"_id": 0})
+    if not item and body.count:
+        name = f"{body.name} ({body.animal_type})"
+        item = await db.inventory_items.find_one({"name_key": _inventory_name_key(name), "business_unit": "peternakan"}, {"_id": 0})
+        if not item:
+            item = {
+                "id": gen_id(), "name": name, "name_key": _inventory_name_key(name),
+                "category": "Aset Ternak", "unit": body.unit or "ekor", "current_stock": 0, "min_stock": 0,
+                "cost_price": 0, "sell_price": 0, "business_unit": "peternakan", "location": body.location or "Kandang",
+                "notes": "Dibuat otomatis dari menu Peternakan", "created_at": now_iso(),
+            }
+            await db.inventory_items.insert_one(item)
+        await db.inventory_items.update_one({"id": item["id"]}, {"$inc": {"current_stock": float(body.count)}})
+        await _record_output_batch_if_enabled(item, float(body.count), "livestock_asset", ref=data["id"], notes=f"Tambah aset ternak {body.name}")
+        data["inventory_item_id"] = item["id"]
+        data["inventory_item_name"] = item["name"]
+    await db.livestock_assets.insert_one(data)
+    data.pop("_id", None)
+    await write_audit(user, "create", "livestock_asset", data["id"], {"name": body.name, "count": body.count})
+    return data
+
+
+@api.delete("/livestock/assets/{asset_id}")
+async def delete_livestock_asset(asset_id: str, user: dict = Depends(get_current_user)):
+    if await db.livestock_productions.find_one({"asset_id": asset_id}):
+        raise HTTPException(400, "Aset ternak sudah punya catatan produksi. Hapus produksi terkait dulu.")
+    await db.livestock_assets.delete_one({"id": asset_id})
+    await write_audit(user, "delete", "livestock_asset", asset_id, {})
+    return {"ok": True}
+
+
+@api.get("/livestock/productions")
+async def list_livestock_productions(user: dict = Depends(get_current_user)):
+    return await db.livestock_productions.find({}, {"_id": 0}).sort("date", -1).to_list(500)
+
+
+@api.post("/livestock/productions")
+async def create_livestock_production(body: LivestockProductionIn, user: dict = Depends(get_current_user)):
+    if body.quantity <= 0:
+        raise HTTPException(400, "Jumlah hasil harus lebih dari 0")
+    asset = await db.livestock_assets.find_one({"id": body.asset_id}, {"_id": 0}) if body.asset_id else None
+    item = await db.inventory_items.find_one({"id": body.inventory_item_id}, {"_id": 0}) if body.inventory_item_id else None
+    product_name = f"{body.product_name} Grade {(body.grade or 'A').upper()}".strip()
+    if not item:
+        item = await db.inventory_items.find_one({"name_key": _inventory_name_key(product_name), "business_unit": "peternakan"}, {"_id": 0})
+    if not item:
+        item = {
+            "id": gen_id(), "name": product_name, "name_key": _inventory_name_key(product_name),
+            "category": "Hasil Ternak", "unit": body.unit or "pcs", "current_stock": 0, "min_stock": 0,
+            "cost_price": 0, "sell_price": 0, "business_unit": "peternakan", "location": "Gudang Ternak",
+            "notes": "Dibuat otomatis dari produksi Peternakan", "created_at": now_iso(),
+        }
+        await db.inventory_items.insert_one(item)
+    data = body.model_dump()
+    data["id"] = gen_id()
+    data["date"] = data.get("date") or now_iso()
+    data["asset_name"] = (asset or {}).get("name", "")
+    data["inventory_item_id"] = item["id"]
+    data["inventory_item_name"] = item["name"]
+    await db.livestock_productions.insert_one(data)
+    await db.inventory_items.update_one({"id": item["id"]}, {"$inc": {"current_stock": float(body.quantity)}})
+    batch = await _record_output_batch_if_enabled(item, float(body.quantity), "livestock_production", ref=data["id"], notes=f"Produksi ternak {item.get('name')}", date=data["date"])
+    await db.stock_movements.insert_one({
+        "id": gen_id(), "item_id": item["id"], "type": "livestock_production", "quantity": float(body.quantity),
+        "reason": f"Produksi peternakan {item.get('name')}", "reference": "livestock_production", "reference_id": data["id"],
+        "batch_no": (batch or {}).get("batch_no", ""), "created_at": now_iso(),
+    })
+    data["batch_no"] = (batch or {}).get("batch_no", "")
+    await write_audit(user, "create", "livestock_production", data["id"], {"item": item.get("name"), "qty": body.quantity})
+    data.pop("_id", None)
+    return data
+
+
+@api.delete("/livestock/productions/{prod_id}")
+async def delete_livestock_production(prod_id: str, user: dict = Depends(get_current_user)):
+    prod = await db.livestock_productions.find_one({"id": prod_id}, {"_id": 0})
+    if not prod:
+        raise HTTPException(404, "Catatan produksi tidak ditemukan")
+    if prod.get("inventory_item_id") and prod.get("quantity"):
+        await db.inventory_items.update_one({"id": prod["inventory_item_id"]}, {"$inc": {"current_stock": -float(prod.get("quantity") or 0)}})
+        await db.stock_movements.insert_one({"id": gen_id(), "item_id": prod["inventory_item_id"], "type": "livestock_production_delete_reverse", "quantity": -float(prod.get("quantity") or 0), "reference": "livestock_production", "reference_id": prod_id, "created_at": now_iso()})
+    await db.livestock_productions.delete_one({"id": prod_id})
+    await write_audit(user, "delete", "livestock_production", prod_id, {})
     return {"ok": True}
 
 
@@ -4556,6 +4790,11 @@ class BizUnitIn(BaseModel):
     icon: Optional[str] = ""
     color: Optional[str] = "#1a6b3c"
     active: bool = True
+    auto_batch_enabled: bool = True
+    batch_on_purchase: bool = True
+    batch_on_production: bool = False
+    batch_on_harvest: bool = True
+    batch_on_farm: bool = True
 
 
 @api.get("/business-units")
@@ -4564,11 +4803,12 @@ async def list_units(user: dict = Depends(get_current_user)):
     if not units:
         # Seed defaults
         defaults = [
-            {"code": "warung", "name": "Warung Makan", "color": "#ea580c", "icon": "utensils"},
-            {"code": "anggur", "name": "Kebun Anggur", "color": "#6b46c1", "icon": "grape"},
-            {"code": "pupuk", "name": "Produksi Pupuk", "color": "#b45309", "icon": "beaker"},
-            {"code": "pembibitan", "name": "Pembibitan", "color": "#059669", "icon": "sprout"},
-            {"code": "gudang", "name": "Gudang", "color": "#2563eb", "icon": "warehouse"},
+            {"code": "warung", "name": "Warung Makan", "color": "#ea580c", "icon": "utensils", "batch_on_production": False, "batch_on_harvest": False},
+            {"code": "anggur", "name": "Kebun", "color": "#6b46c1", "icon": "sprout", "batch_on_production": True, "batch_on_harvest": True},
+            {"code": "pupuk", "name": "Produksi Pupuk", "color": "#b45309", "icon": "beaker", "batch_on_production": True, "batch_on_harvest": False},
+            {"code": "peternakan", "name": "Peternakan", "color": "#0891b2", "icon": "activity", "batch_on_production": True, "batch_on_harvest": True},
+            {"code": "pembibitan", "name": "Pembibitan", "color": "#059669", "icon": "sprout", "batch_on_production": True, "batch_on_harvest": True},
+            {"code": "gudang", "name": "Gudang", "color": "#2563eb", "icon": "warehouse", "batch_on_production": False, "batch_on_harvest": False},
         ]
         for d in defaults:
             await insert_doc("business_units", {**d, "active": True})
@@ -4601,7 +4841,7 @@ async def delete_unit(uid: str, user: dict = Depends(get_current_user)):
     u = await db.business_units.find_one({"id": uid})
     if not u:
         raise HTTPException(404, "Tidak ditemukan")
-    if u["code"] in ("warung", "anggur", "pupuk", "pembibitan", "gudang"):
+    if u["code"] in ("warung", "anggur", "pupuk", "peternakan", "pembibitan", "gudang"):
         raise HTTPException(400, "Unit default tidak bisa dihapus")
     await db.business_units.delete_one({"id": uid})
     return {"ok": True}

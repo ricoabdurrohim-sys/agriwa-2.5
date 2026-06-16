@@ -46,7 +46,7 @@ export default function Pupuk() {
     <div className="space-y-4 fade-in">
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Produksi Pupuk</h1>
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Produksi</h1>
           <p className="text-sm text-gray-500 mt-0.5">Batch produksi dengan checklist bahan</p>
         </div>
         <div className="flex gap-2">
@@ -84,7 +84,7 @@ export default function Pupuk() {
         </TabsContent>
         <TabsContent value="recipes" className="p-4">
           {recipes.length === 0 ? (
-            <div className="text-center py-8 text-gray-400 text-sm">Belum ada formula pupuk. Tambahkan di menu Resep & BOM.</div>
+            <div className="text-center py-8 text-gray-400 text-sm">Belum ada formula. Tambahkan di menu Resep & BOM.</div>
           ) : (
             <div className="grid sm:grid-cols-2 gap-3">
               {recipes.map((r) => (
@@ -100,12 +100,12 @@ export default function Pupuk() {
 
       <Dialog open={show} onOpenChange={(o) => { setShow(o); if (!o) setPreview(null); }}>
         <DialogContent className="max-w-lg">
-          <DialogHeader><DialogTitle>Mulai Produksi Pupuk</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle>Mulai Produksi</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div>
               <Label>Pilih Formula</Label>
               <Select value={recipeId} onValueChange={setRecipeId}>
-                <SelectTrigger data-testid="prod-recipe-select"><SelectValue placeholder="Pilih formula pupuk" /></SelectTrigger>
+                <SelectTrigger data-testid="prod-recipe-select"><SelectValue placeholder="Pilih formula" /></SelectTrigger>
                 <SelectContent>{recipes.map((r) => <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>)}</SelectContent>
               </Select>
             </div>

@@ -17,6 +17,7 @@ import Pengaturan from "@/pages/Pengaturan";
 import Bantuan from "@/pages/Bantuan";
 import Pupuk from "@/pages/Pupuk";
 import Anggur from "@/pages/Anggur";
+import Peternakan from "@/pages/Peternakan";
 import Pembelian from "@/pages/Pembelian";
 import KDS from "@/pages/KDS";
 import Karyawan from "@/pages/Karyawan";
@@ -54,6 +55,8 @@ function AppRouter() {
         <Route path="/laporan" element={<Laporan />} />
         <Route path="/pupuk" element={<Pupuk />} />
         <Route path="/anggur" element={<Anggur />} />
+        <Route path="/kebun" element={<Anggur />} />
+        <Route path="/peternakan" element={<Peternakan />} />
         <Route path="/pembelian" element={<Pembelian />} />
         <Route path="/karyawan" element={<Karyawan />} />
         <Route path="/opname" element={<StockOpname />} />

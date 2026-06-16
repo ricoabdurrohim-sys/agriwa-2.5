@@ -70,7 +70,7 @@ export default function Anggur() {
       area_sqm: parseFloat(plotForm.area_sqm) || 0,
       planted_count: parseInt(plotForm.planted_count) || 0,
       inventory_item_id: plotForm.inventory_mode === "existing" ? plotForm.inventory_item_id : "",
-      inventory_item_name: plotForm.inventory_item_name || `Tanaman Anggur - ${plotForm.name}`,
+      inventory_item_name: plotForm.inventory_item_name || `Tanaman - ${plotForm.name}`,
     };
     if (payload.inventory_mode === "existing" && !payload.inventory_item_id) return toast.error("Pilih item inventori untuk jumlah tanaman");
     if (editPlot) await api.put(`/vineyard/plots/${editPlot.id}`, payload);
@@ -130,7 +130,7 @@ export default function Anggur() {
   const printInvoice = (inv) => {
     printViaIframe({ title: inv.invoice_no, css: "body{font-family:monospace;padding:20px} .r{display:flex;justify-content:space-between;border-bottom:1px dashed #ddd;padding:4px 0} h2{text-align:center}", buildBody: (doc) => {
       const d = doc.createElement("div");
-      d.innerHTML = `<h2>INVOICE ANGGUR</h2><p>No: ${inv.invoice_no}</p><p>Pelanggan: ${inv.customer_name || "-"}</p><hr/>${(inv.items||[]).map(it=>`<div class='r'><span>${it.name} ${it.quantity}x</span><b>${formatRupiah(it.quantity*it.unit_price)}</b></div>`).join("")}<h3>Total: ${formatRupiah(inv.total)}</h3><p>Dibayar: ${formatRupiah(inv.paid || 0)}</p><p>Sisa: ${formatRupiah(inv.total - (inv.paid || 0))}</p>`;
+      d.innerHTML = `<h2>INVOICE KEBUN</h2><p>No: ${inv.invoice_no}</p><p>Pelanggan: ${inv.customer_name || "-"}</p><hr/>${(inv.items||[]).map(it=>`<div class='r'><span>${it.name} ${it.quantity}x</span><b>${formatRupiah(it.quantity*it.unit_price)}</b></div>`).join("")}<h3>Total: ${formatRupiah(inv.total)}</h3><p>Dibayar: ${formatRupiah(inv.paid || 0)}</p><p>Sisa: ${formatRupiah(inv.total - (inv.paid || 0))}</p>`;
       return d;
     }});
   };
@@ -139,14 +139,14 @@ export default function Anggur() {
     <div className="space-y-4 fade-in">
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Kebun Anggur</h1>
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Kebun</h1>
           <p className="text-sm text-gray-500 mt-0.5">Plot, aktivitas, input kebun, panen, gudang, dan penjualan B2B terintegrasi</p>
         </div>
       </div>
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
         <Summary title="Total Panen" value={`${totalHarvest.toLocaleString('id-ID')} kg`} icon={<Grape />} />
-        <Summary title="Stok Anggur Gudang" value={`${totalStockGrape.toLocaleString('id-ID')} kg`} icon={<Wheat />} />
+        <Summary title="Stok Hasil Panen" value={`${totalStockGrape.toLocaleString('id-ID')} kg`} icon={<Wheat />} />
         <Summary title="Biaya Kebun" value={formatRupiah(totalCost)} icon={<Sprout />} />
         <Summary title="Piutang B2B" value={formatRupiah(totalB2B - totalB2BPaid)} icon={<Wallet />} />
       </div>
@@ -190,7 +190,7 @@ export default function Anggur() {
 
         <TabsContent value="harvests" className="p-4 space-y-3">
           <Button disabled={plots.length === 0} onClick={() => setShowHarv(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><Wheat className="w-4 h-4 mr-1.5" /> Catat Panen</Button>
-          <List rows={harvests} empty="Belum ada panen" render={(h) => <Row key={h.id} icon={<Grape />} title={`${h.plot_name || plots.find(x=>x.id===h.plot_id)?.name || 'Plot'} · ${h.quantity_kg} kg`} subtitle={`${formatDate(h.date)} · Kualitas ${h.quality_grade} · masuk: ${h.inventory_item_name || 'Inventori Anggur'}`} right={<button onClick={() => deleteHarvest(h)} className="text-red-600"><Trash2 className="w-4 h-4" /></button>} />} />
+          <List rows={harvests} empty="Belum ada panen" render={(h) => <Row key={h.id} icon={<Grape />} title={`${h.plot_name || plots.find(x=>x.id===h.plot_id)?.name || 'Plot'} · ${h.quantity_kg} kg`} subtitle={`${formatDate(h.date)} · Kualitas ${h.quality_grade} · masuk: ${h.inventory_item_name || 'Inventori Panen'}`} right={<button onClick={() => deleteHarvest(h)} className="text-red-600"><Trash2 className="w-4 h-4" /></button>} />} />
         </TabsContent>
 
         <TabsContent value="b2b" className="p-4 space-y-3">
@@ -200,7 +200,7 @@ export default function Anggur() {
 
         <TabsContent value="invoices" className="p-4 space-y-3">
           <Button disabled={customers.length === 0} onClick={() => setShowInv(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><FileText className="w-4 h-4 mr-1.5" /> Invoice Baru</Button>
-          <List rows={invoices} empty="Belum ada invoice" render={(inv) => <Row key={inv.id} icon={<FileText />} title={`${inv.invoice_no} · ${inv.customer_name || '—'}`} subtitle={`${formatRupiah(inv.total)} · dibayar ${formatRupiah(inv.paid || 0)}`} badge={<Badge className={inv.status === 'paid' ? 'bg-emerald-600' : 'bg-amber-500'}>{inv.status}</Badge>} right={<div className="flex gap-2"><button onClick={() => printInvoice(inv)} className="text-gray-600"><Printer className="w-4 h-4" /></button><Button size="sm" variant="outline" onClick={() => payInvoice(inv)}>Bayar</Button></div>} />} />
+          <List rows={invoices} empty="Belum ada invoice" render={(inv) => <Row key={inv.id} icon={<FileText />} title={`${inv.invoice_no} · ${inv.customer_name || '—'}`} subtitle={`${formatRupiah(inv.total)} · dibayar ${formatRupiah(inv.paid || 0)}`} badge={<Badge className={inv.status === 'paid' ? 'bg-emerald-600' : 'bg-amber-500'}>{inv.status}</Badge>} right={<div className="flex gap-2"><button onClick={() => printInvoice(inv)} className="text-gray-600"><Printer className="w-4 h-4" /></button><button onClick={() => deleteInvoice(inv)} className="text-red-600"><Trash2 className="w-4 h-4" /></button><Button size="sm" variant="outline" onClick={() => payInvoice(inv)}>Bayar</Button></div>} />} />
         </TabsContent>
       </Tabs>
 
@@ -219,7 +219,7 @@ export default function Anggur() {
             <div className="text-xs font-semibold text-purple-900">Integrasi Inventori Tanaman</div>
             <SelectField label="Catat jumlah tanaman ke inventori?" value={plotForm.inventory_mode || 'auto'} onChange={(v)=>setPlotForm({...plotForm,inventory_mode:v})} items={[{value:'auto',label:'Belum punya item — buat otomatis'}, {value:'existing',label:'Sudah punya item — pilih dari inventori'}, {value:'none',label:'Jangan catat ke inventori'}]} />
             {plotForm.inventory_mode === 'existing' && <SelectField label="Item Inventori Tanaman" value={plotForm.inventory_item_id || ''} onChange={(v)=>setPlotForm({...plotForm,inventory_item_id:v})} items={inventory.filter(i => (i.business_unit === 'anggur') && ['pohon','batang','pcs'].includes(String(i.unit || '').toLowerCase())).map(i=>({value:i.id,label:`${i.name} · stok ${i.current_stock || 0} ${i.unit}`}))} />}
-            {plotForm.inventory_mode === 'auto' && <Field label="Nama item inventori otomatis" value={plotForm.inventory_item_name || `Tanaman Anggur - ${plotForm.name || 'Plot'}`} onChange={(v)=>setPlotForm({...plotForm,inventory_item_name:v})}/>} 
+            {plotForm.inventory_mode === 'auto' && <Field label="Nama item inventori otomatis" value={plotForm.inventory_item_name || `Tanaman - ${plotForm.name || 'Plot'}`} onChange={(v)=>setPlotForm({...plotForm,inventory_item_name:v})}/>} 
             <div className="text-[11px] text-purple-800">Saat disimpan, jumlah tanaman akan masuk Inventori & Gudang sebagai stok aset tanaman. Saat jumlah tanaman diedit, sistem hanya menyesuaikan selisihnya.</div>
           </div>
           <Label>Catatan</Label>
