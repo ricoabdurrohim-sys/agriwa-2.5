@@ -4,6 +4,7 @@ import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, Utensi
 import { QRCodeCanvas } from "qrcode.react";
 import api, { formatRupiah } from "@/lib/api";
 import { printViaIframe } from "@/lib/safePrint";
+import { printThermalOrderQr, isPrinterAvailable } from "@/lib/printer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -330,20 +331,43 @@ export default function Warung() {
     const printActiveOrderQr = async () => {
       const latestCart = getCurrentCart();
       if (!latestCart.length) return toast.error("Isi pesanan dulu sebelum print QR pesanan");
+      let savedOrder = null;
       try {
-        const savedOrder = await ensureCurrentOrderSaved();
+        savedOrder = await ensureCurrentOrderSaved();
         if (!savedOrder?.id) return toast.error("Order belum siap untuk QR");
         const url = `${window.location.origin}/warung?table=${encodeURIComponent(activeTable.id)}&order=${encodeURIComponent(savedOrder.id)}`;
-        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(url)}`;
-        const rows = latestCart.map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(Number(it.quantity || 0) * Number(it.unit_price || 0))}</b></div>`).join("");
-        printViaIframe({
-          title: `QR Pesanan ${activeTable.name}`,
-          preferWindow: true,
-          css: "@page{size:80mm auto;margin:1.5mm}html,body{margin:0;padding:0}.thermal-print{font-family:'Courier New',monospace;font-size:11px;line-height:1.25;width:74mm;margin:0 auto;color:#111}.center{text-align:center}.title{font-weight:700;font-size:14px}.small{font-size:9.5px}.line{border-top:1px dashed #555;margin:5px 0}.row{display:flex;justify-content:space-between;gap:8px}.item-name{font-weight:600;word-break:break-word}.qr{width:90px;height:90px;display:block;margin:5px auto}.total{font-weight:700;font-size:13px}@media print{body>*:not(.thermal-print):not(main){display:none!important}}",
-          bodyHtml: `<div class="thermal-print"><div class="center title">QR PESANAN</div><div class="center">${activeTable.name}</div><div class="center small">${savedOrder.queue_no || savedOrder.id}</div><div class="line"></div>${rows}<div class="line"></div><div class="row total"><span>Total</span><b>${formatRupiah(totalForItems(latestCart))}</b></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${activeTable.name}</div></div></div>`,
-        });
+        const orderCode = savedOrder.queue_no || savedOrder.id;
+        if (isPrinterAvailable()) {
+          await printThermalOrderQr({
+            tableName: activeTable.name,
+            orderCode,
+            items: latestCart,
+            total: totalForItems(latestCart),
+            qrData: url,
+            footer: "",
+          });
+          toast.success("QR pesanan dikirim ke printer thermal");
+          return;
+        }
+        throw new Error("Web Bluetooth tidak tersedia");
       } catch (e) {
-        toast.error(e?.response?.data?.detail || "Gagal membuat QR pesanan");
+        // Fallback tetap ada supaya kasir tidak berhenti kalau printer belum connect/HP tidak support Bluetooth.
+        try {
+          if (!savedOrder?.id) savedOrder = await ensureCurrentOrderSaved();
+          if (!savedOrder?.id) throw e;
+          const url = `${window.location.origin}/warung?table=${encodeURIComponent(activeTable.id)}&order=${encodeURIComponent(savedOrder.id)}`;
+          const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(url)}`;
+          const rows = latestCart.map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(Number(it.quantity || 0) * Number(it.unit_price || 0))}</b></div>`).join("");
+          printViaIframe({
+            title: `QR Pesanan ${activeTable.name}`,
+            preferWindow: true,
+            css: "@page{size:80mm auto;margin:1.5mm}html,body{margin:0;padding:0}.thermal-print{font-family:'Courier New',monospace;font-size:11px;line-height:1.25;width:74mm;margin:0 auto;color:#111}.center{text-align:center!important}.title{font-weight:800;font-size:15px;text-align:center!important}.small{font-size:9.5px}.line{border-top:1px dashed #555;margin:5px 0}.row{display:flex;justify-content:space-between;gap:8px}.item-name{font-weight:600;word-break:break-word}.qr{width:82px;height:82px;display:block;margin:5px auto}.total{font-weight:700;font-size:13px}@media print{body>*:not(.thermal-print):not(main){display:none!important}}",
+            bodyHtml: `<div class="thermal-print"><div class="center title">QR PESANAN</div><div class="center"><b>${activeTable.name}</b></div><div class="center small">${savedOrder.queue_no || savedOrder.id}</div><div class="line"></div>${rows}<div class="line"></div><div class="row total"><span>Total</span><b>${formatRupiah(totalForItems(latestCart))}</b></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${activeTable.name}</div></div></div>`,
+          });
+          toast.info("Thermal gagal/Belum connect, dibuka fallback print browser 80mm");
+        } catch (err) {
+          toast.error(err?.response?.data?.detail || err?.message || "Gagal membuat QR pesanan");
+        }
       }
     };
 

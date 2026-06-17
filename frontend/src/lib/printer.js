@@ -1,6 +1,7 @@
 // ESC/POS thermal printer via Web Bluetooth
-// Stabilized for AgriWarung 80mm receipts. Keeps the original Bluetooth flow,
-// adds 80mm text layout, smaller QR, optional logo bitmap, and fast chunk writes.
+// AgriWarung 80mm stable print helper.
+// Keeps the old Bluetooth UUID flow that already worked, but fixes 80mm alignment,
+// business-name font weight, direct table-order QR print, and logo bitmap conversion.
 
 const PRINTER_SERVICE = "000018f0-0000-1000-8000-00805f9b34fb";
 const PRINTER_CHAR = "00002af1-0000-1000-8000-00805f9b34fb";
@@ -65,9 +66,10 @@ async function ensurePrinter() {
   return printer;
 }
 
-async function writeEscPos(data) {
+async function writeEscPos(data, opts = {}) {
   const printer = await ensurePrinter();
-  const chunkSize = 160;
+  const chunkSize = Number(opts.chunkSize || 128);
+  const delay = Number(opts.delay || 10);
   for (let i = 0; i < data.length; i += chunkSize) {
     const chunk = data.slice(i, i + chunkSize);
     if (printer.characteristic.writeValueWithoutResponse) {
@@ -75,12 +77,16 @@ async function writeEscPos(data) {
     } else {
       await printer.characteristic.writeValue(chunk);
     }
-    await sleep(12);
+    if (delay > 0) await sleep(delay);
   }
 }
 
 function normalizeLines(value = "") {
-  return String(value || "").replace(/\r\n/g, "\n").split("\n").map((s) => s.trim()).filter(Boolean);
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function wrapText(text, width = 48) {
@@ -104,14 +110,66 @@ function padPair(left, right, width = 48) {
   return left + " ".repeat(width - left.length - right.length) + right;
 }
 
-function centerText(s, width = 48) {
-  s = String(s || "");
-  if (s.length >= width) return s;
-  return " ".repeat(Math.floor((width - s.length) / 2)) + s;
+function align(mode = "left") {
+  const map = { left: 0, center: 1, right: 2 };
+  return bytes(ESC, 0x61, map[mode] ?? 0);
 }
 
-async function imageUrlToEscposRaster(url, maxWidth = 256) {
-  if (!url || typeof document === "undefined") return new Uint8Array([]);
+function bold(on = true) { return bytes(ESC, 0x45, on ? 1 : 0); }
+function textSize(n = 0x00) { return bytes(GS, 0x21, n); }
+
+function pushCenteredLines(cmds, text, width = 48, { uppercase = false, boldText = false, size = 0x00 } = {}) {
+  const lines = normalizeLines(text).flatMap((l) => wrapText(uppercase ? l.toUpperCase() : l, width));
+  if (!lines.length) return;
+  cmds.push(align("center"));
+  cmds.push(bold(boldText));
+  cmds.push(textSize(size));
+  // Important: do not manually pad spaces here. ESC/POS align center handles centering.
+  for (const line of lines) cmds.push(strBytes(line + "\n"));
+  cmds.push(textSize(0x00));
+  cmds.push(bold(false));
+}
+
+function resolveMaybeRelativeUrl(url) {
+  if (!url) return "";
+  const raw = String(url);
+  if (raw.startsWith("data:") || raw.startsWith("blob:") || raw.startsWith("http")) return raw;
+  const backend = process.env.REACT_APP_BACKEND_URL || "";
+  if (raw.startsWith("/api/uploads/") && backend) return `${backend}${raw}`;
+  if (raw.startsWith("/")) return `${window.location.origin}${raw}`;
+  return raw;
+}
+
+async function loadImageElement(url) {
+  const absolute = resolveMaybeRelativeUrl(url);
+  if (!absolute || typeof document === "undefined") return null;
+
+  // Fetch-to-blob first. This usually avoids canvas tainting and is the most reliable
+  // path for HF /api/uploads/* images before converting to ESC/POS raster bytes.
+  try {
+    const token = localStorage.getItem("aw_token") || "";
+    const res = await fetch(absolute, {
+      mode: "cors",
+      credentials: "omit",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = objectUrl;
+      });
+      img.__awObjectUrl = objectUrl;
+      return img;
+    }
+  } catch (e) {
+    console.warn("Gagal fetch logo untuk ESC/POS, coba mode image biasa.", e);
+  }
+
   try {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -119,37 +177,61 @@ async function imageUrlToEscposRaster(url, maxWidth = 256) {
     await new Promise((resolve, reject) => {
       img.onload = resolve;
       img.onerror = reject;
-      img.src = url;
+      img.src = absolute;
     });
-    const ratio = Math.min(1, maxWidth / (img.naturalWidth || maxWidth));
-    const w = Math.max(8, Math.floor((img.naturalWidth || maxWidth) * ratio));
-    const h = Math.max(8, Math.floor((img.naturalHeight || 80) * ratio));
+    return img;
+  } catch (e) {
+    console.warn("Logo/gambar tidak bisa dimuat untuk print thermal.", e);
+    return null;
+  }
+}
+
+async function imageUrlToEscposRaster(url, maxWidth = 256) {
+  const img = await loadImageElement(url);
+  if (!img) return new Uint8Array([]);
+  try {
+    const ratio = Math.min(1, maxWidth / (img.naturalWidth || img.width || maxWidth));
+    let w = Math.max(8, Math.floor((img.naturalWidth || img.width || maxWidth) * ratio));
+    let h = Math.max(8, Math.floor((img.naturalHeight || img.height || 80) * ratio));
+    // ESC/POS raster rows are cleaner when width is divisible by 8.
+    w = Math.max(8, Math.floor(w / 8) * 8);
     const canvas = document.createElement("canvas");
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
-    const data = ctx.getImageData(0, 0, w, h).data;
+    const rgba = ctx.getImageData(0, 0, w, h).data;
+
+    // Simple ordered dithering so colored logos still have visible detail on 1-bit thermal print.
+    const bayer = [
+      [15, 135, 45, 165],
+      [195, 75, 225, 105],
+      [60, 180, 30, 150],
+      [240, 120, 210, 90],
+    ];
     const bytesPerRow = Math.ceil(w / 8);
     const raster = new Uint8Array(bytesPerRow * h);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const idx = (y * w + x) * 4;
-        const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-        if (data[idx + 3] > 40 && lum < 160) {
+        const alpha = rgba[idx + 3];
+        const lum = 0.299 * rgba[idx] + 0.587 * rgba[idx + 1] + 0.114 * rgba[idx + 2];
+        const threshold = bayer[y % 4][x % 4];
+        if (alpha > 40 && lum < threshold) {
           raster[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
         }
       }
     }
+    try { if (img.__awObjectUrl) URL.revokeObjectURL(img.__awObjectUrl); } catch {}
     return concat(
-      bytes(ESC, 0x61, 0x01),
+      align("center"),
       bytes(GS, 0x76, 0x30, 0x00, bytesPerRow & 0xff, (bytesPerRow >> 8) & 0xff, h & 0xff, (h >> 8) & 0xff),
       raster,
       strBytes("\n")
     );
   } catch (e) {
-    console.warn("Logo/gambar struk tidak bisa dikonversi ke ESC/POS, struk tetap dicetak teks.", e);
+    console.warn("Logo/gambar struk tidak bisa dikonversi ke ESC/POS. Browser print tetap bisa menampilkan gambar.", e);
     return new Uint8Array([]);
   }
 }
@@ -166,16 +248,16 @@ export async function printReceipt(receipt, opts = {}) {
 
   cmds.push(bytes(ESC, 0x40));
   cmds.push(bytes(ESC, 0x74, 0x00)); // codepage default
-  const logo = await imageUrlToEscposRaster(logoUrl, 220);
+  const logo = await imageUrlToEscposRaster(logoUrl, 256);
   if (logo.length) cmds.push(logo);
 
-  cmds.push(bytes(ESC, 0x61, 0x01));
-  cmds.push(bytes(GS, 0x21, 0x00)); // jangan double size agar nama usaha tidak kegedean
-  for (const line of normalizeLines(headerName).flatMap((l) => wrapText(l.toUpperCase(), width))) cmds.push(strBytes(centerText(line, width) + "\n"));
-  for (const line of normalizeLines(subLine).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
-  if (phoneLine) for (const line of wrapText("Telp: " + phoneLine, width)) cmds.push(strBytes(centerText(line, width) + "\n"));
+  // Nama lini bisnis: lebih besar dan bold, tapi tidak double-width agar tetap muat 80mm.
+  pushCenteredLines(cmds, headerName, width, { uppercase: true, boldText: true, size: 0x10 });
+  pushCenteredLines(cmds, subLine, width, { uppercase: false, boldText: false, size: 0x00 });
+  if (phoneLine) pushCenteredLines(cmds, "Telp: " + phoneLine, width, { uppercase: false, boldText: false, size: 0x00 });
+
+  cmds.push(align("left"));
   cmds.push(strBytes("-".repeat(width) + "\n"));
-  cmds.push(bytes(ESC, 0x61, 0x00));
   cmds.push(strBytes(`No: ${receipt.trx_no || receipt.id || "-"}\n`));
   if (receipt.queue_no) cmds.push(strBytes(`Antrian: ${receipt.queue_no}\n`));
   cmds.push(strBytes(`${receipt.created_at ? new Date(receipt.created_at).toLocaleString("id-ID") : new Date().toLocaleString("id-ID")}\n`));
@@ -189,9 +271,9 @@ export async function printReceipt(receipt, opts = {}) {
   cmds.push(strBytes("-".repeat(width) + "\n"));
   cmds.push(strBytes(padPair("Subtotal", formatRp(receipt.subtotal || receipt.total || 0), width) + "\n"));
   if (Number(receipt.discount || 0) > 0) cmds.push(strBytes(padPair("Diskon", "-" + formatRp(receipt.discount), width) + "\n"));
-  cmds.push(bytes(ESC, 0x45, 0x01));
+  cmds.push(bold(true));
   cmds.push(strBytes(padPair("TOTAL", formatRp(receipt.total || 0), width) + "\n"));
-  cmds.push(bytes(ESC, 0x45, 0x00));
+  cmds.push(bold(false));
   if (receipt.payment_method === "cash") {
     cmds.push(strBytes(padPair("Bayar", formatRp(receipt.cash_received || 0), width) + "\n"));
     cmds.push(strBytes(padPair("Kembali", formatRp(receipt.change || 0), width) + "\n"));
@@ -200,18 +282,17 @@ export async function printReceipt(receipt, opts = {}) {
   }
   if (receipt.trx_no) {
     cmds.push(strBytes("-".repeat(width) + "\n"));
-    cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(String(receipt.trx_no), 4)); // lebih kecil untuk 80mm
+    cmds.push(align("center"));
+    cmds.push(escposQr(String(receipt.trx_no), 3)); // kecil dan rapi untuk 80mm
     cmds.push(strBytes(String(receipt.trx_no) + "\n"));
   }
   cmds.push(strBytes("-".repeat(width) + "\n"));
-  cmds.push(bytes(ESC, 0x61, 0x01));
-  for (const line of normalizeLines(note).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
-  for (const line of normalizeLines(footer).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
+  pushCenteredLines(cmds, note, width, { uppercase: false, boldText: false, size: 0x00 });
+  pushCenteredLines(cmds, footer, width, { uppercase: false, boldText: false, size: 0x00 });
   cmds.push(strBytes("\n\n\n"));
   cmds.push(bytes(GS, 0x56, 0x00));
 
-  await writeEscPos(concat(...cmds));
+  await writeEscPos(concat(...cmds), { chunkSize: logo.length ? 96 : 160, delay: logo.length ? 14 : 8 });
 }
 
 function escposQr(data, size = 4) {
@@ -247,23 +328,48 @@ export async function printThermalLabel({ title = "LABEL", subtitle = "", lines 
   const safeLines = Array.isArray(lines) ? lines : [];
   const cmds = [];
   cmds.push(bytes(ESC, 0x40));
-  cmds.push(bytes(ESC, 0x61, 0x01));
-  cmds.push(bytes(GS, 0x21, 0x00));
-  cmds.push(strBytes(String(title || "LABEL").slice(0, 42).toUpperCase() + "\n"));
-  if (subtitle) cmds.push(strBytes(String(subtitle).slice(0, 48) + "\n"));
+  pushCenteredLines(cmds, title || "LABEL", 48, { uppercase: true, boldText: true, size: 0x10 });
+  if (subtitle) pushCenteredLines(cmds, subtitle, 48, { uppercase: false, boldText: false, size: 0x00 });
+  cmds.push(align("left"));
   cmds.push(strBytes("-".repeat(48) + "\n"));
-  cmds.push(bytes(ESC, 0x61, 0x00));
   for (const line of safeLines) for (const l of wrapText(line, 48)) cmds.push(strBytes(l + "\n"));
   if (qrData) {
     cmds.push(strBytes("-".repeat(48) + "\n"));
-    cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(qrData, 4));
+    cmds.push(align("center"));
+    cmds.push(escposQr(qrData, 3));
   }
   if (barcodeData) cmds.push(escposCode128(barcodeData));
-  if (footer) cmds.push(strBytes(String(footer).slice(0, 48) + "\n"));
+  if (footer) pushCenteredLines(cmds, footer, 48, { uppercase: false, boldText: false, size: 0x00 });
   cmds.push(strBytes("\n\n\n"));
   cmds.push(bytes(GS, 0x56, 0x00));
-  await writeEscPos(concat(...cmds));
+  await writeEscPos(concat(...cmds), { chunkSize: 128, delay: 8 });
+}
+
+export async function printThermalOrderQr({ tableName = "Meja", orderCode = "", items = [], total = 0, qrData = "", footer = "AgriWarung" } = {}) {
+  const cmds = [];
+  cmds.push(bytes(ESC, 0x40));
+  pushCenteredLines(cmds, "QR PESANAN", 48, { uppercase: true, boldText: true, size: 0x10 });
+  pushCenteredLines(cmds, tableName, 48, { uppercase: false, boldText: true, size: 0x00 });
+  if (orderCode) pushCenteredLines(cmds, String(orderCode), 48, { uppercase: false, boldText: false, size: 0x00 });
+  cmds.push(align("left"));
+  cmds.push(strBytes("-".repeat(48) + "\n"));
+  for (const it of items || []) {
+    for (const line of wrapText(it.name, 48)) cmds.push(strBytes(line + "\n"));
+    cmds.push(strBytes(padPair(`  ${it.quantity} x ${formatRp(it.unit_price)}`, formatRp(Number(it.unit_price || 0) * Number(it.quantity || 0)), 48) + "\n"));
+  }
+  cmds.push(strBytes("-".repeat(48) + "\n"));
+  cmds.push(bold(true));
+  cmds.push(strBytes(padPair("Total", formatRp(total), 48) + "\n"));
+  cmds.push(bold(false));
+  if (qrData) {
+    cmds.push(strBytes("-".repeat(48) + "\n"));
+    cmds.push(align("center"));
+    cmds.push(escposQr(qrData, 3));
+  }
+  pushCenteredLines(cmds, footer, 48, { uppercase: false, boldText: false, size: 0x00 });
+  cmds.push(strBytes("\n\n\n"));
+  cmds.push(bytes(GS, 0x56, 0x00));
+  await writeEscPos(concat(...cmds), { chunkSize: 128, delay: 8 });
 }
 
 function formatRp(n) {
