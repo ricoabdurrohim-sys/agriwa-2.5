@@ -1,4 +1,5 @@
-/* AgriWarung v2.5.16 - stable 80mm receipt / QR print helper */
+/* AgriWarung v2.5.19 - stable 80mm receipt + QR print helper.
+   Backend tetap pakai server.py asli. Tidak membutuhkan server_patched.py. */
 
 const BACKEND_BASE = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
 
@@ -44,20 +45,21 @@ function normalizeLines(value) {
     .filter((line) => line.length > 0);
 }
 
-function getBusinessOption(options, keyList, fallback = '') {
-  for (const key of keyList) {
+function getOption(options, keys, fallback = '') {
+  for (const key of keys) {
     if (options[key] !== undefined && options[key] !== null && options[key] !== '') return options[key];
     if (options.businessUnit && options.businessUnit[key] !== undefined && options.businessUnit[key] !== null && options.businessUnit[key] !== '') return options.businessUnit[key];
     if (options.receipt && options.receipt[key] !== undefined && options.receipt[key] !== null && options.receipt[key] !== '') return options.receipt[key];
+    if (options.settings && options.settings[key] !== undefined && options.settings[key] !== null && options.settings[key] !== '') return options.settings[key];
   }
   return fallback;
 }
 
-function buildQrImage(qrData, qrImageUrl) {
+function buildQrImage(qrData, qrImageUrl, size = 140) {
   const raw = qrImageUrl || qrData;
   if (!raw) return '';
   if (/^https?:\/\//i.test(raw) && !qrData) return resolveAssetUrl(raw);
-  return `https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=${encodeURIComponent(raw)}`;
+  return `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=0&data=${encodeURIComponent(raw)}`;
 }
 
 function lineHtml(lines, className = '') {
@@ -90,7 +92,7 @@ async function waitForPrintAssets(win) {
       const done = () => resolve();
       img.onload = done;
       img.onerror = done;
-      setTimeout(done, 2500);
+      setTimeout(done, 3500);
     });
   }));
 
@@ -98,7 +100,7 @@ async function waitForPrintAssets(win) {
     try { await win.document.fonts.ready; } catch (_) {}
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, 400));
 }
 
 function openAndPrint(html) {
@@ -113,21 +115,21 @@ function openAndPrint(html) {
     win.print();
     setTimeout(() => {
       try { win.close(); } catch (_) {}
-    }, 1200);
+    }, 1400);
     return true;
   });
 }
 
 export function buildReceipt80mmHtml(transaction = {}, options = {}) {
-  const businessName = getBusinessOption(options, ['receipt_name', 'receiptName', 'business_name', 'businessName', 'name'], 'WARUNG');
-  const address = getBusinessOption(options, ['receipt_address', 'address'], '');
-  const phone = getBusinessOption(options, ['receipt_phone', 'phone'], '');
-  const headerText = getBusinessOption(options, ['receipt_header', 'headerText'], '');
-  const footerText = getBusinessOption(options, ['receipt_footer', 'footerText', 'footer'], 'Terima kasih');
-  const logoUrl = resolveAssetUrl(getBusinessOption(options, ['receipt_logo_url', 'logo_url', 'logoUrl', 'image_url'], ''));
-  const footerImageUrl = resolveAssetUrl(getBusinessOption(options, ['receipt_footer_image_url', 'footerImageUrl'], ''));
-  const qrUrl = buildQrImage(options.qrData, options.qrImageUrl);
-  const qrSizeMm = Math.max(12, Math.min(Number(options.qrSizeMm || 18), 32));
+  const businessName = getOption(options, ['receipt_name', 'receiptName', 'business_name', 'businessName', 'name'], 'WARUNG');
+  const address = getOption(options, ['receipt_address', 'address'], '');
+  const phone = getOption(options, ['receipt_phone', 'phone'], '');
+  const headerText = getOption(options, ['receipt_header', 'headerText'], '');
+  const footerText = getOption(options, ['receipt_footer', 'footerText', 'footer'], 'Terima kasih');
+  const logoUrl = resolveAssetUrl(getOption(options, ['receipt_logo_url', 'logo_url', 'logoUrl', 'image_url'], ''));
+  const footerImageUrl = resolveAssetUrl(getOption(options, ['receipt_footer_image_url', 'footerImageUrl'], ''));
+  const qrUrl = buildQrImage(options.qrData, options.qrImageUrl, 140);
+  const qrSizeMm = Math.max(10, Math.min(Number(options.qrSizeMm || 15), 24));
 
   const invoice = transaction.trx_no || transaction.invoice_no || transaction.invoice || transaction.id || '-';
   const dateLabel = transaction.created_at_label || transaction.date_label || transaction.created_at || new Date().toLocaleString('id-ID');
@@ -156,33 +158,33 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
   .receipt {
     width: 72mm;
     margin: 0 auto;
-    padding: 2.5mm 0 12mm;
-    font-size: 10.2px;
+    padding: 2mm 0 14mm;
+    font-size: 9.8px;
     line-height: 1.22;
     overflow: visible;
   }
   .center { text-align: center; }
   .store-name {
-    font-size: 12.6px;
-    line-height: 1.15;
+    font-size: 11.4px;
+    line-height: 1.13;
     font-weight: 700;
     word-break: break-word;
-    margin: 1mm 0 .8mm;
+    margin: .8mm 0 .6mm;
   }
-  .small { font-size: 9.6px; line-height: 1.2; word-break: break-word; }
+  .small { font-size: 9.2px; line-height: 1.18; word-break: break-word; }
   .preline { white-space: pre-line; word-break: break-word; }
-  .dash { border-top: 1px dashed #000; margin: 4px 0; height: 0; }
-  .row { display: flex; justify-content: space-between; gap: 6px; align-items: flex-start; }
+  .dash { border-top: 1px dashed #000; margin: 3.5px 0; height: 0; }
+  .row { display: flex; justify-content: space-between; gap: 5px; align-items: flex-start; }
   .row > span:last-child { text-align: right; }
-  .item { margin: 0 0 4px; page-break-inside: avoid; }
+  .item { margin: 0 0 3.5px; page-break-inside: avoid; }
   .item-name { font-weight: 700; white-space: normal; word-break: break-word; }
-  .item-meta { display: flex; justify-content: space-between; gap: 6px; }
-  .item-note { font-size: 9.2px; padding-left: 3mm; word-break: break-word; }
+  .item-meta { display: flex; justify-content: space-between; gap: 5px; }
+  .item-note { font-size: 8.8px; padding-left: 3mm; word-break: break-word; }
   .logo-wrap, .footer-img-wrap, .qr-wrap { text-align: center; page-break-inside: avoid; }
-  .logo { max-width: 44mm; max-height: 16mm; object-fit: contain; margin-bottom: 1mm; }
-  .footer-img { max-width: 56mm; max-height: 18mm; object-fit: contain; margin-top: 2mm; }
-  .qr-img { width: ${qrSizeMm}mm; height: ${qrSizeMm}mm; object-fit: contain; margin: 2mm auto 1mm; }
-  .footer { margin-top: 5px; text-align: center; page-break-inside: avoid; }
+  .logo { max-width: 38mm; max-height: 13mm; object-fit: contain; margin-bottom: .8mm; }
+  .footer-img { max-width: 50mm; max-height: 15mm; object-fit: contain; margin-top: 1.5mm; }
+  .qr-img { width: ${qrSizeMm}mm; height: ${qrSizeMm}mm; object-fit: contain; margin: 1.5mm auto .5mm; }
+  .footer { margin-top: 4px; text-align: center; page-break-inside: avoid; }
 </style>
 </head>
 <body>
@@ -221,8 +223,7 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
 export async function printReceipt80mm(transaction = {}, options = {}) {
   const html = buildReceipt80mmHtml(transaction, {
     ...options,
-    includeQrCaption: false,
-    qrSizeMm: options.qrSizeMm || 18,
+    qrSizeMm: options.qrSizeMm || 15,
   });
   return openAndPrint(html);
 }
@@ -234,9 +235,9 @@ export async function printReceipt(transaction = {}, options = {}) {
 export function buildTableQr80mmHtml(table = {}, options = {}) {
   const tableName = table.table_name || table.name || options.tableName || 'Meja';
   const qrData = table.url || options.url || options.qrData || '';
-  const qrUrl = buildQrImage(qrData, options.qrImageUrl);
+  const qrUrl = buildQrImage(qrData, options.qrImageUrl, 180);
   const businessName = options.businessName || options.receiptName || 'AgriWarung';
-  const qrSizeMm = Math.max(24, Math.min(Number(options.qrSizeMm || 34), 44));
+  const qrSizeMm = Math.max(22, Math.min(Number(options.qrSizeMm || 30), 38));
 
   return `<!doctype html>
 <html>
@@ -248,11 +249,11 @@ export function buildTableQr80mmHtml(table = {}, options = {}) {
   html, body { width:80mm; margin:0; padding:0; background:#fff; color:#000; font-family:Consolas,"Courier New",monospace; }
   * { box-sizing:border-box; }
   .qr-ticket { width:72mm; margin:0 auto; padding:4mm 0 10mm; text-align:center; }
-  .brand { font-size:11px; font-weight:700; word-break:break-word; }
-  .title { font-size:14px; font-weight:800; margin-top:2mm; }
-  .table { font-size:19px; font-weight:900; margin:2mm 0; word-break:break-word; }
+  .brand { font-size:10.4px; font-weight:700; word-break:break-word; white-space:pre-line; }
+  .title { font-size:12px; font-weight:800; margin-top:2mm; }
+  .table { font-size:17px; font-weight:900; margin:2mm 0; word-break:break-word; }
   .qr { width:${qrSizeMm}mm; height:${qrSizeMm}mm; object-fit:contain; margin:1mm auto 2mm; }
-  .url { font-size:7.8px; word-break:break-all; }
+  .url { font-size:7.5px; word-break:break-all; }
   .dash { border-top:1px dashed #000; margin:3mm 0; }
 </style>
 </head>

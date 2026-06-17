@@ -1,37 +1,31 @@
-AGRIWARUNG V2.5.16 - PRINT 80MM + QR MEJA
+AGRIWARUNG v2.5.19 - SYNC FULL SAFE FIX
 
-UPLOAD KE GITHUB
-1. Extract ZIP ini.
-2. Copy folder frontend dan backend ke repo GitHub AgriWarung.
-3. Replace file lama kalau diminta.
+INI PATCH KOREKSI DARI PATCH SEBELUMNYA.
+Jangan pakai lagi server_patched.py sebagai start app.
+
+YANG BENAR:
+- Backend HF berjalan dari server.py asli.
+- Dockerfile menjalankan uvicorn server:app.
+- QR meja memakai endpoint public yang sudah ada di server.py asli.
+- Frontend saja yang disesuaikan untuk print QR meja dan self-order.
+
+CARA GITHUB:
+1. Extract ZIP.
+2. Copy isi folder ini ke repo AgriWarung.
+3. Replace file yang sama.
 4. Commit summary:
-   Fix 80mm receipt print and add table QR self order
-5. Push ke GitHub.
+   Sync backend and frontend without server_patched wrapper
+5. Push GitHub.
 6. Tunggu Vercel redeploy.
 
-UPLOAD KE HUGGING FACE
-Karena patch ini menambah endpoint QR meja, HF juga perlu update.
-Upload/replace di HF Space backend:
-- server_patched.py
-- Dockerfile
+CARA HF:
+1. Dari repo GitHub hasil update, masuk folder backend.
+2. Upload semua ISI folder backend ke HF root.
+3. Pastikan root HF berisi server.py, requirements.txt, Dockerfile.
+4. Commit summary HF:
+   Restore full backend server app
 
-Jangan hapus:
-- server.py
-- requirements.txt
-- uploads
-
-Commit summary HF:
-Add table QR self order backend v2.5.16
-
-SETTING PENTING DI HF
-Tambahkan secret/variable jika belum ada:
-FRONTEND_PUBLIC_URL=https://domain-vercel-kamu.vercel.app
-
-Contoh:
-FRONTEND_PUBLIC_URL=https://agriwarung.vercel.app
-
-Kalau variable ini kosong, backend akan mencoba pakai Origin dari frontend saat tombol Print QR dipanggil.
-
-CATATAN
-- Untuk struk dengan gambar/logo, gunakan mode browser print/80mm.
-- Di printer settings: paper 80mm, scale 100%, margin none/default, browser header-footer OFF.
+CATATAN:
+- Kalau HF root tidak ada server.py, runtime pasti error.
+- Paket ini tidak menyertakan server.py penuh karena server.py asli harus diambil dari backend repo kamu agar semua endpoint lama tetap utuh.
+- Jangan membuat server.py baru yang minimal karena akan mematikan menu lama.

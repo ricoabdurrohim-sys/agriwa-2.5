@@ -9,7 +9,6 @@ function tokenHeaders() {
 
 export default function ReceiptSettingsFields({ form, setForm }) {
   const [uploading, setUploading] = useState('');
-
   const update = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
 
   const uploadImage = async (file, key) => {
@@ -26,7 +25,7 @@ export default function ReceiptSettingsFields({ form, setForm }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail || data?.message || 'Upload gagal');
-      update(key, data.url);
+      update(key, data.url || data.file_url || data.path);
     } catch (err) {
       console.error(err);
       alert(err?.message || 'Upload gambar gagal');
@@ -44,7 +43,7 @@ export default function ReceiptSettingsFields({ form, setForm }) {
           rows={2}
           value={form.receipt_name || form.name || ''}
           onChange={(e) => update('receipt_name', e.target.value)}
-          placeholder="Contoh:\nWarung Makan Pak Riko"
+          placeholder={'Contoh:\nWarung Makan Pak Riko'}
         />
         <small>Enter bisa dipakai untuk menurunkan teks ke baris berikutnya.</small>
       </label>
@@ -56,7 +55,7 @@ export default function ReceiptSettingsFields({ form, setForm }) {
           rows={3}
           value={form.receipt_address || form.address || ''}
           onChange={(e) => update('receipt_address', e.target.value)}
-          placeholder="Contoh:\nJl. Raya Sumberejo\nBuka 08.00 - 21.00"
+          placeholder={'Contoh:\nJl. Raya Sumberejo\nBuka 08.00 - 21.00'}
         />
       </label>
 
@@ -67,7 +66,7 @@ export default function ReceiptSettingsFields({ form, setForm }) {
           rows={4}
           value={form.receipt_footer || ''}
           onChange={(e) => update('receipt_footer', e.target.value)}
-          placeholder="Contoh:\nTerima kasih\nBarang yang sudah dibeli tidak dapat dikembalikan"
+          placeholder={'Contoh:\nTerima kasih\nBarang yang sudah dibeli tidak dapat dikembalikan'}
         />
       </label>
 

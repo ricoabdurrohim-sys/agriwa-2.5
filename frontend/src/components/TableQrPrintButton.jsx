@@ -11,7 +11,7 @@ export default function TableQrPrintButton({ table, businessName, className = ''
     }
     try {
       setLoading(true);
-      await printTableQr(table, { businessName, qrSizeMm: 34 });
+      await printTableQr(table, { businessName, qrSizeMm: 30 });
     } catch (err) {
       console.error(err);
       alert(err?.message || 'Gagal print QR meja');

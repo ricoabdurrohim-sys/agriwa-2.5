@@ -1,19 +1,4 @@
-/* Optional stylesheet if your existing print component uses CSS classes. */
 @media print {
   @page { size: 80mm auto; margin: 0; }
-  body { margin: 0 !important; }
-  .agri-receipt-80mm {
-    width: 72mm !important;
-    margin: 0 auto !important;
-    font-family: Consolas, "Courier New", monospace !important;
-    font-size: 10.2px !important;
-    line-height: 1.22 !important;
-  }
-  .agri-receipt-80mm .store-name {
-    font-size: 12.6px !important;
-    line-height: 1.15 !important;
-  }
-  .agri-receipt-80mm .preline { white-space: pre-line !important; }
-  .agri-receipt-80mm img.logo { max-height: 16mm !important; max-width: 44mm !important; }
-  .agri-receipt-80mm img.qr { width: 18mm !important; height: 18mm !important; }
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }

@@ -17,7 +17,7 @@ export default function ThermalPrintTestPanel({ businessUnit }) {
       change: 4000,
     }, {
       businessUnit,
-      qrSizeMm: 18,
+      qrSizeMm: 15,
       footerText: businessUnit?.receipt_footer || 'Terima kasih\nSilakan datang kembali',
     });
   };
