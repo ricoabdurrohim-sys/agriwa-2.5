@@ -1,0 +1,51 @@
+URUTAN UPDATE AGAR AMAN
+
+A. UPDATE HF BACKEND DULU
+1. Download ZIP khusus HF_BACKEND.
+2. Extract ZIP.
+3. Buka Hugging Face Space: rikoabd/agriwarung-2.5.
+4. Upload isi ZIP ke root Space, bukan folder ZIP.
+5. Root HF harus berisi:
+   - Dockerfile
+   - requirements.txt
+   - server.py
+   - uploads/
+6. Hapus file server_patched.py kalau masih ada.
+7. Commit summary HF:
+   Restore stable full backend v2.5.27
+8. Tunggu build selesai.
+9. Test /docs dan /api/health.
+
+B. UPDATE GITHUB / VERCEL
+1. Download ZIP khusus GITHUB.
+2. Extract ZIP.
+3. Copy semua isi folder ke repo GitHub AgriWarung.
+4. Replace file lama.
+5. Hapus file lama ini kalau masih ada:
+   - backend/server_patched.py
+   - backend/requirements.extra.txt
+6. Commit summary GitHub:
+   Restore stable speed and fix 80mm thermal print
+7. Push ke GitHub.
+8. Tunggu Vercel redeploy.
+
+C. VARIABLE YANG TETAP
+HF Secrets:
+- MONGO_URL
+- JWT_SECRET
+HF Variable/Secret:
+- DB_NAME
+- FRONTEND_PUBLIC_URL
+
+Vercel Environment:
+- REACT_APP_BACKEND_URL=https://URL-HF-KAMU.hf.space
+
+D. TEST SETELAH DEPLOY
+1. Login.
+2. Warung > klik meja > klik item cepat 10x.
+3. Print QR Pesanan Meja.
+4. Scan QR Pesanan.
+5. Tambah item dari meja yang terbuka.
+6. Lanjut Bayar ke Kasir.
+7. Konfirmasi Pembayaran.
+8. Cetak Thermal / 80mm.

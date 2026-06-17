@@ -1,18 +1,17 @@
 // ESC/POS thermal printer via Web Bluetooth
-// Compatible with most 58mm/80mm Bluetooth thermal printers
+// Stabilized for AgriWarung 80mm receipts. Keeps the original Bluetooth flow,
+// adds 80mm text layout, smaller QR, optional logo bitmap, and fast chunk writes.
 
 const PRINTER_SERVICE = "000018f0-0000-1000-8000-00805f9b34fb";
 const PRINTER_CHAR = "00002af1-0000-1000-8000-00805f9b34fb";
 
 const ESC = 0x1b;
 const GS = 0x1d;
-const LF = 0x0a;
 
 function bytes(...arr) { return new Uint8Array(arr); }
 
 function strBytes(s) {
-  const enc = new TextEncoder();
-  return enc.encode(s);
+  return new TextEncoder().encode(String(s ?? ""));
 }
 
 function concat(...arrays) {
@@ -24,9 +23,11 @@ function concat(...arrays) {
   return out;
 }
 
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 export async function connectPrinter() {
   if (!navigator.bluetooth) {
-    throw new Error("Web Bluetooth tidak tersedia di browser ini. Aplikasi akan memakai fallback print browser 80mm.");
+    throw new Error("Web Bluetooth tidak tersedia di browser ini. Pakai fallback print browser 80mm.");
   }
   const device = await navigator.bluetooth.requestDevice({
     acceptAllDevices: true,
@@ -35,125 +36,211 @@ export async function connectPrinter() {
   const server = await device.gatt.connect();
   const service = await server.getPrimaryService(PRINTER_SERVICE);
   const characteristic = await service.getCharacteristic(PRINTER_CHAR);
-  // Save for later use (in-memory only)
   window.__awPrinter = { device, characteristic };
   localStorage.setItem("aw_printer_name", device.name || "Printer");
-  return device.name;
+  device.addEventListener?.("gattserverdisconnected", () => {
+    if (window.__awPrinter?.device?.id === device.id) window.__awPrinter = null;
+  });
+  return device.name || "Printer";
 }
 
-export async function printReceipt(receipt, opts = {}) {
+async function ensurePrinter() {
   let printer = window.__awPrinter;
+  if (printer?.device && !printer.device.gatt?.connected) {
+    try {
+      const server = await printer.device.gatt.connect();
+      const service = await server.getPrimaryService(PRINTER_SERVICE);
+      const characteristic = await service.getCharacteristic(PRINTER_CHAR);
+      printer = { device: printer.device, characteristic };
+      window.__awPrinter = printer;
+    } catch {
+      printer = null;
+      window.__awPrinter = null;
+    }
+  }
   if (!printer?.characteristic) {
     await connectPrinter();
     printer = window.__awPrinter;
   }
-  const headerName = (opts.headerName || "AGRIWARUNG").toUpperCase();
-  const subLine = opts.subLine || "";
-  const phoneLine = opts.phone || "";
-  const footer = opts.footer || "Terima kasih!";
-  const cmds = [];
-  // Initialize
-  cmds.push(bytes(ESC, 0x40));
-  // Center, big
-  cmds.push(bytes(ESC, 0x61, 0x01));
-  cmds.push(bytes(GS, 0x21, 0x00));
-  cmds.push(strBytes(headerName + "\n"));
-  cmds.push(bytes(GS, 0x21, 0x00));
-  if (subLine) cmds.push(strBytes(subLine + "\n"));
-  if (phoneLine) cmds.push(strBytes("Telp: " + phoneLine + "\n"));
-  cmds.push(strBytes("--------------------------------\n"));
-  // Left align
-  cmds.push(bytes(ESC, 0x61, 0x00));
-  cmds.push(strBytes(`No: ${receipt.trx_no}\n`));
-  cmds.push(strBytes(`${new Date(receipt.created_at).toLocaleString("id-ID")}\n`));
-  cmds.push(strBytes("--------------------------------\n"));
-  for (const it of receipt.items) {
-    cmds.push(strBytes(`${it.name}\n`));
-    cmds.push(strBytes(`  ${it.quantity}x ${formatRp(it.unit_price)} = ${formatRp(it.unit_price * it.quantity)}\n`));
-  }
-  cmds.push(strBytes("--------------------------------\n"));
-  cmds.push(strBytes(`Subtotal : ${formatRp(receipt.subtotal)}\n`));
-  if (receipt.discount > 0) cmds.push(strBytes(`Diskon   : -${formatRp(receipt.discount)}\n`));
-  cmds.push(bytes(ESC, 0x45, 0x01));
-  cmds.push(strBytes(`TOTAL    : ${formatRp(receipt.total)}\n`));
-  cmds.push(bytes(ESC, 0x45, 0x00));
-  if (receipt.payment_method === "cash") {
-    cmds.push(strBytes(`Bayar    : ${formatRp(receipt.cash_received)}\n`));
-    cmds.push(strBytes(`Kembali  : ${formatRp(receipt.change)}\n`));
-  } else {
-    cmds.push(strBytes(`Bayar    : ${receipt.payment_method.toUpperCase()}\n`));
-  }
-  cmds.push(strBytes("--------------------------------\n"));
-  if (receipt.trx_no) {
-    cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(String(receipt.trx_no), 4));
-    cmds.push(strBytes("--------------------------------\n"));
-  }
-  cmds.push(bytes(ESC, 0x61, 0x01));
-  // Multi-line footer support
-  for (const line of String(footer).split("\n")) {
-    cmds.push(strBytes(line + "\n"));
-  }
-  cmds.push(strBytes("\n\n"));
-  // Cut
-  cmds.push(bytes(GS, 0x56, 0x00));
+  return printer;
+}
 
-  const data = concat(...cmds);
-  // Send in chunks of 100 bytes (BLE MTU limit)
-  const chunkSize = 100;
+async function writeEscPos(data) {
+  const printer = await ensurePrinter();
+  const chunkSize = 160;
   for (let i = 0; i < data.length; i += chunkSize) {
     const chunk = data.slice(i, i + chunkSize);
-    await printer.characteristic.writeValueWithoutResponse(chunk);
-    await new Promise(r => setTimeout(r, 30));
+    if (printer.characteristic.writeValueWithoutResponse) {
+      await printer.characteristic.writeValueWithoutResponse(chunk);
+    } else {
+      await printer.characteristic.writeValue(chunk);
+    }
+    await sleep(12);
   }
 }
 
+function normalizeLines(value = "") {
+  return String(value || "").replace(/\r\n/g, "\n").split("\n").map((s) => s.trim()).filter(Boolean);
+}
 
-function escposQr(data, size = 5) {
+function wrapText(text, width = 48) {
+  const raw = String(text || "").trim();
+  if (!raw) return [""];
+  const words = raw.split(/\s+/);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    if (!line) line = word;
+    else if ((line + " " + word).length <= width) line += " " + word;
+    else { lines.push(line); line = word; }
+  }
+  if (line) lines.push(line);
+  return lines.flatMap((l) => l.length <= width ? [l] : l.match(new RegExp(`.{1,${width}}`, "g")) || [l]);
+}
+
+function padPair(left, right, width = 48) {
+  left = String(left || ""); right = String(right || "");
+  if (left.length + right.length + 1 > width) return `${left}\n${right.padStart(width, " ")}`;
+  return left + " ".repeat(width - left.length - right.length) + right;
+}
+
+function centerText(s, width = 48) {
+  s = String(s || "");
+  if (s.length >= width) return s;
+  return " ".repeat(Math.floor((width - s.length) / 2)) + s;
+}
+
+async function imageUrlToEscposRaster(url, maxWidth = 256) {
+  if (!url || typeof document === "undefined") return new Uint8Array([]);
+  try {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.referrerPolicy = "no-referrer";
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = url;
+    });
+    const ratio = Math.min(1, maxWidth / (img.naturalWidth || maxWidth));
+    const w = Math.max(8, Math.floor((img.naturalWidth || maxWidth) * ratio));
+    const h = Math.max(8, Math.floor((img.naturalHeight || 80) * ratio));
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const bytesPerRow = Math.ceil(w / 8);
+    const raster = new Uint8Array(bytesPerRow * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        if (data[idx + 3] > 40 && lum < 160) {
+          raster[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
+        }
+      }
+    }
+    return concat(
+      bytes(ESC, 0x61, 0x01),
+      bytes(GS, 0x76, 0x30, 0x00, bytesPerRow & 0xff, (bytesPerRow >> 8) & 0xff, h & 0xff, (h >> 8) & 0xff),
+      raster,
+      strBytes("\n")
+    );
+  } catch (e) {
+    console.warn("Logo/gambar struk tidak bisa dikonversi ke ESC/POS, struk tetap dicetak teks.", e);
+    return new Uint8Array([]);
+  }
+}
+
+export async function printReceipt(receipt, opts = {}) {
+  const width = Number(opts.width || 48); // 80mm = ±48 chars in normal font
+  const headerName = (opts.headerName || opts.businessName || "AGRIWARUNG");
+  const subLine = opts.subLine || opts.address || "";
+  const phoneLine = opts.phone || "";
+  const footer = opts.footer || "Terima kasih!";
+  const note = opts.note || "";
+  const logoUrl = opts.logoUrl || opts.logo_url || "";
+  const cmds = [];
+
+  cmds.push(bytes(ESC, 0x40));
+  cmds.push(bytes(ESC, 0x74, 0x00)); // codepage default
+  const logo = await imageUrlToEscposRaster(logoUrl, 220);
+  if (logo.length) cmds.push(logo);
+
+  cmds.push(bytes(ESC, 0x61, 0x01));
+  cmds.push(bytes(GS, 0x21, 0x00)); // jangan double size agar nama usaha tidak kegedean
+  for (const line of normalizeLines(headerName).flatMap((l) => wrapText(l.toUpperCase(), width))) cmds.push(strBytes(centerText(line, width) + "\n"));
+  for (const line of normalizeLines(subLine).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
+  if (phoneLine) for (const line of wrapText("Telp: " + phoneLine, width)) cmds.push(strBytes(centerText(line, width) + "\n"));
+  cmds.push(strBytes("-".repeat(width) + "\n"));
+  cmds.push(bytes(ESC, 0x61, 0x00));
+  cmds.push(strBytes(`No: ${receipt.trx_no || receipt.id || "-"}\n`));
+  if (receipt.queue_no) cmds.push(strBytes(`Antrian: ${receipt.queue_no}\n`));
+  cmds.push(strBytes(`${receipt.created_at ? new Date(receipt.created_at).toLocaleString("id-ID") : new Date().toLocaleString("id-ID")}\n`));
+  if (receipt.customer_name) cmds.push(strBytes(`Pelanggan: ${receipt.customer_name}\n`));
+  cmds.push(strBytes("-".repeat(width) + "\n"));
+
+  for (const it of receipt.items || []) {
+    for (const line of wrapText(it.name, width)) cmds.push(strBytes(line + "\n"));
+    cmds.push(strBytes(padPair(`  ${it.quantity} x ${formatRp(it.unit_price)}`, formatRp(Number(it.unit_price || 0) * Number(it.quantity || 0)), width) + "\n"));
+  }
+  cmds.push(strBytes("-".repeat(width) + "\n"));
+  cmds.push(strBytes(padPair("Subtotal", formatRp(receipt.subtotal || receipt.total || 0), width) + "\n"));
+  if (Number(receipt.discount || 0) > 0) cmds.push(strBytes(padPair("Diskon", "-" + formatRp(receipt.discount), width) + "\n"));
+  cmds.push(bytes(ESC, 0x45, 0x01));
+  cmds.push(strBytes(padPair("TOTAL", formatRp(receipt.total || 0), width) + "\n"));
+  cmds.push(bytes(ESC, 0x45, 0x00));
+  if (receipt.payment_method === "cash") {
+    cmds.push(strBytes(padPair("Bayar", formatRp(receipt.cash_received || 0), width) + "\n"));
+    cmds.push(strBytes(padPair("Kembali", formatRp(receipt.change || 0), width) + "\n"));
+  } else if (receipt.payment_method) {
+    cmds.push(strBytes(`Metode: ${String(receipt.payment_method).toUpperCase()}\n`));
+  }
+  if (receipt.trx_no) {
+    cmds.push(strBytes("-".repeat(width) + "\n"));
+    cmds.push(bytes(ESC, 0x61, 0x01));
+    cmds.push(escposQr(String(receipt.trx_no), 4)); // lebih kecil untuk 80mm
+    cmds.push(strBytes(String(receipt.trx_no) + "\n"));
+  }
+  cmds.push(strBytes("-".repeat(width) + "\n"));
+  cmds.push(bytes(ESC, 0x61, 0x01));
+  for (const line of normalizeLines(note).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
+  for (const line of normalizeLines(footer).flatMap((l) => wrapText(l, width))) cmds.push(strBytes(centerText(line, width) + "\n"));
+  cmds.push(strBytes("\n\n\n"));
+  cmds.push(bytes(GS, 0x56, 0x00));
+
+  await writeEscPos(concat(...cmds));
+}
+
+function escposQr(data, size = 4) {
   const payload = strBytes(String(data || ""));
   const storeLen = payload.length + 3;
   const pL = storeLen % 256;
   const pH = Math.floor(storeLen / 256);
   return concat(
-    // QR model 2
     bytes(GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00),
-    // module size
-    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.max(3, Math.min(8, size))),
-    // correction level M
+    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.max(3, Math.min(6, size))),
     bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31),
-    // store data
     bytes(GS, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30),
     payload,
-    // print
-    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30)
+    bytes(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30),
+    strBytes("\n")
   );
 }
 
 function escposCode128(data) {
   const text = String(data || '').slice(0, 60);
   if (!text) return new Uint8Array([]);
-  const payload = concat(bytes(0x7b, 0x42), strBytes(text)); // Code128 subset B
+  const payload = concat(bytes(0x7b, 0x42), strBytes(text));
   return concat(
-    bytes(GS, 0x68, 0x50), // height
-    bytes(GS, 0x77, 0x02), // width
-    bytes(GS, 0x48, 0x02), // HRI below
+    bytes(GS, 0x68, 0x50),
+    bytes(GS, 0x77, 0x02),
+    bytes(GS, 0x48, 0x02),
     bytes(GS, 0x6b, 0x49, payload.length),
     payload
   );
-}
-
-async function writeEscPos(data) {
-  let printer = window.__awPrinter;
-  if (!printer?.characteristic) {
-    await connectPrinter();
-    printer = window.__awPrinter;
-  }
-  const chunkSize = 100;
-  for (let i = 0; i < data.length; i += chunkSize) {
-    const chunk = data.slice(i, i + chunkSize);
-    await printer.characteristic.writeValueWithoutResponse(chunk);
-    await new Promise(r => setTimeout(r, 30));
-  }
 }
 
 export async function printThermalLabel({ title = "LABEL", subtitle = "", lines = [], qrData = "", barcodeData = "", footer = "" } = {}) {
@@ -161,27 +248,26 @@ export async function printThermalLabel({ title = "LABEL", subtitle = "", lines 
   const cmds = [];
   cmds.push(bytes(ESC, 0x40));
   cmds.push(bytes(ESC, 0x61, 0x01));
-  cmds.push(bytes(GS, 0x21, 0x11));
-  cmds.push(strBytes(String(title || "LABEL").slice(0, 32).toUpperCase() + "\n"));
   cmds.push(bytes(GS, 0x21, 0x00));
-  if (subtitle) cmds.push(strBytes(String(subtitle).slice(0, 42) + "\n"));
-  cmds.push(strBytes("--------------------------------\n"));
+  cmds.push(strBytes(String(title || "LABEL").slice(0, 42).toUpperCase() + "\n"));
+  if (subtitle) cmds.push(strBytes(String(subtitle).slice(0, 48) + "\n"));
+  cmds.push(strBytes("-".repeat(48) + "\n"));
   cmds.push(bytes(ESC, 0x61, 0x00));
-  for (const line of safeLines) cmds.push(strBytes(String(line || "").slice(0, 42) + "\n"));
+  for (const line of safeLines) for (const l of wrapText(line, 48)) cmds.push(strBytes(l + "\n"));
   if (qrData) {
-    cmds.push(strBytes("--------------------------------\n"));
+    cmds.push(strBytes("-".repeat(48) + "\n"));
     cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(qrData, 6));
-    cmds.push(strBytes("Scan QR untuk cek detail\n"));
+    cmds.push(escposQr(qrData, 4));
   }
-  if (footer) cmds.push(strBytes(String(footer).slice(0, 42) + "\n"));
-  cmds.push(strBytes("\n\n"));
+  if (barcodeData) cmds.push(escposCode128(barcodeData));
+  if (footer) cmds.push(strBytes(String(footer).slice(0, 48) + "\n"));
+  cmds.push(strBytes("\n\n\n"));
   cmds.push(bytes(GS, 0x56, 0x00));
   await writeEscPos(concat(...cmds));
 }
 
 function formatRp(n) {
-  const abs = Math.abs(Math.round(n));
+  const abs = Math.abs(Math.round(Number(n || 0)));
   return "Rp" + abs.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
 }
 

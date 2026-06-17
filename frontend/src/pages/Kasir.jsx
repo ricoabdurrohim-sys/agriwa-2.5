@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
-import { printReceipt80mm } from "@/utils/receiptPrint80mm";
+import { printReceipt, isPrinterAvailable } from "@/lib/printer";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 import { resolveImageUrl } from "@/components/ImageUpload";
 import QRCodeBox from "@/components/QRCodeBox";
 import { Button } from "@/components/ui/button";
@@ -46,6 +47,7 @@ export default function Kasir() {
   const [historySearch, setHistorySearch] = useState("");
   const [editTrx, setEditTrx] = useState(null);
   const [settings, setSettings] = useState({ business_name: "", address: "", phone: "", receipt_footer: "", tax_rate: 11, tax_receipt_enabled: true, tax_inclusive: true });
+  const [isCheckingOut, setIsCheckingOut] = useState(false);
   const [transactionType, setTransactionType] = useState("SALE");
   const [redirectAfterReceipt, setRedirectAfterReceipt] = useState(false);
   const [bonInfo, setBonInfo] = useState(null); // {id, customer_name, amount, paid, customer_phone}
@@ -441,9 +443,11 @@ export default function Kasir() {
   const isUnderpaid = !bonInfo && change < 0;
 
   const checkout = async () => {
+    if (isCheckingOut) return;
     if (cart.length === 0) return toast.error("Keranjang kosong");
     if (transactionType === "SALE" && isBon && !customerName) return toast.error("Isi nama pelanggan untuk bon");
     if (transactionType !== "SALE" && !window.confirm("Transaksi ini bukan penjualan. Stok akan berkurang dan HPP dicatat sebagai biaya tanpa pendapatan. Lanjutkan?")) return;
+    setIsCheckingOut(true);
     try {
       let data;
       if (bonInfo) {
@@ -484,6 +488,8 @@ export default function Kasir() {
       }
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Gagal memproses transaksi");
+    } finally {
+      setIsCheckingOut(false);
     }
   };
 
@@ -850,9 +856,9 @@ export default function Kasir() {
             <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">Nama pelanggan wajib diisi agar bon bisa dicari nanti.</div>
           )}
 
-          <Button data-testid="checkout-btn" onClick={checkout} disabled={cart.length === 0 || (bonInfo && paymentDue <= 0)}
+          <Button data-testid="checkout-btn" onClick={checkout} disabled={isCheckingOut || cart.length === 0 || (bonInfo && paymentDue <= 0)}
             className="w-full h-12 bg-[#f4a228] hover:bg-[#d98b1a] text-white font-semibold text-base">
-            {bonInfo ? `Lunasi Bon ${formatRupiah(paymentDue)}` : "Konfirmasi Pembayaran"}
+            {isCheckingOut ? "Memproses..." : (bonInfo ? `Lunasi Bon ${formatRupiah(paymentDue)}` : "Konfirmasi Pembayaran")}
           </Button>
         </div>
       </div>
@@ -1053,7 +1059,7 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <QRCodeBox value={showReceipt.trx_no} size={76} quiet />
+                  <QRCodeBox value={showReceipt.trx_no} size={88} label="" />
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
@@ -1066,23 +1072,40 @@ export default function Kasir() {
               <>
                 <Button data-testid="receipt-bluetooth-btn" variant="outline" className="flex-1 w-full" onClick={async () => {
                   const cfg = getReceiptConfig(showReceipt);
-                  const printBrowser80mm = async () => printReceipt80mm(showReceipt, {
-                    receipt_name: cfg.business_name,
-                    receipt_address: cfg.address || "",
-                    receipt_phone: cfg.phone || "",
-                    receipt_note: cfg.note || "",
-                    receipt_footer: cfg.footer || "Terima kasih!",
-                    receipt_logo: cfg.logo_url || "",
-                    qrData: showReceipt.trx_no || "",
-                    qrSizeMm: 10,
-                  });
+                  const fallbackThermal = () => {
+                    printViaIframe({
+                      title: `Struk ${showReceipt.trx_no}`,
+                      css: thermal80Css(),
+                      preferWindow: true,
+                      buildBody: (doc) => {
+                        const wrap = doc.createElement('div');
+                        wrap.className = 'thermal-print';
+                        const rows = (showReceipt.items || []).map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
+                        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(showReceipt.trx_no || '')}`;
+                        const logo = cfg.logo_url ? `<div class="center"><img class="logo" src="${resolveImageUrl(cfg.logo_url)}"/></div>` : '';
+                        wrap.innerHTML = `${logo}<div class="center title">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small multiline">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row total"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${showReceipt.trx_no || ''}</div></div><div class="line"></div>${cfg.note ? `<div class="center small multiline">${cfg.note}</div>` : ''}<div class="center small multiline">${cfg.footer || 'Terima kasih!'}</div>`;
+                        doc.body.appendChild(wrap);
+                      }
+                    });
+                  };
                   try {
-                    // Browser 80mm diprioritaskan karena mode ini bisa mencetak logo/gambar/footer.
-                    // Raw Bluetooth tetap disiapkan di lib/printer, tetapi banyak printer thermal murah tidak stabil untuk bitmap/logo.
-                    await printBrowser80mm();
-                    toast.success("Struk 80mm siap dicetak");
+                    if (!isPrinterAvailable()) {
+                      fallbackThermal();
+                      toast.info("Web Bluetooth tidak tersedia di browser ini. Dibuka mode print browser ukuran 80mm.");
+                      return;
+                    }
+                    await printReceipt(showReceipt, {
+                      headerName: cfg.business_name,
+                      subLine: cfg.address || "",
+                      phone: cfg.phone || "",
+                      footer: cfg.footer || "Terima kasih!",
+                      note: cfg.note || "",
+                      logoUrl: cfg.logo_url ? resolveImageUrl(cfg.logo_url) : "",
+                    });
+                    toast.success("Struk dikirim ke printer thermal");
                   } catch (e) {
-                    toast.error(e?.message || "Gagal membuka print 80mm");
+                    fallbackThermal();
+                    toast.error((e?.message || "Gagal cetak Bluetooth") + ". Dibuka fallback print browser.");
                   }
                 }}>
                   <Bluetooth className="w-4 h-4 mr-1.5" /> Thermal / 80mm
@@ -1112,16 +1135,12 @@ export default function Kasir() {
                   <MessageCircle className="w-4 h-4 mr-1.5" /> WhatsApp{showReceipt?.customer_phone ? " Pelanggan" : ""}
                 </Button>
                 <Button data-testid="receipt-print-btn" variant="outline" className="flex-1 w-full" onClick={() => {
-                  const cfg = getReceiptConfig(showReceipt);
-                  printReceipt80mm(showReceipt, {
-                    receipt_name: cfg.business_name,
-                    receipt_address: cfg.address || "",
-                    receipt_phone: cfg.phone || "",
-                    receipt_note: cfg.note || "",
-                    receipt_footer: cfg.footer || "Terima kasih!",
-                    receipt_logo: cfg.logo_url || "",
-                    qrData: showReceipt.trx_no || "",
-                    qrSizeMm: 10,
+                  const html = document.getElementById("receipt-content")?.innerHTML || "";
+                  printViaIframe({
+                    title: `Struk ${showReceipt.trx_no}`,
+                    css: thermal80Css(),
+                    bodyHtml: `<div class="thermal-print">${html}</div>`,
+                    preferWindow: true,
                   });
                 }}>
                   <Printer className="w-4 h-4 mr-1.5" /> Print

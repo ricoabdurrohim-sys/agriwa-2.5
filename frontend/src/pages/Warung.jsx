@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone, Edit2 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
 import api, { formatRupiah } from "@/lib/api";
-import { printTableQr } from "@/utils/tableQrPrint";
+import { printViaIframe } from "@/lib/safePrint";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -18,6 +18,7 @@ function elapsedMin(iso) {
 
 export default function Warung() {
   const nav = useNavigate();
+  const [params] = useSearchParams();
   const [tables, setTables] = useState([]);
   const [orders, setOrders] = useState([]);
   const [items, setItems] = useState([]);
@@ -31,6 +32,7 @@ export default function Warung() {
   const [tick, setTick] = useState(0);
   const [draftTakeawayCart, setDraftTakeawayCart] = useState([]);
   const [draftTableCarts, setDraftTableCarts] = useState({});
+  const [localOrderItems, setLocalOrderItems] = useState({});
   const [variantPicker, setVariantPicker] = useState(null);
   const saveTimersRef = useRef({});
   const pendingOrderItemsRef = useRef({});
@@ -82,6 +84,7 @@ export default function Warung() {
       const { data } = await api.put(`/orders/${orderId}/items`, { items: itemsToSave, quiet: true });
       delete pendingOrderItemsRef.current[orderId];
       delete previousOrderRef.current[orderId];
+      setLocalOrderItems((prev) => { const cp = { ...prev }; delete cp[orderId]; return cp; });
       replaceOrderLocal(data);
       return data;
     } catch (e) {
@@ -147,6 +150,13 @@ export default function Warung() {
     orders.forEach((o) => { if (o.status !== "paid" && o.status !== "cancelled") m[o.table_id || "_takeaway"] = o; });
     return m;
   }, [orders]);
+
+  useEffect(() => {
+    const tableParam = params.get("table");
+    if (!tableParam || activeTable || tables.length === 0) return;
+    const row = tables.find((t) => String(t.id) === String(tableParam));
+    if (row) setActiveTable(row);
+  }, [params, tables, activeTable]);
 
   const totalForOrder = (o) => o?.items?.reduce((s, i) => s + i.quantity * i.unit_price, 0) || 0;
   const servedCount = (o) => o?.items?.filter((i) => i.served)?.length || 0;
@@ -217,13 +227,19 @@ export default function Warung() {
   // Table detail view
   if (activeTable) {
     const order = activeTable.takeaway ? orders.find((o) => o.id === activeTable.order_id) : ordersByTable[activeTable.id];
-    const cart = order?.items || (activeTable.takeaway ? draftTakeawayCart : (draftTableCarts[activeTable.id] || []));
-    const total = order ? totalForOrder(order) : totalForItems(cart);
+    const getCurrentCart = () => {
+      if (order?.id) return pendingOrderItemsRef.current[order.id] || localOrderItems[order.id] || order.items || [];
+      if (activeTable.takeaway) return draftTakeawayCart;
+      return draftTableCartsRef.current[activeTable.id] || draftTableCarts[activeTable.id] || [];
+    };
+    const cart = getCurrentCart();
+    const total = order ? totalForItems(cart) : totalForItems(cart);
     const elapsed = order ? elapsedMin(order.created_at) : 0;
 
     const saveItems = async (next) => {
       if (order) {
         const optimistic = { ...order, items: next, updated_at: new Date().toISOString() };
+        setLocalOrderItems((prev) => ({ ...prev, [order.id]: next }));
         replaceOrderLocal(optimistic);
         scheduleOrderItemsSync(order.id, next, order);
         return;
@@ -237,7 +253,7 @@ export default function Warung() {
     };
 
     const upsertLine = async (line, delta) => {
-      const next = [...cart];
+      const next = [...getCurrentCart()];
       const key = lineKey(line);
       const idx = next.findIndex((c) => lineKey(c) === key);
       if (idx >= 0) {
@@ -291,12 +307,50 @@ export default function Warung() {
       }
     };
 
-    const sendToKasir = async () => {
-      if (!order) return toast.error("Proses order dulu sebelum lanjut ke Kasir");
-      if (pendingOrderItemsRef.current[order.id]) {
-        await saveOrderItemsNow(order.id);
+    const ensureCurrentOrderSaved = async () => {
+      const latestCart = getCurrentCart();
+      if (order?.id) {
+        if (pendingOrderItemsRef.current[order.id]) await saveOrderItemsNow(order.id);
+        return { ...order, items: latestCart };
       }
-      nav(`/kasir?${activeTable.takeaway ? "" : `table=${activeTable.id}&`}order=${order.id}`);
+      if (activeTable.takeaway) return null;
+      if (!latestCart.length) return null;
+      if (createTimersRef.current[activeTable.id]) {
+        clearTimeout(createTimersRef.current[activeTable.id]);
+        delete createTimersRef.current[activeTable.id];
+      }
+      const { data } = await api.post("/orders", { table_id: activeTable.id, items: latestCart });
+      const saved = { ...data, items: latestCart };
+      replaceOrderLocal(saved);
+      setDraftTableCarts((prev) => { const cp = { ...prev }; delete cp[activeTable.id]; return cp; });
+      delete draftTableCartsRef.current[activeTable.id];
+      return saved;
+    };
+
+    const printActiveOrderQr = async () => {
+      const latestCart = getCurrentCart();
+      if (!latestCart.length) return toast.error("Isi pesanan dulu sebelum print QR pesanan");
+      try {
+        const savedOrder = await ensureCurrentOrderSaved();
+        if (!savedOrder?.id) return toast.error("Order belum siap untuk QR");
+        const url = `${window.location.origin}/warung?table=${encodeURIComponent(activeTable.id)}&order=${encodeURIComponent(savedOrder.id)}`;
+        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(url)}`;
+        const rows = latestCart.map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(Number(it.quantity || 0) * Number(it.unit_price || 0))}</b></div>`).join("");
+        printViaIframe({
+          title: `QR Pesanan ${activeTable.name}`,
+          preferWindow: true,
+          css: "@page{size:80mm auto;margin:1.5mm}html,body{margin:0;padding:0}.thermal-print{font-family:'Courier New',monospace;font-size:11px;line-height:1.25;width:74mm;margin:0 auto;color:#111}.center{text-align:center}.title{font-weight:700;font-size:14px}.small{font-size:9.5px}.line{border-top:1px dashed #555;margin:5px 0}.row{display:flex;justify-content:space-between;gap:8px}.item-name{font-weight:600;word-break:break-word}.qr{width:90px;height:90px;display:block;margin:5px auto}.total{font-weight:700;font-size:13px}@media print{body>*:not(.thermal-print):not(main){display:none!important}}",
+          bodyHtml: `<div class="thermal-print"><div class="center title">QR PESANAN</div><div class="center">${activeTable.name}</div><div class="center small">${savedOrder.queue_no || savedOrder.id}</div><div class="line"></div>${rows}<div class="line"></div><div class="row total"><span>Total</span><b>${formatRupiah(totalForItems(latestCart))}</b></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${activeTable.name}</div></div></div>`,
+        });
+      } catch (e) {
+        toast.error(e?.response?.data?.detail || "Gagal membuat QR pesanan");
+      }
+    };
+
+    const sendToKasir = async () => {
+      const savedOrder = await ensureCurrentOrderSaved();
+      if (!savedOrder?.id) return toast.error("Proses order dulu sebelum lanjut ke Kasir");
+      nav(`/kasir?${activeTable.takeaway ? "" : `table=${activeTable.id}&`}order=${savedOrder.id}`);
     };
 
     const cancelOrder = async () => {
@@ -377,6 +431,12 @@ export default function Warung() {
                 <span className="text-gray-600">Total Sementara</span>
                 <span className="font-mono font-bold text-base text-[#1a6b3c]" data-testid="warung-total">{formatRupiah(total)}</span>
               </div>
+              {!order && !activeTable.takeaway && cart.length > 0 && (
+                <Button data-testid="print-draft-order-qr-btn" onClick={printActiveOrderQr}
+                  variant="outline" className="w-full h-10 font-semibold border-[#1a6b3c] text-[#1a6b3c] hover:bg-emerald-50">
+                  <QrCode className="w-4 h-4 mr-1.5" /> Print QR Pesanan Meja
+                </Button>
+              )}
               {!order && activeTable.takeaway && (
                 <Button data-testid="process-takeaway-btn" onClick={processTakeawayDraft} disabled={cart.length === 0}
                   className="w-full bg-[#1a6b3c] hover:bg-[#14522d] h-11 font-semibold">
@@ -385,6 +445,10 @@ export default function Warung() {
               )}
               {order && (
                 <>
+                  <Button data-testid="print-order-qr-btn" onClick={printActiveOrderQr} disabled={cart.length === 0}
+                    variant="outline" className="w-full h-10 font-semibold border-[#1a6b3c] text-[#1a6b3c] hover:bg-emerald-50">
+                    <QrCode className="w-4 h-4 mr-1.5" /> Print QR Pesanan Meja
+                  </Button>
                   <Button data-testid="send-to-kasir-btn" onClick={sendToKasir} disabled={cart.length === 0}
                     className="w-full bg-[#f4a228] hover:bg-[#d98b1a] h-11 font-semibold">
                     <Send className="w-4 h-4 mr-1.5" /> Lanjut Bayar ke Kasir
@@ -565,7 +629,7 @@ export default function Warung() {
                   <div className="text-2xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>{qrTable.name}</div>
                 </div>
                 <div className="bg-white p-4 rounded-2xl border-2 border-gray-100 flex justify-center" data-testid="qr-canvas-wrap">
-                  <QRCodeCanvas value={url} size={180} level="H" includeMargin={false} fgColor="#1a6b3c" />
+                  <QRCodeCanvas value={url} size={220} level="H" includeMargin={false} fgColor="#1a6b3c" />
                 </div>
                 <div className="text-[11px] text-center text-gray-500">Pelanggan scan untuk memesan dari HP-nya</div>
                 <div className="bg-gray-50 rounded-lg p-2 text-[11px] font-mono break-all text-gray-700">{url}</div>
@@ -580,9 +644,30 @@ export default function Warung() {
                   </Button>
                 </div>
                 <Button variant="outline" className="w-full" data-testid="print-qr-btn" onClick={() => {
-                  printTableQr({ ...qrTable, url }, { businessName: "AgriWarung", qrSizeMm: 28 });
+                  const canvas = document.querySelector('[data-testid="qr-canvas-wrap"] canvas');
+                  const dataUrl = canvas?.toDataURL("image/png") || "";
+                  printViaIframe({
+                    title: `QR ${qrTable.name}`,
+                    css: "@page{size:80mm auto;margin:2mm}body{font-family:sans-serif;text-align:center;padding:8px;}h1{margin:0 0 4px;font-size:18px;}p{color:#666;font-size:11px;margin-top:3px;}img{margin:10px auto;display:block;}.b{border:1px solid #1a6b3c;border-radius:12px;padding:10px;display:inline-block;max-width:72mm;}",
+                    buildBody: (doc) => {
+                      const box = doc.createElement("div");
+                      box.className = "b";
+                      const h = doc.createElement("h1");
+                      h.textContent = qrTable.name;
+                      const p1 = doc.createElement("p");
+                      p1.textContent = "";
+                      const img = doc.createElement("img");
+                      img.src = dataUrl;
+                      img.width = 190;
+                      const p2 = doc.createElement("p");
+                      p2.style.cssText = "font-size:11px;color:#888;";
+                      p2.textContent = url;
+                      box.appendChild(h); box.appendChild(p1); box.appendChild(img); box.appendChild(p2);
+                      doc.body.appendChild(box);
+                    },
+                  });
                 }}>
-                  Cetak QR 80mm
+                  Cetak QR
                 </Button>
               </div>
             );

@@ -89,13 +89,13 @@ export default function BusinessUnits() {
             <div><Label>Kode (slug)</Label><Input data-testid="unit-code-input" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value.toLowerCase().replace(/\s+/g, "_") })} disabled={editing} className="font-mono" /></div>
             <div>
               <Label>Nama di Struk / Nota</Label>
-              <Textarea data-testid="unit-receipt-name-input" rows={2} value={form.receipt_name || ""} onChange={(e) => setForm({ ...form, receipt_name: e.target.value })} placeholder={"Mis: Warung Pak Didi\nCabang Boyolali"} />
-              <p className="text-[11px] text-gray-500 mt-1">Bisa tekan Enter untuk membuat baris baru di header struk.</p>
+              <Textarea data-testid="unit-receipt-name-input" value={form.receipt_name || ""} onChange={(e) => setForm({ ...form, receipt_name: e.target.value })} placeholder="Mis:\nWarung Pak Didi\nCabang Boyolali" className="min-h-[72px]" />
+              <p className="text-[11px] text-gray-500 mt-1">Tekan Enter untuk turun baris. Format ini ikut ke struk 80mm.</p>
             </div>
-            <div><Label>Alamat di Struk</Label><Textarea data-testid="unit-receipt-address-input" rows={2} value={form.receipt_address || ""} onChange={(e) => setForm({ ...form, receipt_address: e.target.value })} placeholder={"Alamat khusus lini bisnis ini\nBisa baris kedua"} /></div>
+            <div><Label>Alamat di Struk</Label><Textarea data-testid="unit-receipt-address-input" value={form.receipt_address || ""} onChange={(e) => setForm({ ...form, receipt_address: e.target.value })} placeholder="Alamat khusus lini bisnis ini" className="min-h-[72px]" /></div>
             <div><Label>Telepon di Struk</Label><Input data-testid="unit-receipt-phone-input" value={form.receipt_phone || ""} onChange={(e) => setForm({ ...form, receipt_phone: e.target.value })} placeholder="08xxx / 0276..." /></div>
-            <div><Label>Footer Struk</Label><Textarea data-testid="unit-receipt-footer-input" rows={3} value={form.receipt_footer || ""} onChange={(e) => setForm({ ...form, receipt_footer: e.target.value })} placeholder={"Terima kasih\nPromo / kebijakan retur\nSampai jumpa"} /></div>
-            <div><Label>Catatan Struk</Label><Textarea data-testid="unit-receipt-note-input" rows={2} value={form.receipt_note || ""} onChange={(e) => setForm({ ...form, receipt_note: e.target.value })} placeholder={"Catatan tambahan di bawah struk\nBisa multi-baris"} /></div>
+            <div><Label>Footer Struk</Label><Textarea data-testid="unit-receipt-footer-input" value={form.receipt_footer || ""} onChange={(e) => setForm({ ...form, receipt_footer: e.target.value })} placeholder="Terima kasih\nBarang yang sudah dibeli tidak dapat dikembalikan" className="min-h-[86px]" /></div>
+            <div><Label>Catatan Struk</Label><Textarea data-testid="unit-receipt-note-input" value={form.receipt_note || ""} onChange={(e) => setForm({ ...form, receipt_note: e.target.value })} placeholder="Catatan tambahan di bawah struk" className="min-h-[72px]" /></div>
             <ImageUpload value={form.receipt_logo || ""} onChange={(v) => setForm({ ...form, receipt_logo: v })} label="Logo/Gambar di Struk (opsional)" testid="unit-receipt-logo" />
             <div><Label>Deskripsi</Label><Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
             <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 space-y-2">
