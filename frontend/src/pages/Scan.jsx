@@ -8,6 +8,36 @@ import { toast } from "sonner";
 
 const SCANNER_ID = "agriwarung-html5-qr-reader";
 
+function normalizeWarungOrderTarget(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  const fromAwPayload = (text) => {
+    const m = String(text || "").match(/^aw:warung-order:([^:]+):([^:]+)$/i);
+    if (!m) return null;
+    const tableId = decodeURIComponent(m[1] || "");
+    const orderId = decodeURIComponent(m[2] || "");
+    if (!tableId || !orderId) return null;
+    return `/warung?table=${encodeURIComponent(tableId)}&order=${encodeURIComponent(orderId)}&from=scan`;
+  };
+  const aw = fromAwPayload(value);
+  if (aw) return aw;
+  try {
+    const url = new URL(value, window.location.origin);
+    const path = url.pathname || "";
+    const codeParam = url.searchParams.get("code");
+    if (codeParam) {
+      const nested = normalizeWarungOrderTarget(codeParam);
+      if (nested) return nested;
+    }
+    const tableId = url.searchParams.get("table");
+    const orderId = url.searchParams.get("order");
+    if ((path.endsWith("/warung") || path === "/warung") && tableId && orderId) {
+      return `/warung?table=${encodeURIComponent(tableId)}&order=${encodeURIComponent(orderId)}&from=scan`;
+    }
+  } catch {}
+  return null;
+}
+
 export default function Scan() {
   const nav = useNavigate();
   const [params] = useSearchParams();
@@ -39,6 +69,14 @@ export default function Scan() {
     if (!value) return toast.error("Kode kosong");
     if (resolvingRef.current) return;
     resolvingRef.current = true;
+    setStatus("Membuka hasil scan...");
+    const directWarungTarget = normalizeWarungOrderTarget(value);
+    if (directWarungTarget) {
+      await stopCamera();
+      toast.success("QR pesanan Warung ditemukan");
+      nav(directWarungTarget);
+      return;
+    }
     setStatus("Mencari data...");
     try {
       const { data } = await api.get(`/scan/resolve?code=${encodeURIComponent(value)}`);
@@ -122,7 +160,7 @@ export default function Scan() {
             <p className="text-sm text-gray-500">Mode: {modeLabel}</p>
           </div>
         </div>
-        <p className="text-xs text-gray-500 leading-relaxed">Scan QR struk, batch, panen, produksi, kegiatan kebun, atau riwayat lain untuk membuka detail terkait. Jika kamera sulit membaca, ketik nomor nota/batch manual. Scanner external tetap bisa dipakai untuk input manual karena bekerja seperti keyboard.</p>
+        <p className="text-xs text-gray-500 leading-relaxed">Scan QR pesanan Warung, struk, batch, panen, produksi, kegiatan kebun, atau riwayat lain untuk membuka detail terkait. QR pesanan Warung langsung membuka meja dan order aktif, tidak lagi mencari lintas lini bisnis.</p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-3">
@@ -148,7 +186,7 @@ export default function Scan() {
           <Input value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && resolve(code)} placeholder="Nomor nota / batch / kode QR" className="font-mono" />
           <Button variant="outline" onClick={() => resolve(code)}><Search className="w-4 h-4 mr-1" /> Cari</Button>
         </div>
-        <div className="text-[11px] text-gray-500">Contoh input manual: AW-170626-0001, GP160626001, atau kode aw:batch:GP160626001.</div>
+        <div className="text-[11px] text-gray-500">Contoh input manual: AW-170626-0001, GP160626001, aw:batch:GP160626001, atau aw:warung-order:MEJA_ID:ORDER_ID.</div>
       </div>
     </div>
   );

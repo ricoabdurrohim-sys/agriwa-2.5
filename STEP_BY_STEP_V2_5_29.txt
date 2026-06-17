@@ -1,0 +1,37 @@
+STEP BY STEP UPDATE v2.5.29
+
+A. UPDATE HF BACKEND DULU
+1. Download HF_BACKEND_agriwarung_v2_5_29_STABLE_SERVER_QR_SCAN.zip.
+2. Extract.
+3. Upload isi file ke root HF Space:
+   - Dockerfile
+   - requirements.txt
+   - server.py
+   - uploads/ jika ada
+4. Hapus server_patched.py kalau masih ada.
+5. Commit HF: Fix warung order QR scan resolve
+6. Tunggu build sampai running.
+7. Tes /docs dan /api/health.
+
+B. UPDATE GITHUB / VERCEL
+1. Download GITHUB_agriwarung_v2_5_29_QR_SCAN_ERP_UI_FULL.zip.
+2. Extract.
+3. Copy semua isi ke repo GitHub.
+4. Replace file lama.
+5. Commit GitHub: Fix warung order QR scan and desktop dialog UI
+6. Push.
+7. Tunggu Vercel redeploy.
+
+C. TEST WAJIB
+1. Buka Warung.
+2. Klik meja.
+3. Tambah menu.
+4. Print QR Pesanan Meja ke thermal.
+5. Scan QR lewat menu Pintasan Scan.
+6. Harus langsung membuka meja + order aktif tersebut.
+7. Tambah item lagi dari detail meja.
+8. Klik Lanjut ke Kasir.
+9. Selesaikan pembayaran.
+10. Balik Warung, meja harus kosong/available.
+11. Buka dialog besar di desktop, tombol harus tetap terlihat atau bisa discroll.
+12. Buka menu Operasional Pro.

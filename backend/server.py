@@ -349,6 +349,8 @@ async def resolve_scan_code(code: str, user: dict = Depends(get_current_user)):
             decoded = "aw:trx:" + unquote(qs["lookup"][0]).strip()
         elif "batch" in qs and qs["batch"]:
             decoded = "aw:batch:" + unquote(qs["batch"][0]).strip()
+        elif (parsed.path or "").rstrip("/").endswith("/warung") and qs.get("table") and qs.get("order"):
+            decoded = "aw:warung-order:" + unquote(qs["table"][0]).strip() + ":" + unquote(qs["order"][0]).strip()
     except Exception:
         decoded = raw
 
@@ -361,6 +363,15 @@ async def resolve_scan_code(code: str, user: dict = Depends(get_current_user)):
         trx = await db.transactions.find_one({"$or": [{"trx_no": q}, {"id": q}]}, {"_id": 0})
         if trx:
             return payload("transaction", f"/kasir?lookup={quote(trx.get('trx_no') or trx.get('id'))}", trx)
+    if low.startswith("aw:warung-order:"):
+        parts = decoded.split(":", 3)
+        if len(parts) == 4:
+            table_id, order_id = parts[2].strip(), parts[3].strip()
+            order = await db.orders.find_one({"id": order_id, "table_id": table_id}, {"_id": 0})
+            if order and str(order.get("status", "")).lower() not in ("paid", "cancelled", "closed"):
+                return payload("warung_order", f"/warung?table={quote(table_id)}&order={quote(order_id)}&from=scan", order)
+            raise HTTPException(404, "QR pesanan Warung tidak aktif atau sudah selesai dibayar")
+
     if low.startswith("aw:batch:"):
         q = decoded.split(":", 2)[2]
         b = await db.inventory_batches.find_one({"$or": [{"batch_no": q}, {"id": q}]}, {"_id": 0})
@@ -400,7 +411,7 @@ async def resolve_scan_code(code: str, user: dict = Depends(get_current_user)):
     b = await db.inventory_batches.find_one({"$or": [{"batch_no": {"$regex": f"^{re.escape(q)}$", "$options": "i"}}, {"id": q}]}, {"_id": 0})
     if b:
         return payload("inventory_batch", f"/inventori?batch={quote(b.get('batch_no') or b.get('id'))}", b)
-    raise HTTPException(404, "Kode tidak ditemukan di transaksi/batch/produksi/kebun/peternakan")
+    raise HTTPException(404, "Kode tidak ditemukan di QR Warung/transaksi/batch/produksi/kebun/peternakan")
 
 # ---------- Models ----------
 class LoginIn(BaseModel):

@@ -1,0 +1,18 @@
+QA CHECK v2.5.29
+
+Backend:
+- python -m py_compile backend/server.py: OK
+- server_patched.py tidak dipakai.
+- /api/scan/resolve menerima aw:warung-order:TABLE_ID:ORDER_ID.
+- /api/scan/resolve untuk QR Warung tidak fallback mencari transaksi/batch jika order tidak aktif.
+
+Frontend:
+- QR Warung dicetak sebagai link /scan?mode=warung-order&code=aw:warung-order:...
+- Scan.jsx mendeteksi QR Warung di sisi browser sebelum memanggil pencarian global.
+- Dialog default desktop lebih lebar dan tetap scroll.
+- Menu baru Operasional Pro ditambahkan sebagai modul aman.
+
+Manual test:
+- Warung -> input menu -> print QR -> scan -> buka order aktif meja spesifik.
+- Scan nomor nota/batch lama tetap jalan via /api/scan/resolve.
+- Kasir pembayaran order tetap menutup order.

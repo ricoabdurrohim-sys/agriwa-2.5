@@ -6,7 +6,7 @@ import {
   HelpCircle, Menu, LogOut, Bell, ChefHat, Beaker, Truck,
   Briefcase, ClipboardCheck, Building2, Tag, Layers,
   Shield, MessageCircle, Activity, Crown, Building, Eye, EyeOff, Sliders, Check,
-  Package, ScanLine,
+  Package, ScanLine, Workflow,
 } from "lucide-react";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
@@ -27,6 +27,7 @@ const allModules = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, group: "Ringkasan", essential: true },
   { to: "/notifications", label: "Notifikasi", icon: MessageCircle, group: "Ringkasan" },
   { to: "/scan", label: "Pintasan Scan", icon: ScanLine, group: "Ringkasan" },
+  { to: "/operasional-pro", label: "Operasional Pro", icon: Workflow, group: "Ringkasan" },
   { to: "/warung", label: "Warung & Meja", icon: UtensilsCrossed, group: "Operasional", essential: true },
   { to: "/kasir", label: "Kasir POS", icon: Calculator, group: "Operasional", essential: true },
   { to: "/kds", label: "Dapur / KDS", icon: ChefHat, group: "Operasional" },

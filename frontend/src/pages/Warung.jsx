@@ -17,9 +17,20 @@ function elapsedMin(iso) {
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
 }
 
+function buildWarungOrderScanPayload(tableId, orderId) {
+  return `aw:warung-order:${encodeURIComponent(tableId || "")}:${encodeURIComponent(orderId || "")}`;
+}
+
+function buildWarungOrderScanUrl(tableId, orderId) {
+  const payload = buildWarungOrderScanPayload(tableId, orderId);
+  return `${window.location.origin}/scan?mode=warung-order&code=${encodeURIComponent(payload)}`;
+}
+
 export default function Warung() {
   const nav = useNavigate();
   const [params] = useSearchParams();
+  const selectedOrderId = params.get("order") || "";
+  const selectedTableId = params.get("table") || "";
   const [tables, setTables] = useState([]);
   const [orders, setOrders] = useState([]);
   const [items, setItems] = useState([]);
@@ -153,11 +164,20 @@ export default function Warung() {
   }, [orders]);
 
   useEffect(() => {
-    const tableParam = params.get("table");
+    const tableParam = selectedTableId;
+    const orderParam = selectedOrderId;
     if (!tableParam || activeTable || tables.length === 0) return;
     const row = tables.find((t) => String(t.id) === String(tableParam));
     if (row) setActiveTable(row);
-  }, [params, tables, activeTable]);
+
+    // QR pesanan Warung wajib membuka order aktif yang spesifik, bukan scan global lintas menu.
+    // Jika orders/active belum sempat memuat order tersebut, ambil langsung by order_id.
+    if (orderParam && !orders.some((o) => String(o.id) === String(orderParam))) {
+      api.get(`/orders/${encodeURIComponent(orderParam)}`)
+        .then(({ data }) => { if (data?.id) replaceOrderLocal(data); })
+        .catch(() => toast.error("QR pesanan tidak ditemukan atau transaksi sudah selesai"));
+    }
+  }, [selectedTableId, selectedOrderId, tables, orders, activeTable]);
 
   const totalForOrder = (o) => o?.items?.reduce((s, i) => s + i.quantity * i.unit_price, 0) || 0;
   const servedCount = (o) => o?.items?.filter((i) => i.served)?.length || 0;
@@ -227,7 +247,9 @@ export default function Warung() {
 
   // Table detail view
   if (activeTable) {
-    const order = activeTable.takeaway ? orders.find((o) => o.id === activeTable.order_id) : ordersByTable[activeTable.id];
+    const order = activeTable.takeaway
+      ? orders.find((o) => o.id === activeTable.order_id)
+      : (selectedOrderId ? orders.find((o) => String(o.id) === String(selectedOrderId) && String(o.table_id || "") === String(activeTable.id || "")) : null) || ordersByTable[activeTable.id];
     const getCurrentCart = () => {
       if (order?.id) return pendingOrderItemsRef.current[order.id] || localOrderItems[order.id] || order.items || [];
       if (activeTable.takeaway) return draftTakeawayCart;
@@ -335,7 +357,7 @@ export default function Warung() {
       try {
         savedOrder = await ensureCurrentOrderSaved();
         if (!savedOrder?.id) return toast.error("Order belum siap untuk QR");
-        const url = `${window.location.origin}/warung?table=${encodeURIComponent(activeTable.id)}&order=${encodeURIComponent(savedOrder.id)}`;
+        const url = buildWarungOrderScanUrl(activeTable.id, savedOrder.id);
         const orderCode = savedOrder.queue_no || savedOrder.id;
         if (isPrinterAvailable()) {
           await printThermalOrderQr({
@@ -355,7 +377,7 @@ export default function Warung() {
         try {
           if (!savedOrder?.id) savedOrder = await ensureCurrentOrderSaved();
           if (!savedOrder?.id) throw e;
-          const url = `${window.location.origin}/warung?table=${encodeURIComponent(activeTable.id)}&order=${encodeURIComponent(savedOrder.id)}`;
+          const url = buildWarungOrderScanUrl(activeTable.id, savedOrder.id);
           const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(url)}`;
           const rows = latestCart.map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(Number(it.quantity || 0) * Number(it.unit_price || 0))}</b></div>`).join("");
           printViaIframe({
