@@ -1,0 +1,7 @@
+# v2.5.16 does not require a new Python package.
+# Keep your existing requirements.txt.
+# Make sure these are already present:
+# fastapi
+# uvicorn[standard]
+# motor
+# pydantic
