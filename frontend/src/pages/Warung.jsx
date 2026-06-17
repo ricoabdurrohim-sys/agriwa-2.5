@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone, Edit2 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
@@ -30,7 +30,15 @@ export default function Warung() {
   const [search, setSearch] = useState("");
   const [tick, setTick] = useState(0);
   const [draftTakeawayCart, setDraftTakeawayCart] = useState([]);
+  const [draftTableCarts, setDraftTableCarts] = useState({});
   const [variantPicker, setVariantPicker] = useState(null);
+  const saveTimersRef = useRef({});
+  const pendingOrderItemsRef = useRef({});
+  const previousOrderRef = useRef({});
+  const createTimersRef = useRef({});
+  const creatingTableRef = useRef({});
+  const draftTableCartsRef = useRef({});
+  const opsRefreshTimerRef = useRef(null);
 
   const normalizeMenuItems = (rows = []) => rows
     .filter((x) => !String(x.category || "").toLowerCase().includes("bahan baku"))
@@ -38,9 +46,13 @@ export default function Warung() {
     .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "id"));
 
   const loadOps = async () => {
-    const [t, o] = await Promise.all([api.get("/tables"), api.get("/orders/active")]);
+    const [t, o] = await Promise.all([api.get("/tables?light=true"), api.get("/orders/active")]);
     setTables(t.data || []);
     setOrders(o.data || []);
+  };
+  const scheduleOpsRefresh = (delay = 900) => {
+    if (opsRefreshTimerRef.current) clearTimeout(opsRefreshTimerRef.current);
+    opsRefreshTimerRef.current = setTimeout(() => { loadOps().catch(() => {}); }, delay);
   };
   const loadMenu = async () => {
     const { data } = await api.get("/inventory?include_batches=false&limit=1500");
@@ -58,13 +70,73 @@ export default function Warung() {
       return [...prev, doc];
     });
   };
+
+  const saveOrderItemsNow = async (orderId) => {
+    const itemsToSave = pendingOrderItemsRef.current[orderId];
+    if (!orderId || !itemsToSave) return null;
+    if (saveTimersRef.current[orderId]) {
+      clearTimeout(saveTimersRef.current[orderId]);
+      delete saveTimersRef.current[orderId];
+    }
+    try {
+      const { data } = await api.put(`/orders/${orderId}/items`, { items: itemsToSave, quiet: true });
+      delete pendingOrderItemsRef.current[orderId];
+      delete previousOrderRef.current[orderId];
+      replaceOrderLocal(data);
+      return data;
+    } catch (e) {
+      const previous = previousOrderRef.current[orderId];
+      if (previous) replaceOrderLocal(previous);
+      toast.error(e?.response?.data?.detail || "Gagal menyimpan pesanan");
+      return null;
+    }
+  };
+
+  const scheduleOrderItemsSync = (orderId, next, previous) => {
+    if (!orderId) return;
+    pendingOrderItemsRef.current[orderId] = next;
+    if (!previousOrderRef.current[orderId] && previous) previousOrderRef.current[orderId] = previous;
+    if (saveTimersRef.current[orderId]) clearTimeout(saveTimersRef.current[orderId]);
+    saveTimersRef.current[orderId] = setTimeout(() => { saveOrderItemsNow(orderId); }, 450);
+  };
+
+  const scheduleCreateTableOrder = (tableId, next) => {
+    if (!tableId) return;
+    draftTableCartsRef.current[tableId] = next;
+    if (creatingTableRef.current[tableId]) return;
+    if (createTimersRef.current[tableId]) clearTimeout(createTimersRef.current[tableId]);
+    createTimersRef.current[tableId] = setTimeout(async () => {
+      creatingTableRef.current[tableId] = true;
+      const latest = draftTableCartsRef.current[tableId] || [];
+      if (latest.length === 0) {
+        creatingTableRef.current[tableId] = false;
+        return;
+      }
+      try {
+        const { data } = await api.post("/orders", { table_id: tableId, items: latest });
+        const newest = draftTableCartsRef.current[tableId] || latest;
+        const optimistic = { ...data, items: newest, updated_at: new Date().toISOString() };
+        replaceOrderLocal(optimistic);
+        setDraftTableCarts((prev) => { const cp = { ...prev }; delete cp[tableId]; return cp; });
+        delete draftTableCartsRef.current[tableId];
+        if (JSON.stringify(newest) !== JSON.stringify(data.items || [])) {
+          scheduleOrderItemsSync(data.id, newest, data);
+        }
+      } catch (e) {
+        toast.error(e?.response?.data?.detail || "Gagal membuat order meja");
+      } finally {
+        creatingTableRef.current[tableId] = false;
+      }
+    }, 350);
+  };
   useEffect(() => { load(); }, []);
   useEffect(() => { const id = setInterval(() => { loadOps(); setTick(t => t + 1); }, 15000); return () => clearInterval(id); }, []);
   useEffect(() => {
     const h = (e) => {
       const t = e.detail?.type;
       if (t === "inventory_updated" || t === "bizunit_updated") loadMenu();
-      if (t === "transaction_created" || t === "order_created" || t === "order_updated" || t === "transaction_cancelled") loadOps();
+      if (t === "transaction_created" || t === "order_created" || t === "transaction_cancelled") scheduleOpsRefresh(500);
+      if (t === "order_updated") scheduleOpsRefresh(1500);
     };
     window.addEventListener("aw:ws", h);
     return () => window.removeEventListener("aw:ws", h);
@@ -92,22 +164,52 @@ export default function Warung() {
   const totalForItems = (rows = []) => rows.reduce((s, i) => s + Number(i.quantity || 0) * Number(i.unit_price || 0), 0);
 
   const addTable = async () => {
-    if (!newTableName.trim()) return;
-    await api.post("/tables", { name: newTableName });
-    setNewTableName(""); setShowAdd(false); load(); toast.success("Meja ditambahkan");
+    const name = newTableName.trim();
+    if (!name) return;
+    const tempId = `tmp-${Date.now()}`;
+    const optimistic = { id: tempId, name, status: "available" };
+    setTables((prev) => [...prev, optimistic]);
+    setNewTableName(""); setShowAdd(false);
+    try {
+      const { data } = await api.post("/tables", { name });
+      setTables((prev) => prev.map((t) => t.id === tempId ? data : t));
+      toast.success("Meja ditambahkan");
+      scheduleOpsRefresh(700);
+    } catch (e) {
+      setTables((prev) => prev.filter((t) => t.id !== tempId));
+      toast.error(e?.response?.data?.detail || "Gagal menambah meja");
+    }
   };
 
   const openEditTable = (t) => { setEditTable(t); setEditTableName(t.name || ""); };
   const saveEditTable = async () => {
     if (!editTable || !editTableName.trim()) return toast.error("Nama meja wajib");
-    await api.put(`/tables/${editTable.id}`, { name: editTableName.trim() });
-    setEditTable(null); setEditTableName(""); load(); toast.success("Meja diperbarui");
+    const name = editTableName.trim();
+    const previous = tables;
+    setTables((prev) => prev.map((t) => t.id === editTable.id ? { ...t, name } : t));
+    setEditTable(null); setEditTableName("");
+    try {
+      const { data } = await api.put(`/tables/${editTable.id}`, { name });
+      setTables((prev) => prev.map((t) => t.id === editTable.id ? data : t));
+      toast.success("Meja diperbarui");
+    } catch (e) {
+      setTables(previous);
+      toast.error(e?.response?.data?.detail || "Gagal memperbarui meja");
+    }
   };
   const deleteTable = async (t) => {
     if (ordersByTable[t.id]) return toast.error("Meja masih punya order aktif. Selesaikan dulu.");
     if (!window.confirm(`Hapus ${t.name}? Hanya meja ini yang dihapus, bukan semua meja.`)) return;
-    await api.delete(`/tables/${t.id}`);
-    load(); toast.success("Meja dihapus");
+    const previous = tables;
+    setTables((prev) => prev.filter((row) => row.id !== t.id));
+    try {
+      await api.delete(`/tables/${t.id}`);
+      toast.success("Meja dihapus");
+      scheduleOpsRefresh(700);
+    } catch (e) {
+      setTables(previous);
+      toast.error(e?.response?.data?.detail || "Gagal menghapus meja");
+    }
   };
 
   const filteredItems = items.filter((i) => i.name.toLowerCase().includes(search.toLowerCase()));
@@ -115,34 +217,23 @@ export default function Warung() {
   // Table detail view
   if (activeTable) {
     const order = activeTable.takeaway ? orders.find((o) => o.id === activeTable.order_id) : ordersByTable[activeTable.id];
-    const cart = order?.items || (activeTable.takeaway ? draftTakeawayCart : []);
+    const cart = order?.items || (activeTable.takeaway ? draftTakeawayCart : (draftTableCarts[activeTable.id] || []));
     const total = order ? totalForOrder(order) : totalForItems(cart);
     const elapsed = order ? elapsedMin(order.created_at) : 0;
 
     const saveItems = async (next) => {
       if (order) {
-        const previous = order;
         const optimistic = { ...order, items: next, updated_at: new Date().toISOString() };
         replaceOrderLocal(optimistic);
-        try {
-          const { data } = await api.put(`/orders/${order.id}/items`, { items: next });
-          replaceOrderLocal(data);
-        } catch (e) {
-          replaceOrderLocal(previous);
-          toast.error(e?.response?.data?.detail || "Gagal menyimpan pesanan");
-        }
+        scheduleOrderItemsSync(order.id, next, order);
         return;
       }
       if (activeTable.takeaway) {
         setDraftTakeawayCart(next);
         return;
       }
-      try {
-        const { data } = await api.post("/orders", { table_id: activeTable.id, items: next });
-        replaceOrderLocal(data);
-      } catch (e) {
-        toast.error(e?.response?.data?.detail || "Gagal membuat order meja");
-      }
+      setDraftTableCarts((prev) => ({ ...prev, [activeTable.id]: next }));
+      scheduleCreateTableOrder(activeTable.id, next);
     };
 
     const upsertLine = async (line, delta) => {
@@ -155,7 +246,7 @@ export default function Warung() {
       } else if (delta > 0) {
         next.push({ ...line, quantity: 1, notes: "", served: false });
       }
-      await saveItems(next);
+      saveItems(next);
     };
 
     const addVariantLine = async (item, variant = null) => {
@@ -168,7 +259,7 @@ export default function Warung() {
         variant_id: variant?.id || "",
         variant_name: variant?.name || "",
       };
-      await upsertLine(line, 1);
+      upsertLine(line, 1);
       setVariantPicker(null);
     };
 
@@ -200,8 +291,11 @@ export default function Warung() {
       }
     };
 
-    const sendToKasir = () => {
+    const sendToKasir = async () => {
       if (!order) return toast.error("Proses order dulu sebelum lanjut ke Kasir");
+      if (pendingOrderItemsRef.current[order.id]) {
+        await saveOrderItemsNow(order.id);
+      }
       nav(`/kasir?${activeTable.takeaway ? "" : `table=${activeTable.id}&`}order=${order.id}`);
     };
 
@@ -343,7 +437,7 @@ export default function Warung() {
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Warung Makan</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · refresh ringan tiap 15 detik</p>
+          <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · klik item mode cepat</p>
         </div>
         <div className="flex gap-2 flex-wrap">
           <Button data-testid="new-takeaway-btn" onClick={() => setActiveTable({ id: null, name: "Takeaway Baru", takeaway: true })} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">

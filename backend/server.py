@@ -1445,8 +1445,10 @@ class TableIn(BaseModel):
 
 
 @api.get("/tables")
-async def list_tables(user: dict = Depends(get_current_user)):
+async def list_tables(light: bool = False, user: dict = Depends(get_current_user)):
     tables = await list_collection("tables")
+    if light:
+        return tables
     orders = await db.orders.find({"status": {"$in": ["open", "sent", "bill_requested"]}}, {"_id": 0}).to_list(500)
     by_table = {}
     for o in orders:
@@ -2574,10 +2576,16 @@ async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
 
 @api.put("/orders/{order_id}/items")
 async def update_order_items(order_id: str, body: dict, user: dict = Depends(get_current_user)):
-    """body: {items: [...full new list...]}"""
+    """body: {items: [...full new list...], quiet?: true}
+
+    Warung/meja sering mengirim update item beruntun. `quiet=true` dipakai agar
+    device yang sama tidak memicu broadcast/reload berat untuk setiap klik +/-.
+    Order tetap tersimpan di database; layar lain tetap akan sinkron lewat refresh ringan.
+    """
     items = body.get("items", [])
-    await db.orders.update_one({"id": order_id}, {"$set": {"items": items}})
-    await broadcast_event("order_updated", {"id": order_id})
+    await db.orders.update_one({"id": order_id}, {"$set": {"items": items, "updated_at": now_iso()}})
+    if not body.get("quiet"):
+        await broadcast_event("order_updated", {"id": order_id})
     return await db.orders.find_one({"id": order_id}, {"_id": 0})
 
 
