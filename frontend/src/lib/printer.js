@@ -86,8 +86,8 @@ export async function printReceipt(receipt, opts = {}) {
   cmds.push(strBytes("--------------------------------\n"));
   if (receipt.trx_no) {
     cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposCode128(String(receipt.trx_no)));
-    cmds.push(strBytes("\nScan / ketik nomor nota\n"));
+    cmds.push(escposQr(String(receipt.trx_no), 6));
+    cmds.push(strBytes("Scan QR / ketik nomor nota\n"));
     cmds.push(strBytes(String(receipt.trx_no) + "\n"));
     cmds.push(strBytes("--------------------------------\n"));
   }
@@ -173,8 +173,8 @@ export async function printThermalLabel({ title = "LABEL", subtitle = "", lines 
   if (qrData) {
     cmds.push(strBytes("--------------------------------\n"));
     cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(qrData, 5));
-    cmds.push(strBytes("Scan untuk cek detail\n"));
+    cmds.push(escposQr(qrData, 6));
+    cmds.push(strBytes("Scan QR untuk cek detail\n"));
   }
   if (footer) cmds.push(strBytes(String(footer).slice(0, 42) + "\n"));
   cmds.push(strBytes("\n\n"));

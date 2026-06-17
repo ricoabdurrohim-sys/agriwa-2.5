@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ClipboardList, Edit2, FileText, Grape, Leaf, MapPin, Plus, Printer, Sprout, Trash2, Wallet, Wheat } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
-import { printViaIframe } from "@/lib/safePrint";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -165,16 +165,24 @@ export default function Anggur() {
   };
   const printFarmActivityThermal = async (a) => {
     try {
-      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung");
       const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:activity:' + a.id)}`;
+      if (!isPrinterAvailable()) {
+        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(target)}`;
+        printViaIframe({ title: `Aktivitas ${a.plot_name || 'Kebun'}`, css: thermal80Css(), preferWindow: true, bodyHtml: `<div class='thermal-print center'><div class='big'>Aktivitas Kebun</div><div>${a.plot_name || 'Plot'}</div><img class='qr' src='${qr}'/><div>Jenis: ${a.activity_type}</div><div>Tanggal: ${formatDate(a.date)}</div><div class='small'>Scan QR untuk riwayat kegiatan</div></div>` });
+        return toast.info('Bluetooth langsung tidak tersedia. Dibuka mode print QR 80mm.');
+      }
       await printThermalLabel({ title: 'Aktivitas Kebun', subtitle: a.plot_name || 'Plot', lines: [`Jenis: ${a.activity_type}`, `Tanggal: ${formatDate(a.date)}`, `Biaya: ${formatRupiah(a.cost || 0)}`], qrData: target, footer: 'AgriWarung Kebun' });
       toast.success('Label aktivitas dikirim ke printer thermal');
     } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }
   };
   const printHarvestThermal = async (h) => {
     try {
-      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung");
       const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:harvest:' + h.id)}`;
+      if (!isPrinterAvailable()) {
+        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(target)}`;
+        printViaIframe({ title: `Panen ${h.batch_no || h.id}`, css: thermal80Css(), preferWindow: true, bodyHtml: `<div class='thermal-print center'><div class='big'>${h.inventory_item_name || 'Panen'}</div><div>${h.batch_no ? `Batch: ${h.batch_no}` : ''}</div><img class='qr' src='${qr}'/><div>Jumlah: ${h.quantity_kg} kg</div><div>Grade: ${h.quality_grade || '-'}</div><div class='small'>Scan QR untuk riwayat panen</div></div>` });
+        return toast.info('Bluetooth langsung tidak tersedia. Dibuka mode print QR 80mm.');
+      }
       await printThermalLabel({ title: h.inventory_item_name || 'Panen', subtitle: `Grade ${h.quality_grade || '-'}`, lines: [`Jumlah: ${h.quantity_kg} kg`, `Tanggal: ${formatDate(h.date)}`, h.batch_no ? `Batch: ${h.batch_no}` : ''], qrData: target, footer: 'AgriWarung Panen' });
       toast.success('Label panen dikirim ke printer thermal');
     } catch (e) { toast.error(e?.message || 'Gagal print thermal'); }

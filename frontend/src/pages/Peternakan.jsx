@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { printViaIframe } from "@/lib/safePrint";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 
 const initAsset = { name: "", animal_type: "ayam", count: "", unit: "ekor", location: "Kandang", notes: "" };
 const initProd = { asset_id: "", product_name: "Telur", quantity: "", unit: "pcs", grade: "A", notes: "" };
@@ -44,7 +44,7 @@ export default function Peternakan() {
   const printLabel = (p) => {
     const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:livestock:' + (p.id || p.batch_no))}`;
     const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(target)}`;
-    printViaIframe({ title: `Label ${p.batch_no || p.product_name}`, css: "body{font-family:monospace;font-size:12px;text-align:center;padding:8px}.qr{width:92px;height:92px}.big{font-weight:700;font-size:14px}", bodyHtml: `<div class='big'>${p.inventory_item_name || p.product_name}</div><div>Batch: ${p.batch_no || '-'}</div><img class='qr' src='${qr}'/><div>${p.quantity} ${p.unit}</div>` });
+    printViaIframe({ title: `Label ${p.batch_no || p.product_name}`, css: thermal80Css(), preferWindow: true, bodyHtml: `<div class='thermal-print center'><div class='big'>${p.inventory_item_name || p.product_name}</div><div>Batch: ${p.batch_no || '-'}</div><img class='qr' src='${qr}'/><div>${p.quantity} ${p.unit}</div><div class='small'>Scan QR untuk riwayat ternak</div></div>` });
   };
   const totalAssets = assets.reduce((s,a)=>s+(Number(a.count)||0),0);
   const totalProd = productions.reduce((s,p)=>s+(Number(p.quantity)||0),0);

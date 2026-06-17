@@ -3,9 +3,9 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
-import { printViaIframe } from "@/lib/safePrint";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 import { resolveImageUrl } from "@/components/ImageUpload";
-import Barcode from "@/components/Barcode";
+import QRCodeBox from "@/components/QRCodeBox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -1054,8 +1054,7 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <Barcode value={showReceipt.trx_no} width={1.8} height={58} fontSize={12} />
-                  <div className="text-[10px] mt-1">Scan / ketik: {showReceipt.trx_no}</div>
+                  <QRCodeBox value={showReceipt.trx_no} size={118} label={`Scan QR / ketik: ${showReceipt.trx_no}`} />
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
@@ -1071,11 +1070,14 @@ export default function Kasir() {
                   const fallbackThermal = () => {
                     printViaIframe({
                       title: `Struk ${showReceipt.trx_no}`,
-                      css: `@page{size:80mm auto;margin:2mm}body{font-family:monospace;font-size:12px;width:76mm;margin:0 auto;color:#111}.center{text-align:center}.line{border-top:1px dashed #555;margin:6px 0}.row{display:flex;justify-content:space-between;gap:8px}.big{font-weight:700;font-size:15px}.small{font-size:10px}svg{max-width:72mm}`,
+                      css: thermal80Css(),
+                      preferWindow: true,
                       buildBody: (doc) => {
                         const wrap = doc.createElement('div');
+                        wrap.className = 'thermal-print';
                         const rows = (showReceipt.items || []).map((it) => `<div>${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
-                        wrap.innerHTML = `<div class="center big">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row big"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center small">${cfg.footer || 'Terima kasih!'}</div>`;
+                        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(showReceipt.trx_no || '')}`;
+                        wrap.innerHTML = `<div class="center big">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row big"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/><div class="small">Scan QR / ketik ${showReceipt.trx_no || ''}</div></div><div class="line"></div><div class="center small">${cfg.footer || 'Terima kasih!'}</div>`;
                         doc.body.appendChild(wrap);
                       }
                     });
@@ -1128,8 +1130,9 @@ export default function Kasir() {
                   const html = document.getElementById("receipt-content")?.innerHTML || "";
                   printViaIframe({
                     title: `Struk ${showReceipt.trx_no}`,
-                    css: "body{font-family:monospace;font-size:12px;padding:10px;}",
-                    bodyHtml: html,
+                    css: thermal80Css(),
+                    bodyHtml: `<div class="thermal-print">${html}</div>`,
+                    preferWindow: true,
                   });
                 }}>
                   <Printer className="w-4 h-4 mr-1.5" /> Print

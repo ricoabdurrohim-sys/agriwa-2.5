@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 
 export default function Pupuk() {
   const [params] = useSearchParams();
@@ -53,9 +54,18 @@ export default function Pupuk() {
 
   const printProductionThermal = async (b) => {
     try {
-      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung di browser ini");
       const code = `aw:production:${b.id || b.batch_no}`;
       const target = `${window.location.origin}/scan?code=${encodeURIComponent(code)}`;
+      if (!isPrinterAvailable()) {
+        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(target)}`;
+        printViaIframe({
+          title: `Label ${b.batch_no || b.recipe_name}`,
+          css: thermal80Css(),
+          preferWindow: true,
+          bodyHtml: `<div class='thermal-print center'><div class='big'>${b.recipe_name || 'Produksi'}</div><div>Batch: ${b.batch_no || '-'}</div><img class='qr' src='${qr}'/><div>${b.quantity || ''} unit</div><div class='small'>Scan QR untuk riwayat produksi</div></div>`
+        });
+        return toast.info('Bluetooth langsung tidak tersedia. Dibuka mode print QR 80mm.');
+      }
       await printThermalLabel({
         title: b.recipe_name || 'Produksi', subtitle: b.batch_no || b.id,
         lines: [`Jumlah: ${b.quantity} unit`, `Biaya: ${formatRupiah(b.actual_cost || 0)}`, `Waktu: ${formatDateTime(b.created_at)}`],

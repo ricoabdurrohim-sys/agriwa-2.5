@@ -11,9 +11,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { printViaIframe } from "@/lib/safePrint";
+import { printViaIframe, thermal80Css } from "@/lib/safePrint";
 import { printThermalLabel, isPrinterAvailable } from "@/lib/printer";
-import Barcode from "@/components/Barcode";
 
 const CATEGORIES = [
   "Bahan Baku Warung", "Bahan Baku Pupuk", "Bahan Baku Kebun",
@@ -152,16 +151,18 @@ export default function Inventori() {
 
   const printBatchLabel = (b) => {
     const code = `aw:batch:${b.batch_no || b.id}`;
+    const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(code)}`;
     printViaIframe({
       title: `Label Batch ${b.batch_no}`,
-      css: "body{font-family:monospace;font-size:12px;padding:8px;width:80mm}.center{text-align:center}.big{font-weight:700;font-size:14px}.small{font-size:10px} svg{max-width:100%;}",
-      bodyHtml: `<div class='center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><svg id='barcode'></svg><script src='https://cdn.jsdelivr.net/npm/jsbarcode@3.12.1/dist/JsBarcode.all.min.js'></script><script>JsBarcode('#barcode','${code}',{format:'CODE128',height:48,width:1.4,fontSize:10,margin:4});</script><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
+      css: thermal80Css(),
+      preferWindow: true,
+      bodyHtml: `<div class='thermal-print center'><div class='big'>${b.item_name || batchItem?.name || 'ITEM'}</div><div>Batch: <b>${b.batch_no || '-'}</b></div><img class='qr' src='${qr}'/><div class='small'>Scan QR untuk cek detail batch</div><div>Sisa: ${Number(b.remaining_quantity ?? b.quantity ?? 0).toFixed(2)} ${b.unit || ''}</div><div class='small'>${b.supplier_name || b.source || ''}</div><div class='small'>${b.purchase_date ? new Date(b.purchase_date).toLocaleDateString('id-ID') : ''}</div></div>`,
     });
   };
   const printBatchLabelThermal = async (b) => {
     try {
-      if (!isPrinterAvailable()) return toast.error("Web Bluetooth tidak didukung. Gunakan Chrome/Edge dengan printer Bluetooth.");
       const target = `${window.location.origin}/scan?code=${encodeURIComponent('aw:batch:' + (b.batch_no || b.id))}`;
+      if (!isPrinterAvailable()) { printBatchLabel(b); return toast.info("Bluetooth langsung tidak tersedia. Dibuka mode print QR 80mm khusus label."); }
       await printThermalLabel({
         title: b.item_name || batchItem?.name || 'ITEM',
         subtitle: `Batch ${b.batch_no || '-'}`,

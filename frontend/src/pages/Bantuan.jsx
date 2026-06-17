@@ -17,14 +17,36 @@ const TYPES = {
   SUPPORT: { label: "Dukungan", icon: MessageCircle, color: "text-purple-700", bg: "bg-purple-50" },
 };
 
+const BUILTIN_HELP = [
+  { id: "builtin-pos", type: "GUIDE", title: "Kasir POS: transaksi cepat", sort_order: 1, content: "1) Pilih unit bisnis. 2) Cari/klik produk. 3) Jika ada varian, pilih varian dahulu. 4) Ubah qty dari keranjang. 5) Pilih metode bayar. 6) Konfirmasi transaksi.\n\nTips: gunakan Scan Produk untuk scanner external USB/Bluetooth. Untuk transaksi bon, isi nama pelanggan agar mudah dicari saat pelunasan." },
+  { id: "builtin-warung", type: "GUIDE", title: "Warung, meja, takeaway, dan KDS", sort_order: 2, content: "Meja dipakai untuk makan di tempat. Takeaway dipakai untuk antrian tanpa meja. Pilih menu dulu, cek pesanan, lalu proses ke antrian/dapur. Dari riwayat takeaway atau meja, lanjutkan ke Kasir untuk pembayaran. KDS menampilkan pesanan aktif untuk dapur." },
+  { id: "builtin-qr", type: "GUIDE", title: "QR Code untuk struk, batch, produksi, panen, dan kegiatan", sort_order: 3, content: "QR dipakai sebagai jalan pintas. Scan QR struk untuk membuka transaksi. Scan QR batch untuk membuka detail batch inventori. Scan QR panen/produksi/kegiatan untuk kembali ke riwayat asalnya. Jika kamera sulit, ketik nomor nota/batch manual di Pintasan Scan." },
+  { id: "builtin-print", type: "FAQ", title: "Print thermal di iPhone/iPad", sort_order: 4, content: "iPhone/iPad tidak mendukung Web Bluetooth dari browser seperti Android. Gunakan mode Print Browser 80mm. Aplikasi akan membuka halaman struk/label khusus agar yang tercetak hanya struk/label, bukan seluruh halaman Kasir. Untuk Bluetooth langsung, gunakan Chrome Android atau desktop yang mendukung Web Bluetooth." },
+  { id: "builtin-inventory", type: "GUIDE", title: "Inventori, batch, FIFO, dan label", sort_order: 5, content: "Inventori adalah master barang. Batch adalah catatan stok masuk per pembelian/panen/produksi. Jika produksi/penjualan tidak memilih batch, sistem memakai FIFO: batch masuk lebih dulu dipakai lebih dulu. Label batch dapat diprint 80mm dengan QR agar bisa ditempel dan discan." },
+  { id: "builtin-variant", type: "GUIDE", title: "Kategori dan varian produk", sort_order: 6, content: "Kategori membantu tampilan Kasir/Warung. Kategori bisa dibuat manual. Varian cocok untuk produk yang stoknya sama tapi pilihan jualnya berbeda, misalnya Es/Hangat atau Kecil/Besar. Stok tetap mengurangi item utama, sedangkan varian tercatat di struk dan riwayat." },
+  { id: "builtin-finance", type: "GUIDE", title: "Keuangan, Dashboard, dan Laporan", sort_order: 7, content: "Kasir mencatat penjualan. HPP diambil dari inventori/batch. Keuangan menampilkan pemasukan, pengeluaran, piutang, dan pembayaran. Dashboard menampilkan ringkasan cepat. Laporan menampilkan versi lebih lengkap seperti revenue, HPP, dan net profit. Jika transaksi dibatalkan, efek keuangan ikut dibatalkan." },
+  { id: "builtin-debt", type: "FAQ", title: "Bon/piutang pelanggan", sort_order: 8, content: "Bon terjadi saat pembayaran kurang dari total. Isi nama pelanggan dan nomor HP agar mudah dicari. Pelunasan sebaiknya dilakukan dari Kasir melalui Cari Transaksi agar alurnya tetap sinkron dengan Keuangan dan Laporan." },
+  { id: "builtin-business", type: "GUIDE", title: "Lini Bisnis dan pengaturan struk", sort_order: 9, content: "Lini Bisnis dipakai untuk membedakan Warung, Kebun, Produksi, Peternakan, dan unit lain. Header/footer/logo struk diatur per Lini Bisnis supaya struk tiap usaha bisa berbeda." },
+  { id: "builtin-pajak", type: "FAQ", title: "PPN dan harga termasuk pajak", sort_order: 10, content: "Jika harga jual sudah termasuk PPN, aktifkan mode harga termasuk pajak. Struk akan memecah DPP dan PPN tanpa mengubah total bayar. Jika usaha belum PKP, tampilan PPN bisa dimatikan dan dipakai sebagai catatan internal saja." },
+  { id: "builtin-role", type: "GUIDE", title: "User, role, dan keamanan", sort_order: 11, content: "Gunakan password unik khusus aplikasi, jangan sama dengan Gmail. Untuk karyawan, buat akun sesuai role. Jika browser memberi peringatan password terekspos, itu biasanya dari Password Manager karena password tersebut pernah ditemukan di kebocoran situs lain, bukan berarti Gmail kamu dibaca aplikasi." },
+  { id: "builtin-troubleshoot", type: "FAQ", title: "Troubleshooting cepat", sort_order: 12, content: "Jika data tidak berubah: tekan Ctrl+F5. Jika endpoint NotFound: backend HuggingFace belum update. Jika Vercel blank: cek build log dan env REACT_APP_BACKEND_URL. Jika scan kamera gagal: izinkan Camera dari ikon gembok address bar, atau gunakan input manual." },
+];
+
 export default function Bantuan() {
   const [items, setItems] = useState([]);
   const [filter, setFilter] = useState("ALL");
   const [edit, setEdit] = useState(null);
 
   const load = async () => {
-    const { data } = await api.get("/help-contents");
-    setItems(data);
+    try {
+      const { data } = await api.get("/help-contents");
+      const custom = Array.isArray(data) ? data : [];
+      const customTitles = new Set(custom.map((i) => String(i.title || "").toLowerCase()));
+      const builtins = BUILTIN_HELP.filter((i) => !customTitles.has(String(i.title || "").toLowerCase()));
+      setItems([...builtins, ...custom].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)));
+    } catch (e) {
+      setItems(BUILTIN_HELP);
+    }
   };
   useEffect(() => { load(); }, []);
 
@@ -42,6 +64,7 @@ export default function Bantuan() {
   };
 
   const remove = async (it) => {
+    if (String(it.id || "").startsWith("builtin-")) return toast.info("Panduan bawaan tidak dihapus. Kamu bisa tambah konten sendiri di atasnya.");
     if (!window.confirm(`Hapus konten bantuan \"${it.title}\"?`)) return;
     await api.delete(`/help-contents/${it.id}`);
     toast.success("Dihapus"); load();
@@ -106,7 +129,7 @@ export default function Bantuan() {
                 </div>
               </div>
               <div className="flex gap-1 shrink-0">
-                <button onClick={() => setEdit({ ...init, ...it })} className="p-1.5 text-gray-500 hover:text-[#1a6b3c]" title="Edit"><Edit2 className="w-4 h-4" /></button>
+                <button onClick={() => setEdit(String(it.id || "").startsWith("builtin-") ? { ...init, ...it, id: undefined, title: `${it.title} (salinan)` } : { ...init, ...it })} className="p-1.5 text-gray-500 hover:text-[#1a6b3c]" title="Edit"><Edit2 className="w-4 h-4" /></button>
                 <button onClick={() => remove(it)} className="p-1.5 text-gray-500 hover:text-red-600" title="Hapus"><Trash2 className="w-4 h-4" /></button>
               </div>
             </div>

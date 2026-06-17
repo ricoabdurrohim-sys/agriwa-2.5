@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { ScanLine, Search, Camera, XCircle, Keyboard, RefreshCcw } from "lucide-react";
+import { ScanLine, Search, Camera, XCircle, Keyboard, RefreshCcw, QrCode } from "lucide-react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -73,11 +73,6 @@ export default function Scan() {
       await stopCamera();
       const scanner = new Html5Qrcode(SCANNER_ID, { verbose: false, formatsToSupport: [
         Html5QrcodeSupportedFormats.QR_CODE,
-        Html5QrcodeSupportedFormats.CODE_128,
-        Html5QrcodeSupportedFormats.EAN_13,
-        Html5QrcodeSupportedFormats.EAN_8,
-        Html5QrcodeSupportedFormats.UPC_A,
-        Html5QrcodeSupportedFormats.UPC_E,
       ] });
       scannerRef.current = scanner;
       const preferred = foundCameras.find((c) => /back|rear|environment|belakang/i.test(c.label || "")) || foundCameras[foundCameras.length - 1] || foundCameras[0];
@@ -90,7 +85,7 @@ export default function Scan() {
         () => {}
       );
       setScanning(true);
-      setStatus("Kamera aktif. Arahkan QR/barcode ke kotak scan.");
+      setStatus("Kamera aktif. Arahkan QR code ke kotak scan.");
     } catch (e) {
       console.error(e);
       setManualOnly(true);
@@ -127,13 +122,13 @@ export default function Scan() {
             <p className="text-sm text-gray-500">Mode: {modeLabel}</p>
           </div>
         </div>
-        <p className="text-xs text-gray-500 leading-relaxed">Scan barcode/QR struk untuk membuka transaksi, scan barcode/QR batch untuk membuka inventori/batch, atau ketik nomor nota/batch manual. Scanner external USB/Bluetooth juga bisa karena bekerja seperti keyboard.</p>
+        <p className="text-xs text-gray-500 leading-relaxed">Scan QR struk, batch, panen, produksi, kegiatan kebun, atau riwayat lain untuk membuka detail terkait. Jika kamera sulit membaca, ketik nomor nota/batch manual. Scanner external tetap bisa dipakai untuk input manual karena bekerja seperti keyboard.</p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 space-y-3">
         <div className="rounded-xl bg-gray-900 overflow-hidden min-h-[320px] flex items-center justify-center relative">
           <div id={SCANNER_ID} className="w-full min-h-[320px] flex items-center justify-center text-white/80" />
-          {!scanning && <div className="absolute inset-0 flex items-center justify-center text-center text-white/80 p-6 pointer-events-none"><div><Camera className="w-12 h-12 mx-auto mb-3 opacity-70" /><div className="text-sm">Kamera belum aktif</div><div className="text-xs text-white/55 mt-1">Klik Mulai Scan agar browser meminta izin kamera</div></div></div>}
+          {!scanning && <div className="absolute inset-0 flex items-center justify-center text-center text-white/80 p-6 pointer-events-none"><div><QrCode className="w-12 h-12 mx-auto mb-3 opacity-70" /><div className="text-sm">Kamera belum aktif</div><div className="text-xs text-white/55 mt-1">Klik Mulai Scan lalu arahkan QR code</div></div></div>}
         </div>
         <div className={`text-xs rounded-lg p-2 ${manualOnly ? "bg-amber-50 text-amber-800 border border-amber-200" : "bg-gray-50 text-gray-600"}`}>{status}</div>
         <div className="grid grid-cols-3 gap-2">
@@ -153,7 +148,7 @@ export default function Scan() {
           <Input value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && resolve(code)} placeholder="Nomor nota / batch / kode QR" className="font-mono" />
           <Button variant="outline" onClick={() => resolve(code)}><Search className="w-4 h-4 mr-1" /> Cari</Button>
         </div>
-        <div className="text-[11px] text-gray-500">Contoh input manual: TRX-20260616-ABC123, GP160626001, atau kode aw:batch:GP160626001.</div>
+        <div className="text-[11px] text-gray-500">Contoh input manual: AW-170626-0001, GP160626001, atau kode aw:batch:GP160626001.</div>
       </div>
     </div>
   );

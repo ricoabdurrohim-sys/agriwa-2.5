@@ -149,7 +149,7 @@ export default function Layout() {
                   <Menu className="w-5 h-5 text-gray-700" />
                 </button>
               </SheetTrigger>
-              <SheetContent side="left" className="p-0 w-[22rem] bg-gradient-to-b from-[#0f5130] via-[#155f38] to-[#0b2f1d] border-0">
+              <SheetContent side="left" className="p-0 w-[21rem] sm:w-[23rem] bg-gradient-to-b from-[#0f5130] via-[#155f38] to-[#0b2f1d] border-0">
                 <div className="flex flex-col h-full text-white">
                   <div className="px-5 py-5 border-b border-white/10">
                     <div className="flex items-center justify-between gap-2">
@@ -163,7 +163,7 @@ export default function Layout() {
                         </div>
                       </div>
                     </div>
-                    <div className="grid grid-cols-3 gap-2 mt-4">
+                    <div className="grid grid-cols-3 gap-2 mt-4 bg-white/5 rounded-2xl p-2 border border-white/10">
                       {[
                         { to: "/", label: "Dashboard", icon: LayoutDashboard },
                         { to: "/warung", label: "Warung", icon: UtensilsCrossed },
@@ -178,7 +178,7 @@ export default function Layout() {
                       <Sliders className="w-4 h-4" /> {editMode ? "Selesai Atur Menu" : "Atur Menu"}
                     </button>
                   </div>
-                  <div className="px-4 pt-3 pb-2 border-b border-white/5">
+                  <div className="px-4 pt-3 pb-2 border-b border-white/5 bg-black/5">
                     <button data-testid="toggle-fullview-btn" onClick={toggleFullView} className="w-full flex items-center gap-2 text-xs px-3 py-2.5 rounded-xl bg-white/8 hover:bg-white/12 border border-white/10 text-white/90">
                       {fullView ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                       <span className="font-medium">{fullView ? "Mode Lengkap" : "Mode Ringkas"}</span>
@@ -186,9 +186,9 @@ export default function Layout() {
                     </button>
                     {editMode && <div className="text-[11px] text-white/65 mt-2 px-1 leading-relaxed">Pilih menu yang ingin tampil. Reset/hapus data massal tidak tersedia; data dihapus satu per satu dari detail masing-masing.</div>}
                   </div>
-                  <nav className="flex-1 px-3 py-3 overflow-y-auto">
+                  <nav className="flex-1 px-3 py-3 overflow-y-auto space-y-2">
                     {GROUP_ORDER.map((g) => grouped[g]?.length ? (
-                      <details key={g} open={editMode || g === "Ringkasan" || g === "Operasional" || g === "Keuangan & Akuntansi"} className="mb-2 group rounded-2xl bg-black/5 border border-white/5 px-1 py-1">
+                      <details key={g} open={editMode || g === "Ringkasan" || g === "Operasional"} className="group rounded-2xl bg-black/8 border border-white/8 px-1.5 py-1 shadow-inner">
                         <summary className="cursor-pointer list-none px-3 py-2 text-[11px] uppercase font-bold tracking-wider text-white/65 hover:text-white/90 flex items-center justify-between">
                           <span>{g}</span><span className="text-[10px] font-mono text-white/40">{grouped[g].length}</span>
                         </summary>
