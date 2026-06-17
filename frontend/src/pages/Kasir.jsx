@@ -203,17 +203,18 @@ export default function Kasir() {
     return () => window.removeEventListener("aw:ws", h);
   }, []);
 
-  // Pre-fill cart from existing order when coming from Warung
+  // Pre-fill cart from existing order when coming from Warung.
+  // Ambil 1 order saja agar buka Kasir dari meja/takeaway lebih cepat.
   useEffect(() => {
     if (orderId) {
-      api.get("/orders").then(({ data }) => {
-        const o = data.find((x) => x.id === orderId);
+      api.get(`/orders/${orderId}`).then(({ data: o }) => {
         if (o && o.items) {
           setCart(o.items.map((it, idx) => ({
             line_id: it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`,
             item_id: it.item_id, name: it.name, unit_price: it.unit_price, quantity: it.quantity, notes: it.notes || "",
             variant_id: it.variant_id || "", variant_name: it.variant_name || "",
           })));
+          if (o.queue_no) setCustomerName(`Takeaway ${o.queue_no}`);
         }
       }).catch(() => {});
     }
@@ -475,7 +476,9 @@ export default function Kasir() {
       setCart([]); setCashReceived(""); setDiscount(0); setIsBon(false); setTransactionType("SALE"); setCustomerName(""); setCustomerPhone("");
       setBonInfo(null);
       clearPromo(); clearMember();
-      load(); loadRecent();
+      // Kasir harus cepat: jangan reload semua inventory setelah checkout.
+      // Stok akan tersinkron saat halaman dimuat ulang / websocket / refresh manual.
+      setRecentTrx((prev) => [data, ...prev.filter((x) => x.id !== data.id)].slice(0, 30));
       // Clear bon URL param after settlement so reload doesn't re-trigger
       if (bonInfo) {
         window.history.replaceState({}, "", "/kasir");
@@ -1051,8 +1054,8 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <Barcode value={`aw:trx:${showReceipt.trx_no}`} height={42} fontSize={10} />
-                  <div className="text-[10px] mt-1">Barcode cek transaksi: {showReceipt.trx_no}</div>
+                  <Barcode value={showReceipt.trx_no} width={1.8} height={58} fontSize={12} />
+                  <div className="text-[10px] mt-1">Scan / ketik: {showReceipt.trx_no}</div>
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
@@ -1064,12 +1067,25 @@ export default function Kasir() {
             {showReceipt && (
               <>
                 <Button data-testid="receipt-bluetooth-btn" variant="outline" className="flex-1 w-full" onClick={async () => {
+                  const cfg = getReceiptConfig(showReceipt);
+                  const fallbackThermal = () => {
+                    printViaIframe({
+                      title: `Struk ${showReceipt.trx_no}`,
+                      css: `@page{size:80mm auto;margin:2mm}body{font-family:monospace;font-size:12px;width:76mm;margin:0 auto;color:#111}.center{text-align:center}.line{border-top:1px dashed #555;margin:6px 0}.row{display:flex;justify-content:space-between;gap:8px}.big{font-weight:700;font-size:15px}.small{font-size:10px}svg{max-width:72mm}`,
+                      buildBody: (doc) => {
+                        const wrap = doc.createElement('div');
+                        const rows = (showReceipt.items || []).map((it) => `<div>${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
+                        wrap.innerHTML = `<div class="center big">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row big"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center small">${cfg.footer || 'Terima kasih!'}</div>`;
+                        doc.body.appendChild(wrap);
+                      }
+                    });
+                  };
                   try {
                     if (!isPrinterAvailable()) {
-                      toast.error("Web Bluetooth tidak didukung di browser ini. Gunakan Chrome Android atau desktop.");
+                      fallbackThermal();
+                      toast.info("Web Bluetooth tidak tersedia di browser ini. Dibuka mode print browser ukuran 80mm.");
                       return;
                     }
-                    const cfg = getReceiptConfig(showReceipt);
                     await printReceipt(showReceipt, {
                       headerName: cfg.business_name,
                       subLine: cfg.address || "",
@@ -1078,10 +1094,11 @@ export default function Kasir() {
                     });
                     toast.success("Struk dikirim ke printer thermal");
                   } catch (e) {
-                    toast.error(e.message || "Gagal cetak");
+                    fallbackThermal();
+                    toast.error((e?.message || "Gagal cetak Bluetooth") + ". Dibuka fallback print browser.");
                   }
                 }}>
-                  <Bluetooth className="w-4 h-4 mr-1.5" /> Thermal
+                  <Bluetooth className="w-4 h-4 mr-1.5" /> Thermal / 80mm
                 </Button>
                 <Button data-testid="receipt-whatsapp-btn" variant="outline" className="flex-1 w-full" onClick={async () => {
                   let phone = (showReceipt.customer_phone || "").replace(/[^\d]/g, "");

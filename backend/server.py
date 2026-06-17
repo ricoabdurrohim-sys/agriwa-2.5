@@ -1516,6 +1516,14 @@ async def active_orders(user: dict = Depends(get_current_user)):
 
 
 
+@api.get("/orders/{order_id}")
+async def get_order(order_id: str, user: dict = Depends(get_current_user)):
+    doc = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Order tidak ditemukan")
+    return doc
+
+
 async def _next_takeaway_queue_no() -> str:
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"TA-{today}-"

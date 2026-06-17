@@ -32,20 +32,40 @@ export default function Warung() {
   const [draftTakeawayCart, setDraftTakeawayCart] = useState([]);
   const [variantPicker, setVariantPicker] = useState(null);
 
-  const load = async () => {
-    const [t, o, i] = await Promise.all([
-      api.get("/tables"),
-      api.get("/orders/active"),
-      api.get("/inventory"),
-    ]);
-    setTables(t.data);
-    setOrders(o.data);
-    setItems(i.data.filter((x) => Number(x.sell_price || 0) > 0 || ((x.variants || []).some((v) => Number(v?.sell_price || 0) > 0))));
+  const normalizeMenuItems = (rows = []) => rows
+    .filter((x) => !String(x.category || "").toLowerCase().includes("bahan baku"))
+    .filter((x) => Number(x.sell_price || 0) > 0 || ((x.variants || []).some((v) => Number(v?.sell_price || 0) > 0)))
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "id"));
+
+  const loadOps = async () => {
+    const [t, o] = await Promise.all([api.get("/tables"), api.get("/orders/active")]);
+    setTables(t.data || []);
+    setOrders(o.data || []);
+  };
+  const loadMenu = async () => {
+    const { data } = await api.get("/inventory?include_batches=false&limit=1500");
+    setItems(normalizeMenuItems(data || []));
+  };
+  const load = async () => { await Promise.all([loadOps(), loadMenu()]); };
+  const replaceOrderLocal = (doc) => {
+    if (!doc?.id) return;
+    setOrders((prev) => {
+      const idx = prev.findIndex((o) => o.id === doc.id);
+      if (["paid", "cancelled", "closed"].includes(String(doc.status || "").toLowerCase())) {
+        return prev.filter((o) => o.id !== doc.id);
+      }
+      if (idx >= 0) return prev.map((o) => (o.id === doc.id ? doc : o));
+      return [...prev, doc];
+    });
   };
   useEffect(() => { load(); }, []);
-  useEffect(() => { const id = setInterval(() => { load(); setTick(t => t + 1); }, 8000); return () => clearInterval(id); }, []);
+  useEffect(() => { const id = setInterval(() => { loadOps(); setTick(t => t + 1); }, 15000); return () => clearInterval(id); }, []);
   useEffect(() => {
-    const h = (e) => { const t = e.detail?.type; if (t === "transaction_created" || t === "order_created" || t === "order_updated" || t === "transaction_cancelled") load(); };
+    const h = (e) => {
+      const t = e.detail?.type;
+      if (t === "inventory_updated" || t === "bizunit_updated") loadMenu();
+      if (t === "transaction_created" || t === "order_created" || t === "order_updated" || t === "transaction_cancelled") loadOps();
+    };
     window.addEventListener("aw:ws", h);
     return () => window.removeEventListener("aw:ws", h);
   }, []);
@@ -101,16 +121,28 @@ export default function Warung() {
 
     const saveItems = async (next) => {
       if (order) {
-        await api.put(`/orders/${order.id}/items`, { items: next });
-        await load();
+        const previous = order;
+        const optimistic = { ...order, items: next, updated_at: new Date().toISOString() };
+        replaceOrderLocal(optimistic);
+        try {
+          const { data } = await api.put(`/orders/${order.id}/items`, { items: next });
+          replaceOrderLocal(data);
+        } catch (e) {
+          replaceOrderLocal(previous);
+          toast.error(e?.response?.data?.detail || "Gagal menyimpan pesanan");
+        }
         return;
       }
       if (activeTable.takeaway) {
         setDraftTakeawayCart(next);
         return;
       }
-      await api.post("/orders", { table_id: activeTable.id, items: next });
-      await load();
+      try {
+        const { data } = await api.post("/orders", { table_id: activeTable.id, items: next });
+        replaceOrderLocal(data);
+      } catch (e) {
+        toast.error(e?.response?.data?.detail || "Gagal membuat order meja");
+      }
     };
 
     const upsertLine = async (line, delta) => {
@@ -150,15 +182,22 @@ export default function Warung() {
       if (cart.length === 0) return toast.error("Pilih menu dulu sebelum masuk antrian");
       const { data } = await api.post("/orders", { table_id: null, items: cart });
       setDraftTakeawayCart([]);
+      replaceOrderLocal(data);
       setActiveTable({ id: null, name: `Takeaway ${data.queue_no || ""}`.trim(), takeaway: true, order_id: data.id });
-      await load();
       toast.success(`Masuk antrian ${data.queue_no || "takeaway"}`);
     };
 
     const toggleServed = async (idx) => {
       const newServed = !cart[idx].served;
-      await api.put(`/orders/${order.id}/items-served`, { indices: [idx], served: newServed });
-      load();
+      const nextItems = cart.map((row, i) => i === idx ? { ...row, served: newServed } : row);
+      replaceOrderLocal({ ...order, items: nextItems });
+      try {
+        const { data } = await api.put(`/orders/${order.id}/items-served`, { indices: [idx], served: newServed });
+        replaceOrderLocal(data);
+      } catch (e) {
+        replaceOrderLocal(order);
+        toast.error("Gagal mengubah status item");
+      }
     };
 
     const sendToKasir = () => {
@@ -169,7 +208,8 @@ export default function Warung() {
     const cancelOrder = async () => {
       if (!order || !window.confirm("Batalkan order ini?")) return;
       await api.delete(`/orders/${order.id}`);
-      setActiveTable(null); load();
+      setOrders((prev) => prev.filter((o) => o.id !== order.id));
+      setActiveTable(null);
     };
 
     return (
@@ -303,7 +343,7 @@ export default function Warung() {
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Warung Makan</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · refresh otomatis tiap 8 detik</p>
+          <p className="text-sm text-gray-500 mt-0.5">{Object.keys(ordersByTable).length} meja aktif · refresh ringan tiap 15 detik</p>
         </div>
         <div className="flex gap-2 flex-wrap">
           <Button data-testid="new-takeaway-btn" onClick={() => setActiveTable({ id: null, name: "Takeaway Baru", takeaway: true })} variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50">

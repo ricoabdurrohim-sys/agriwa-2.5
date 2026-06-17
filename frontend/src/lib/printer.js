@@ -26,7 +26,7 @@ function concat(...arrays) {
 
 export async function connectPrinter() {
   if (!navigator.bluetooth) {
-    throw new Error("Web Bluetooth tidak didukung di browser ini. Gunakan Chrome/Edge Android atau desktop.");
+    throw new Error("Web Bluetooth tidak tersedia di browser ini. Aplikasi akan memakai fallback print browser 80mm.");
   }
   const device = await navigator.bluetooth.requestDevice({
     acceptAllDevices: true,
@@ -84,6 +84,13 @@ export async function printReceipt(receipt, opts = {}) {
     cmds.push(strBytes(`Bayar    : ${receipt.payment_method.toUpperCase()}\n`));
   }
   cmds.push(strBytes("--------------------------------\n"));
+  if (receipt.trx_no) {
+    cmds.push(bytes(ESC, 0x61, 0x01));
+    cmds.push(escposCode128(String(receipt.trx_no)));
+    cmds.push(strBytes("\nScan / ketik nomor nota\n"));
+    cmds.push(strBytes(String(receipt.trx_no) + "\n"));
+    cmds.push(strBytes("--------------------------------\n"));
+  }
   cmds.push(bytes(ESC, 0x61, 0x01));
   // Multi-line footer support
   for (const line of String(footer).split("\n")) {
