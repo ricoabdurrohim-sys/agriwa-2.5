@@ -1,16 +1,10 @@
-// Safe print utility for receipts/labels.
-// Uses a dedicated print document on iPhone/iPad so the browser does not print the whole app.
-
-const escapeMap = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-
-export function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (c) => escapeMap[c]);
+function escapeHtml(s = "") {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
 }
 
-function isIOSLike() {
+export function isIOSLike() {
   if (typeof navigator === "undefined") return false;
   const ua = navigator.userAgent || "";
-  // Chrome on iPhone/iPad still uses iOS WebKit, so treat it like Safari for print/Bluetooth limits.
   return /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 }
 
@@ -31,25 +25,58 @@ function waitImages(doc) {
     : Promise.resolve();
 }
 
+function writeBody(doc, { bodyHtml, buildBody }) {
+  if (buildBody) buildBody(doc); else if (bodyHtml) doc.body.innerHTML = bodyHtml;
+  sanitizePrintedDocument(doc);
+}
+
 /**
  * Print arbitrary HTML safely.
- * On iPhone/iPad, hidden iframe printing can accidentally print the whole app,
- * so we open a dedicated print document/window that contains ONLY the receipt/label.
+ * iPhone/iPad cannot use Web Bluetooth from browser and often blocks automatic print() calls.
+ * For iOS we open a dedicated 80mm receipt page with a visible "Cetak" button, so only
+ * the receipt/label is printed and the user can trigger AirPrint manually.
  */
 export function printViaIframe({ title, bodyHtml = "", buildBody, css = "", preferWindow = false }) {
-  const shell = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>${css}</style></head><body></body></html>`;
+  const printableCss = `${css}\n.no-print{font-family:system-ui,-apple-system,Segoe UI,sans-serif}.print-toolbar{position:sticky;top:0;background:#fff;border-bottom:1px solid #ddd;padding:10px;z-index:10}.print-btn{width:100%;border:0;border-radius:12px;background:#1a6b3c;color:white;font-weight:700;padding:12px 14px;font-size:15px}.print-hint{font-size:12px;color:#555;margin-top:6px;line-height:1.35}@media print{.no-print{display:none!important}.print-toolbar{display:none!important}html,body{background:white!important}}`;
+  const shell = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><title>${escapeHtml(title)}</title><style>${printableCss}</style></head><body></body></html>`;
 
-  if (preferWindow || isIOSLike()) {
+  if (isIOSLike()) {
+    const win = window.open("", "_blank");
+    if (win && win.document) {
+      const doc = win.document;
+      doc.open(); doc.write(shell); doc.close();
+      const toolbar = doc.createElement("div");
+      toolbar.className = "no-print print-toolbar";
+      toolbar.innerHTML = `<button class="print-btn" type="button">Cetak Struk / Label</button><div class="print-hint">Mode iPhone/iPad: halaman ini hanya berisi struk/label 80mm. Jika dialog print belum muncul, tekan tombol hijau ini lalu pilih printer/AirPrint.</div>`;
+      doc.body.appendChild(toolbar);
+      const wrap = doc.createElement("main");
+      doc.body.appendChild(wrap);
+      if (buildBody) {
+        // Build into a temporary document body, then move generated receipt nodes after toolbar.
+        const tmp = doc.implementation.createHTMLDocument(title || "Print");
+        buildBody(tmp);
+        wrap.innerHTML = tmp.body.innerHTML;
+      } else {
+        wrap.innerHTML = bodyHtml || "";
+      }
+      sanitizePrintedDocument(doc);
+      const doPrint = () => waitImages(doc).then(() => { try { win.focus(); win.print(); } catch {} });
+      toolbar.querySelector("button")?.addEventListener("click", doPrint);
+      // Try once for Android-like behavior; iOS users still have the visible button fallback.
+      setTimeout(doPrint, 650);
+      return;
+    }
+  }
+
+  if (preferWindow) {
     const win = window.open("", "_blank", "noopener,noreferrer,width=420,height=720");
     if (win && win.document) {
       const doc = win.document;
       doc.open(); doc.write(shell); doc.close();
-      if (buildBody) buildBody(doc); else if (bodyHtml) doc.body.innerHTML = bodyHtml;
-      sanitizePrintedDocument(doc);
+      writeBody(doc, { bodyHtml, buildBody });
       waitImages(doc).then(() => setTimeout(() => { try { win.focus(); win.print(); } catch {} }, 250));
       return;
     }
-    // If popup is blocked, fall back to iframe below.
   }
 
   const iframe = document.createElement("iframe");
@@ -58,8 +85,7 @@ export function printViaIframe({ title, bodyHtml = "", buildBody, css = "", pref
   document.body.appendChild(iframe);
   const doc = iframe.contentDocument || iframe.contentWindow.document;
   doc.open(); doc.write(shell); doc.close();
-  if (buildBody) buildBody(doc); else if (bodyHtml) doc.body.innerHTML = bodyHtml;
-  sanitizePrintedDocument(doc);
+  writeBody(doc, { bodyHtml, buildBody });
   const win = iframe.contentWindow;
   waitImages(doc).then(() => {
     try { win.focus(); win.print(); } catch {}
@@ -68,5 +94,5 @@ export function printViaIframe({ title, bodyHtml = "", buildBody, css = "", pref
 }
 
 export function thermal80Css(extra = "") {
-  return `@page{size:80mm auto;margin:2mm}html,body{margin:0;padding:0;background:white}.thermal-print{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.28;width:76mm;max-width:76mm;margin:0 auto;color:#111}.center{text-align:center}.line{border-top:1px dashed #555;margin:6px 0}.row{display:flex;justify-content:space-between;gap:8px}.big{font-weight:700;font-size:15px}.small{font-size:10px}.qr{width:96px;height:96px;display:block;margin:6px auto}img{max-width:100%}@media print{body *{visibility:visible!important}}${extra}`;
+  return `@page{size:80mm auto;margin:2mm}html,body{margin:0!important;padding:0!important;background:white}.thermal-print{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.28;width:76mm;max-width:76mm;margin:0 auto;color:#111}.center{text-align:center}.line{border-top:1px dashed #555;margin:6px 0}.row{display:flex;justify-content:space-between;gap:8px}.big{font-weight:700;font-size:15px}.small{font-size:10px}.qr{width:112px;height:112px;display:block;margin:7px auto}img{max-width:100%}@media print{body>*:not(.thermal-print):not(main){display:none!important}.thermal-print{display:block!important}}${extra}`;
 }

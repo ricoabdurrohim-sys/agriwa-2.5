@@ -2592,21 +2592,38 @@ class PublicOrderIn(BaseModel):
 
 @api.get("/public/menu")
 async def public_menu():
-    """Daftar menu siap-jual untuk halaman QR pelanggan (no auth)."""
-    items = await db.inventory_items.find(
-        {"sell_price": {"$gt": 0}}, {"_id": 0}
-    ).sort("category", 1).to_list(500)
-    # Only expose minimal fields
-    return [
-        {
-            "id": i["id"],
+    """Daftar menu siap-jual untuk halaman QR pelanggan (no auth).
+
+    Self-order harus memakai sumber menu yang sama dengan Kasir/Warung:
+    - item harga dasar > 0 tetap muncul
+    - item harga dasar 0 tetapi punya varian aktif/harga > 0 tetap muncul
+    - varian dikirim ke frontend agar pelanggan dapat memilih panas/es/kecil/besar
+    """
+    rows = await db.inventory_items.find({}, {"_id": 0}).sort("name", 1).to_list(1500)
+    out = []
+    for i in rows:
+        category = str(i.get("category") or "Umum")
+        if "bahan baku" in category.lower():
+            continue
+        variants = _sanitize_pos_variants(i.get("variants") or [])
+        active_variants = [
+            v for v in variants
+            if v.get("active", True) is not False and str(v.get("name") or "").strip() and _money(v.get("sell_price") or i.get("sell_price")) > 0
+        ]
+        base_price = _money(i.get("sell_price"))
+        if base_price <= 0 and not active_variants:
+            continue
+        out.append({
+            "id": i.get("id"),
             "name": i.get("name"),
-            "category": i.get("category"),
-            "sell_price": i.get("sell_price"),
+            "category": category,
+            "sell_price": base_price,
             "image_url": i.get("image_url"),
-        }
-        for i in items
-    ]
+            "has_variants": bool(i.get("has_variants") and active_variants),
+            "variants": active_variants,
+        })
+    out.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
+    return out
 
 
 @api.get("/public/tables/{table_id}")
@@ -2628,22 +2645,38 @@ async def public_create_order(body: PublicOrderIn):
     t = await db.tables.find_one({"id": body.table_id})
     if not t:
         raise HTTPException(404, "Meja tidak ditemukan")
-    # Validate items exist and prices match
+    # Validate items exist, including variant price for POS/self-order.
     item_ids = [i.item_id for i in body.items]
-    inv = await db.inventory_items.find({"id": {"$in": item_ids}, "sell_price": {"$gt": 0}}, {"_id": 0}).to_list(500)
+    inv = await db.inventory_items.find({"id": {"$in": item_ids}}, {"_id": 0}).to_list(500)
     inv_by_id = {i["id"]: i for i in inv}
     validated_items = []
     for it in body.items:
         ref = inv_by_id.get(it.item_id)
         if not ref:
             raise HTTPException(400, f"Item tidak tersedia: {it.name}")
+        variants = _sanitize_pos_variants(ref.get("variants") or [])
+        active_variants = [v for v in variants if v.get("active", True) is not False and str(v.get("name") or "").strip()]
+        chosen_variant = None
+        if it.variant_id:
+            chosen_variant = next((v for v in active_variants if str(v.get("id")) == str(it.variant_id)), None)
+            if not chosen_variant:
+                raise HTTPException(400, f"Varian tidak tersedia untuk {ref.get('name')}")
+        elif ref.get("has_variants") and active_variants:
+            raise HTTPException(400, f"Pilih varian untuk {ref.get('name')}")
+        price = _money((chosen_variant or {}).get("sell_price") or ref.get("sell_price"))
+        if price <= 0:
+            raise HTTPException(400, f"Harga belum diatur untuk {ref.get('name')}")
+        variant_name = (chosen_variant or {}).get("name", "")
         validated_items.append({
+            "line_id": f"{it.item_id}::{(chosen_variant or {}).get('id', 'base')}",
             "item_id": it.item_id,
-            "name": ref["name"],
-            "quantity": int(it.quantity),
-            "unit_price": int(ref["sell_price"]),
+            "name": f"{ref.get('name')} ({variant_name})" if variant_name else ref.get("name"),
+            "quantity": max(1, int(it.quantity or 1)),
+            "unit_price": int(price),
             "notes": it.notes or "",
             "served": False,
+            "variant_id": (chosen_variant or {}).get("id", ""),
+            "variant_name": variant_name,
         })
     doc = {
         "id": gen_id(),
@@ -2658,7 +2691,8 @@ async def public_create_order(body: PublicOrderIn):
     }
     await db.orders.insert_one(doc)
     doc.pop("_id", None)
-    await write_notification("NEW_ORDER", f"Pesanan baru {t.get('name', '')}", f"{len(validated_items)} item masuk dari QR meja {t.get('name', body.table_id)}", ref_type="order", ref_id=doc["id"], priority="high")
+    notif = await write_notification("NEW_ORDER", f"Pesanan baru {t.get('name', '')}", f"{len(validated_items)} item masuk dari QR meja {t.get('name', body.table_id)}", ref_type="order", ref_id=doc["id"], priority="high")
+    await broadcast_event("notification_created", {"id": notif.get("id"), "type": "NEW_ORDER", "ref_type": "order", "ref_id": doc["id"], "priority": "high", "source": "self_order"})
     await broadcast_event("order_created", {"id": doc["id"], "table_id": doc["table_id"], "source": "self_order"})
     return {"ok": True, "order_id": doc["id"], "table_name": t["name"], "items_count": len(validated_items)}
 

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, UtensilsCrossed, Calculator, FileBarChart,
@@ -12,6 +12,8 @@ import { useWebSocket } from "@/lib/useWebSocket";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/AuthContext";
 import ErrorBoundary from "@/components/ErrorBoundary";
+import api from "@/lib/api";
+import { toast } from "sonner";
 
 const mainNav = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard" },
@@ -58,11 +60,35 @@ const GROUP_ORDER = ["Ringkasan", "Operasional", "Stok & Produksi", "Keuangan & 
 const LS_HIDDEN_KEY = "aw_drawer_hidden_v2";
 const LS_FULLVIEW_KEY = "aw_drawer_fullview_v2";
 
+function playNewOrderSound() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.22, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+    gain.connect(ctx.destination);
+    [880, 1175].forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, now + idx * 0.16);
+      osc.connect(gain);
+      osc.start(now + idx * 0.16);
+      osc.stop(now + idx * 0.16 + 0.15);
+    });
+    setTimeout(() => ctx.close().catch(() => {}), 700);
+  } catch {}
+}
+
 export default function Layout() {
   const { user, logout } = useAuth();
   const nav = useNavigate();
   const [open, setOpen] = useState(false);
   const [wsStatus, setWsStatus] = useState("connecting");
+  const [unreadCount, setUnreadCount] = useState(0);
   const [editMode, setEditMode] = useState(false);
   const [fullView, setFullView] = useState(() => localStorage.getItem(LS_FULLVIEW_KEY) === "true");
   const [hidden, setHidden] = useState(() => {
@@ -97,10 +123,28 @@ export default function Layout() {
     return out;
   }, [visibleModules]);
 
+  const loadUnreadCount = useCallback(async () => {
+    try {
+      const { data } = await api.get("/notifications", { params: { unread_only: true, limit: 100 } });
+      setUnreadCount(Array.isArray(data) ? data.length : 0);
+    } catch {
+      // If auth is still loading or endpoint is unavailable, avoid breaking the layout.
+    }
+  }, []);
+
+  useEffect(() => { loadUnreadCount(); }, [loadUnreadCount]);
+
   useWebSocket((msg) => {
     if (msg.type === "connected") setWsStatus("connected");
     if (msg.type && msg.type !== "connected") {
       window.dispatchEvent(new CustomEvent("aw:ws", { detail: msg }));
+      const payload = msg.payload || {};
+      const isSelfOrder = payload.source === "self_order" || payload.type === "NEW_ORDER" || msg.type === "notification_created";
+      if ((msg.type === "order_created" || msg.type === "notification_created") && isSelfOrder) {
+        setUnreadCount((n) => Math.min(99, Number(n || 0) + 1));
+        playNewOrderSound();
+        toast.info("Pesanan self-order baru masuk", { description: "Buka Warung/KDS untuk melihat detail." });
+      }
     }
   });
 
@@ -218,7 +262,14 @@ export default function Layout() {
               {wsStatus === "connected" ? "Live · Sinkron" : "Menyambung..."}
             </div>
             <NavLink to="/scan" className="p-2 rounded-md hover:bg-gray-100 relative" data-testid="scan-shortcut-btn"><ScanLine className="w-5 h-5 text-gray-700" /></NavLink>
-            <NavLink to="/notifications" className="p-2 rounded-md hover:bg-gray-100 relative" data-testid="notifications-btn"><Bell className="w-5 h-5 text-gray-700" /></NavLink>
+            <NavLink to="/notifications" onClick={() => setUnreadCount(0)} className="p-2 rounded-md hover:bg-gray-100 relative" data-testid="notifications-btn">
+              <Bell className={`w-5 h-5 ${unreadCount > 0 ? "text-amber-600" : "text-gray-700"}`} />
+              {unreadCount > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-red-600 text-white text-[10px] leading-[18px] text-center font-bold shadow">
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              )}
+            </NavLink>
           </div>
         </div>
       </header>
