@@ -1,0 +1,8 @@
+Kalau di repo/HF masih ada file ini, boleh hapus agar tidak bikin bingung:
+- backend/server_patched.py
+- backend/requirements.extra.txt
+- server_patched.py di root HF
+
+Patch v2.5.26 memakai backend utama:
+- backend/server.py untuk GitHub
+- server.py di root untuk HF

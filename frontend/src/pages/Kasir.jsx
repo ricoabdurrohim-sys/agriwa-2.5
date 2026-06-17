@@ -2,8 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
-import { printReceipt, isPrinterAvailable } from "@/lib/printer";
-import { printViaIframe, thermal80Css } from "@/lib/safePrint";
+import { printReceipt80mm } from "@/utils/receiptPrint80mm";
 import { resolveImageUrl } from "@/components/ImageUpload";
 import QRCodeBox from "@/components/QRCodeBox";
 import { Button } from "@/components/ui/button";
@@ -1054,7 +1053,7 @@ export default function Kasir() {
               <div className="border-t border-dashed border-gray-400 my-2" />
               {showReceipt.trx_no && (
                 <div className="text-center my-2">
-                  <QRCodeBox value={showReceipt.trx_no} size={118} label={`Scan QR / ketik: ${showReceipt.trx_no}`} />
+                  <QRCodeBox value={showReceipt.trx_no} size={76} quiet />
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
@@ -1067,37 +1066,23 @@ export default function Kasir() {
               <>
                 <Button data-testid="receipt-bluetooth-btn" variant="outline" className="flex-1 w-full" onClick={async () => {
                   const cfg = getReceiptConfig(showReceipt);
-                  const fallbackThermal = () => {
-                    printViaIframe({
-                      title: `Struk ${showReceipt.trx_no}`,
-                      css: thermal80Css(),
-                      preferWindow: true,
-                      buildBody: (doc) => {
-                        const wrap = doc.createElement('div');
-                        wrap.className = 'thermal-print';
-                        const rows = (showReceipt.items || []).map((it) => `<div>${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
-                        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(showReceipt.trx_no || '')}`;
-                        wrap.innerHTML = `<div class="center big">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row big"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/><div class="small">Scan QR / ketik ${showReceipt.trx_no || ''}</div></div><div class="line"></div><div class="center small">${cfg.footer || 'Terima kasih!'}</div>`;
-                        doc.body.appendChild(wrap);
-                      }
-                    });
-                  };
+                  const printBrowser80mm = async () => printReceipt80mm(showReceipt, {
+                    receipt_name: cfg.business_name,
+                    receipt_address: cfg.address || "",
+                    receipt_phone: cfg.phone || "",
+                    receipt_note: cfg.note || "",
+                    receipt_footer: cfg.footer || "Terima kasih!",
+                    receipt_logo: cfg.logo_url || "",
+                    qrData: showReceipt.trx_no || "",
+                    qrSizeMm: 10,
+                  });
                   try {
-                    if (!isPrinterAvailable()) {
-                      fallbackThermal();
-                      toast.info("Web Bluetooth tidak tersedia di browser ini. Dibuka mode print browser ukuran 80mm.");
-                      return;
-                    }
-                    await printReceipt(showReceipt, {
-                      headerName: cfg.business_name,
-                      subLine: cfg.address || "",
-                      phone: cfg.phone || "",
-                      footer: cfg.footer || "Terima kasih!",
-                    });
-                    toast.success("Struk dikirim ke printer thermal");
+                    // Browser 80mm diprioritaskan karena mode ini bisa mencetak logo/gambar/footer.
+                    // Raw Bluetooth tetap disiapkan di lib/printer, tetapi banyak printer thermal murah tidak stabil untuk bitmap/logo.
+                    await printBrowser80mm();
+                    toast.success("Struk 80mm siap dicetak");
                   } catch (e) {
-                    fallbackThermal();
-                    toast.error((e?.message || "Gagal cetak Bluetooth") + ". Dibuka fallback print browser.");
+                    toast.error(e?.message || "Gagal membuka print 80mm");
                   }
                 }}>
                   <Bluetooth className="w-4 h-4 mr-1.5" /> Thermal / 80mm
@@ -1127,12 +1112,16 @@ export default function Kasir() {
                   <MessageCircle className="w-4 h-4 mr-1.5" /> WhatsApp{showReceipt?.customer_phone ? " Pelanggan" : ""}
                 </Button>
                 <Button data-testid="receipt-print-btn" variant="outline" className="flex-1 w-full" onClick={() => {
-                  const html = document.getElementById("receipt-content")?.innerHTML || "";
-                  printViaIframe({
-                    title: `Struk ${showReceipt.trx_no}`,
-                    css: thermal80Css(),
-                    bodyHtml: `<div class="thermal-print">${html}</div>`,
-                    preferWindow: true,
+                  const cfg = getReceiptConfig(showReceipt);
+                  printReceipt80mm(showReceipt, {
+                    receipt_name: cfg.business_name,
+                    receipt_address: cfg.address || "",
+                    receipt_phone: cfg.phone || "",
+                    receipt_note: cfg.note || "",
+                    receipt_footer: cfg.footer || "Terima kasih!",
+                    receipt_logo: cfg.logo_url || "",
+                    qrData: showReceipt.trx_no || "",
+                    qrSizeMm: 10,
                   });
                 }}>
                   <Printer className="w-4 h-4 mr-1.5" /> Print

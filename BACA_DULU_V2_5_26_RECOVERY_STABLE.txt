@@ -1,0 +1,15 @@
+AGRIWARUNG v2.5.26 RECOVERY STABLE
+
+INI UNTUK GITHUB / VERCEL.
+
+Tujuan patch ini:
+1. Tidak mengubah alur interkoneksi menu yang sudah sinkron.
+2. Membersihkan deploy agar HF kembali memakai backend utama server.py, bukan server_patched.py.
+3. Memperbaiki print struk thermal 80mm: font lebih kecil, QR lebih kecil, tulisan scan QR/ketik nomor nota dihilangkan, logo/footer ikut tampil.
+4. Lini Bisnis: Nama/Alamat/Footer/Catatan struk bisa Enter/multi-baris.
+5. Menu Warung: tombol Cetak QR meja mencetak QR 80mm yang mengarah ke /order/{tableId}.
+
+PENTING:
+- Untuk Hugging Face, pakai ZIP HF_BACKEND terpisah.
+- Jangan jalankan server_patched.py lagi.
+- Environment tetap sama: MONGO_URL, DB_NAME, JWT_SECRET di HF; REACT_APP_BACKEND_URL di Vercel.

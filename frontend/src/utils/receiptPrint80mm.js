@@ -125,11 +125,13 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
   const address = getOption(options, ['receipt_address', 'address'], '');
   const phone = getOption(options, ['receipt_phone', 'phone'], '');
   const headerText = getOption(options, ['receipt_header', 'headerText'], '');
-  const footerText = getOption(options, ['receipt_footer', 'footerText', 'footer'], 'Terima kasih');
-  const logoUrl = resolveAssetUrl(getOption(options, ['receipt_logo_url', 'logo_url', 'logoUrl', 'image_url'], ''));
-  const footerImageUrl = resolveAssetUrl(getOption(options, ['receipt_footer_image_url', 'footerImageUrl'], ''));
-  const qrUrl = buildQrImage(options.qrData, options.qrImageUrl, 140);
-  const qrSizeMm = Math.max(10, Math.min(Number(options.qrSizeMm || 15), 24));
+  const receiptNote = getOption(options, ['receipt_note', 'note', 'receiptNote'], '');
+  const rawFooterText = getOption(options, ['receipt_footer', 'footerText', 'footer'], 'Terima kasih');
+  const footerText = [receiptNote, rawFooterText].filter((x) => String(x || '').trim()).join('\n');
+  const logoUrl = resolveAssetUrl(getOption(options, ['receipt_logo', 'receipt_logo_url', 'logo_url', 'logoUrl', 'image_url'], ''));
+  const footerImageUrl = resolveAssetUrl(getOption(options, ['receipt_footer_image', 'receipt_footer_image_url', 'footerImageUrl'], ''));
+  const qrUrl = buildQrImage(options.qrData, options.qrImageUrl, 110);
+  const qrSizeMm = Math.max(8, Math.min(Number(options.qrSizeMm || 11), 18));
 
   const invoice = transaction.trx_no || transaction.invoice_no || transaction.invoice || transaction.id || '-';
   const dateLabel = transaction.created_at_label || transaction.date_label || transaction.created_at || new Date().toLocaleString('id-ID');
@@ -156,22 +158,22 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
   }
   * { box-sizing: border-box; }
   .receipt {
-    width: 72mm;
+    width: 70mm;
     margin: 0 auto;
     padding: 2mm 0 14mm;
-    font-size: 9.8px;
-    line-height: 1.22;
+    font-size: 9.4px;
+    line-height: 1.2;
     overflow: visible;
   }
   .center { text-align: center; }
   .store-name {
-    font-size: 11.4px;
-    line-height: 1.13;
+    font-size: 10.2px;
+    line-height: 1.12;
     font-weight: 700;
     word-break: break-word;
     margin: .8mm 0 .6mm;
   }
-  .small { font-size: 9.2px; line-height: 1.18; word-break: break-word; }
+  .small { font-size: 8.8px; line-height: 1.16; word-break: break-word; }
   .preline { white-space: pre-line; word-break: break-word; }
   .dash { border-top: 1px dashed #000; margin: 3.5px 0; height: 0; }
   .row { display: flex; justify-content: space-between; gap: 5px; align-items: flex-start; }
@@ -181,7 +183,7 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
   .item-meta { display: flex; justify-content: space-between; gap: 5px; }
   .item-note { font-size: 8.8px; padding-left: 3mm; word-break: break-word; }
   .logo-wrap, .footer-img-wrap, .qr-wrap { text-align: center; page-break-inside: avoid; }
-  .logo { max-width: 38mm; max-height: 13mm; object-fit: contain; margin-bottom: .8mm; }
+  .logo { max-width: 34mm; max-height: 12mm; object-fit: contain; margin-bottom: .8mm; }
   .footer-img { max-width: 50mm; max-height: 15mm; object-fit: contain; margin-top: 1.5mm; }
   .qr-img { width: ${qrSizeMm}mm; height: ${qrSizeMm}mm; object-fit: contain; margin: 1.5mm auto .5mm; }
   .footer { margin-top: 4px; text-align: center; page-break-inside: avoid; }
@@ -223,7 +225,7 @@ export function buildReceipt80mmHtml(transaction = {}, options = {}) {
 export async function printReceipt80mm(transaction = {}, options = {}) {
   const html = buildReceipt80mmHtml(transaction, {
     ...options,
-    qrSizeMm: options.qrSizeMm || 15,
+    qrSizeMm: options.qrSizeMm || 11,
   });
   return openAndPrint(html);
 }

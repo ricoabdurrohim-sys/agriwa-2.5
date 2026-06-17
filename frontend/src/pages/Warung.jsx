@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Plus, Minus, Trash2, Search, Clock, ChevronLeft, Send, Check, X, UtensilsCrossed, QrCode, Smartphone, Edit2 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
 import api, { formatRupiah } from "@/lib/api";
-import { printViaIframe } from "@/lib/safePrint";
+import { printTableQr } from "@/utils/tableQrPrint";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -565,7 +565,7 @@ export default function Warung() {
                   <div className="text-2xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>{qrTable.name}</div>
                 </div>
                 <div className="bg-white p-4 rounded-2xl border-2 border-gray-100 flex justify-center" data-testid="qr-canvas-wrap">
-                  <QRCodeCanvas value={url} size={220} level="H" includeMargin={false} fgColor="#1a6b3c" />
+                  <QRCodeCanvas value={url} size={180} level="H" includeMargin={false} fgColor="#1a6b3c" />
                 </div>
                 <div className="text-[11px] text-center text-gray-500">Pelanggan scan untuk memesan dari HP-nya</div>
                 <div className="bg-gray-50 rounded-lg p-2 text-[11px] font-mono break-all text-gray-700">{url}</div>
@@ -580,30 +580,9 @@ export default function Warung() {
                   </Button>
                 </div>
                 <Button variant="outline" className="w-full" data-testid="print-qr-btn" onClick={() => {
-                  const canvas = document.querySelector('[data-testid="qr-canvas-wrap"] canvas');
-                  const dataUrl = canvas?.toDataURL("image/png") || "";
-                  printViaIframe({
-                    title: `QR ${qrTable.name}`,
-                    css: "body{font-family:sans-serif;text-align:center;padding:24px;}h1{margin:0 0 6px;font-size:22px;}p{color:#666;font-size:14px;margin-top:4px;}img{margin:18px auto;display:block;}.b{border:2px solid #1a6b3c;border-radius:18px;padding:18px;display:inline-block;}",
-                    buildBody: (doc) => {
-                      const box = doc.createElement("div");
-                      box.className = "b";
-                      const h = doc.createElement("h1");
-                      h.textContent = qrTable.name;
-                      const p1 = doc.createElement("p");
-                      p1.textContent = "Scan untuk pesan";
-                      const img = doc.createElement("img");
-                      img.src = dataUrl;
-                      img.width = 280;
-                      const p2 = doc.createElement("p");
-                      p2.style.cssText = "font-size:11px;color:#888;";
-                      p2.textContent = url;
-                      box.appendChild(h); box.appendChild(p1); box.appendChild(img); box.appendChild(p2);
-                      doc.body.appendChild(box);
-                    },
-                  });
+                  printTableQr({ ...qrTable, url }, { businessName: "AgriWarung", qrSizeMm: 28 });
                 }}>
-                  Cetak QR
+                  Cetak QR 80mm
                 </Button>
               </div>
             );

@@ -1,0 +1,22 @@
+QA CHECK v2.5.26
+
+Checked from uploaded agriwa-2.5.zip.
+
+Backend:
+- python -m py_compile backend/server.py: OK
+- import server with dummy env MONGO_URL/DB_NAME/JWT_SECRET: OK
+- FastAPI app title: AgriWarung Manager API
+- Route count: 238
+- server_patched.py removed from final GitHub/HF outputs.
+- HF Dockerfile runs uvicorn server:app.
+
+Frontend static checks:
+- Receipt print old text 'Scan QR / ketik' removed from patched print paths.
+- Receipt QR default reduced to 10-11mm.
+- Store name font reduced.
+- Business Units receipt fields switched to Textarea for Enter/multi-line.
+- Table QR print route fixed to /order/{tableId}.
+- Warung print QR uses 80mm helper.
+
+Not run:
+- Full Vercel yarn build, because node_modules/dependency install is not available inside this offline sandbox.

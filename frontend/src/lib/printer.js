@@ -56,7 +56,7 @@ export async function printReceipt(receipt, opts = {}) {
   cmds.push(bytes(ESC, 0x40));
   // Center, big
   cmds.push(bytes(ESC, 0x61, 0x01));
-  cmds.push(bytes(GS, 0x21, 0x11));
+  cmds.push(bytes(GS, 0x21, 0x00));
   cmds.push(strBytes(headerName + "\n"));
   cmds.push(bytes(GS, 0x21, 0x00));
   if (subLine) cmds.push(strBytes(subLine + "\n"));
@@ -86,9 +86,7 @@ export async function printReceipt(receipt, opts = {}) {
   cmds.push(strBytes("--------------------------------\n"));
   if (receipt.trx_no) {
     cmds.push(bytes(ESC, 0x61, 0x01));
-    cmds.push(escposQr(String(receipt.trx_no), 6));
-    cmds.push(strBytes("Scan QR / ketik nomor nota\n"));
-    cmds.push(strBytes(String(receipt.trx_no) + "\n"));
+    cmds.push(escposQr(String(receipt.trx_no), 4));
     cmds.push(strBytes("--------------------------------\n"));
   }
   cmds.push(bytes(ESC, 0x61, 0x01));

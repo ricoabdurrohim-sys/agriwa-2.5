@@ -2,7 +2,7 @@ import { printTableQr80mm } from './receiptPrint80mm';
 
 function buildSelfOrderUrl(tableId) {
   const id = encodeURIComponent(tableId);
-  return `${window.location.origin}/self-order/table/${id}`;
+  return `${window.location.origin}/order/${id}`;
 }
 
 export async function printTableQr(table, options = {}) {
@@ -17,6 +17,6 @@ export async function printTableQr(table, options = {}) {
   return printTableQr80mm(meta, {
     ...options,
     businessName: options.businessName || options.receiptName || 'AgriWarung',
-    qrSizeMm: options.qrSizeMm || 30,
+    qrSizeMm: options.qrSizeMm || 28,
   });
 }
