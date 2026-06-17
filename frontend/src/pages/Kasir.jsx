@@ -76,17 +76,15 @@ export default function Kasir() {
 
   const compactPrice = (v) => {
     const n = Number(v || 0);
-    if (!n) return "Rp 0";
-    if (n >= 1000000) return `${(n / 1000000).toFixed(n % 1000000 ? 1 : 0)}jt`;
-    if (n >= 1000) return `${(n / 1000).toFixed(n % 1000 ? 1 : 0)}k`;
-    return String(n);
+    if (!n) return "0";
+    return Number(n).toLocaleString("id-ID");
   };
 
   const itemPriceLabel = (item) => {
     const variants = (item?.variants || []).filter((v) => v && v.active !== false && v.name);
     if (item?.has_variants && variants.length) {
       const prices = [...new Set(variants.map((v) => Number(v.sell_price || item.sell_price || 0)).filter((n) => n > 0))].sort((a,b)=>a-b);
-      if (prices.length) return prices.map(compactPrice).join("/");
+      if (prices.length) return `Rp ${prices.map(compactPrice).join("/")}`;
     }
     return formatRupiah(item?.sell_price || 0);
   };
@@ -696,7 +694,7 @@ export default function Kasir() {
           </div>
           <div className="flex items-center justify-between gap-2">
             <span className="text-sm text-gray-600">Diskon</span>
-            <Input data-testid="discount-input" type="number" value={discount || ""} onChange={(e) => setDiscount(parseInt(e.target.value) || 0)} className="h-9 w-24 text-right font-mono" />
+            <Input data-testid="discount-input" type="text" inputMode="numeric" pattern="[0-9]*" value={discount || ""} onChange={(e) => setDiscount(parseInt(e.target.value) || 0)} className="h-9 w-24 text-right font-mono" />
           </div>
           {showTaxBreakdown && (
             <div className="text-xs bg-emerald-50 border border-emerald-100 rounded-lg p-2 space-y-1">
@@ -734,7 +732,7 @@ export default function Kasir() {
                 <button onClick={clearMember} data-testid="clear-member-btn" className="text-gray-400 hover:text-red-600"><X className="w-3.5 h-3.5" /></button>
               </div>
               <div className="flex gap-1.5 mt-2">
-                <Input data-testid="redeem-points-input" type="number" max={member.points} value={pointsToRedeem || ""} onChange={(e) => setPointsToRedeem(parseInt(e.target.value) || 0)} placeholder="Tukar poin" className="h-8 font-mono text-xs" />
+                <Input data-testid="redeem-points-input" type="text" inputMode="numeric" pattern="[0-9]*" max={member.points} value={pointsToRedeem || ""} onChange={(e) => setPointsToRedeem(parseInt(e.target.value) || 0)} placeholder="Tukar poin" className="h-8 font-mono text-xs" />
                 <Button size="sm" data-testid="apply-redeem-btn" onClick={applyRedeem} className="h-8 bg-amber-500 hover:bg-amber-600">Redeem</Button>
               </div>
               {redeemDiscount > 0 && <div className="text-xs text-amber-900 mt-1.5 font-medium">Diskon poin: -{formatRupiah(redeemDiscount)}</div>}
@@ -800,7 +798,7 @@ export default function Kasir() {
             <>
               <div>
                 <label className="text-xs font-medium text-gray-600">{bonInfo ? "Uang Diterima untuk Pelunasan Bon" : "Uang Diterima"}</label>
-                <Input data-testid="cash-received-input" type="number" value={cashReceived}
+                <Input data-testid="cash-received-input" type="text" inputMode="numeric" pattern="[0-9]*" value={cashReceived}
                   onChange={(e) => setCashReceived(e.target.value)}
                   onFocus={() => { if (bonInfo && (!cashReceived || Number(cashReceived) <= 0)) setCashReceived(String(paymentDue)); }}
                   className="h-11 mt-1 font-mono text-right" placeholder={bonInfo ? String(paymentDue) : "0"} />

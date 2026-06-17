@@ -40,6 +40,7 @@ export default function Anggur() {
   const [showInput, setShowInput] = useState(false);
   const [editPlot, setEditPlot] = useState(null);
   const [editActivity, setEditActivity] = useState(null);
+  const [editCust, setEditCust] = useState(null);
   const [plotForm, setPlotForm] = useState(initPlot);
   const [harvForm, setHarvForm] = useState(initHarv);
   const [custForm, setCustForm] = useState(initCust);
@@ -119,10 +120,18 @@ export default function Anggur() {
     if (!window.confirm("Hapus pemakaian input ini? Stok inventori akan dikembalikan.")) return;
     await api.delete(`/vineyard/input-usages/${u.id}`); load(); toast.success("Pemakaian input dihapus");
   };
+  const openNewCust = () => { setEditCust(null); setCustForm(initCust); setShowCust(true); };
+  const openEditCust = (c) => { setEditCust(c); setCustForm({ ...initCust, ...c }); setShowCust(true); };
   const saveCust = async () => {
     if (!custForm.name) return toast.error("Nama wajib");
-    await api.post("/b2b/customers", custForm);
-    setCustForm(initCust); setShowCust(false); load(); toast.success("Pelanggan B2B ditambahkan");
+    if (editCust) await api.put(`/b2b/customers/${editCust.id}`, custForm);
+    else await api.post("/b2b/customers", custForm);
+    setCustForm(initCust); setEditCust(null); setShowCust(false); load(); toast.success(editCust ? "Pelanggan B2B diperbarui" : "Pelanggan B2B ditambahkan");
+  };
+  const deleteCust = async (c) => {
+    if (!window.confirm(`Hapus pelanggan B2B ${c.name}?`)) return;
+    try { await api.delete(`/b2b/customers/${c.id}`); load(); toast.success("Pelanggan B2B dihapus"); }
+    catch (e) { toast.error(e?.response?.data?.detail || "Tidak bisa hapus pelanggan yang sudah punya invoice"); }
   };
   const saveInv = async () => {
     if (!invForm.customer_id || invForm.items.some((i) => !i.name || !i.quantity)) return toast.error("Lengkapi data invoice");
@@ -230,8 +239,8 @@ export default function Anggur() {
         </TabsContent>
 
         <TabsContent value="b2b" className="p-4 space-y-3">
-          <Button onClick={() => setShowCust(true)} className="bg-[#1a6b3c] hover:bg-[#14522d]"><Plus className="w-4 h-4 mr-1.5" /> Pelanggan B2B</Button>
-          <div className="grid sm:grid-cols-2 gap-3">{customers.length === 0 ? <Empty text="Belum ada pelanggan B2B" /> : customers.map((c) => <div key={c.id} className="border rounded-lg p-3"><div className="font-semibold text-sm">{c.name}</div><div className="text-xs text-gray-500">{c.contact || '—'} · {c.payment_terms}</div><div className="text-xs text-gray-600 mt-1">{c.address}</div></div>)}</div>
+          <Button onClick={openNewCust} className="bg-[#1a6b3c] hover:bg-[#14522d]"><Plus className="w-4 h-4 mr-1.5" /> Pelanggan B2B</Button>
+          <div className="grid sm:grid-cols-2 gap-3">{customers.length === 0 ? <Empty text="Belum ada pelanggan B2B" /> : customers.map((c) => <div key={c.id} className="border rounded-lg p-3"><div className="flex items-start justify-between gap-2"><div><div className="font-semibold text-sm">{c.name}</div><div className="text-xs text-gray-500">{c.contact || '—'} · {c.payment_terms}</div></div><div className="flex gap-2"><button onClick={() => openEditCust(c)} className="text-blue-600"><Edit2 className="w-4 h-4" /></button><button onClick={() => deleteCust(c)} className="text-red-600"><Trash2 className="w-4 h-4" /></button></div></div><div className="text-xs text-gray-600 mt-1">{c.address}</div></div>)}</div>
         </TabsContent>
 
         <TabsContent value="invoices" className="p-4 space-y-3">
@@ -276,9 +285,9 @@ export default function Anggur() {
 
       <Dialog open={showInput} onOpenChange={setShowInput}><DialogContent><DialogHeader><DialogTitle>Pemakaian Input Kebun</DialogTitle></DialogHeader><SelectField label="Plot" value={inputForm.plot_id} onChange={(v)=>setInputForm({...inputForm,plot_id:v})} items={plots.map(p=>({value:p.id,label:p.name}))}/><SelectField label="Item Inventori" value={inputForm.item_id} onChange={(v)=>setInputForm({...inputForm,item_id:v})} items={inputItems.map(i=>({value:i.id,label:`${i.name} · stok ${i.current_stock || 0} ${i.unit}`}))}/><Field label="Jumlah" type="number" value={inputForm.quantity || ''} onChange={(v)=>setInputForm({...inputForm,quantity:v})}/><Field label="Keperluan" value={inputForm.purpose} onChange={(v)=>setInputForm({...inputForm,purpose:v})}/><DialogFooter><Button variant="outline" onClick={()=>setShowInput(false)}>Batal</Button><Button onClick={saveInputUsage}>Simpan</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={showCust} onOpenChange={setShowCust}><DialogContent><DialogHeader><DialogTitle>Pelanggan B2B Baru</DialogTitle></DialogHeader><Field label="Nama / Distributor" value={custForm.name} onChange={(v)=>setCustForm({...custForm,name:v})}/><Field label="Kontak" value={custForm.contact} onChange={(v)=>setCustForm({...custForm,contact:v})}/><Field label="Alamat" value={custForm.address} onChange={(v)=>setCustForm({...custForm,address:v})}/><SelectField label="Termin" value={custForm.payment_terms} onChange={(v)=>setCustForm({...custForm,payment_terms:v})} items={['COD','Net 7','Net 14','Net 30'].map(x=>({value:x,label:x}))}/><DialogFooter><Button variant="outline" onClick={()=>setShowCust(false)}>Batal</Button><Button onClick={saveCust}>Simpan</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={showCust} onOpenChange={(o)=>{setShowCust(o); if(!o){setEditCust(null); setCustForm(initCust);}}}><DialogContent><DialogHeader><DialogTitle>{editCust ? "Edit Pelanggan B2B" : "Pelanggan B2B Baru"}</DialogTitle></DialogHeader><Field label="Nama / Distributor" value={custForm.name} onChange={(v)=>setCustForm({...custForm,name:v})}/><Field label="Kontak" value={custForm.contact} onChange={(v)=>setCustForm({...custForm,contact:v})}/><Field label="Alamat" value={custForm.address} onChange={(v)=>setCustForm({...custForm,address:v})}/><SelectField label="Termin" value={custForm.payment_terms} onChange={(v)=>setCustForm({...custForm,payment_terms:v})} items={['COD','Net 7','Net 14','Net 30'].map(x=>({value:x,label:x}))}/><DialogFooter><Button variant="outline" onClick={()=>setShowCust(false)}>Batal</Button><Button onClick={saveCust}>{editCust ? "Update" : "Simpan"}</Button></DialogFooter></DialogContent></Dialog>
 
-      <Dialog open={showInv} onOpenChange={setShowInv}><DialogContent className="max-w-lg"><DialogHeader><DialogTitle>Invoice B2B Baru</DialogTitle></DialogHeader><SelectField label="Pelanggan" value={invForm.customer_id} onChange={(v)=>setInvForm({...invForm,customer_id:v})} items={customers.map(c=>({value:c.id,label:c.name}))}/><div className="space-y-2"><Label>Item</Label>{invForm.items.map((it, idx)=><div key={idx} className="flex gap-2"><Input placeholder="Nama produk" value={it.name} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],name:e.target.value};setInvForm({...invForm,items:ns});}}/><Input className="w-20" type="number" placeholder="Qty" value={it.quantity || ''} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],quantity:e.target.value};setInvForm({...invForm,items:ns});}}/><Input className="w-28" type="number" placeholder="Harga" value={it.unit_price || ''} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],unit_price:e.target.value};setInvForm({...invForm,items:ns});}}/><button onClick={()=>{const ns=invForm.items.filter((_,i)=>i!==idx);setInvForm({...invForm,items:ns.length?ns:[{name:'',quantity:0,unit_price:0}]});}}><Trash2 className="w-4 h-4 text-red-600"/></button></div>)}<button onClick={()=>setInvForm({...invForm,items:[...invForm.items,{name:'',quantity:0,unit_price:0}]})} className="text-xs text-[#1a6b3c] font-medium">+ Tambah Item</button></div><Field label="Catatan" value={invForm.notes} onChange={(v)=>setInvForm({...invForm,notes:v})}/><DialogFooter><Button variant="outline" onClick={()=>setShowInv(false)}>Batal</Button><Button onClick={saveInv}>Buat Invoice</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={showInv} onOpenChange={setShowInv}><DialogContent className="max-w-lg"><DialogHeader><DialogTitle>Invoice B2B Baru</DialogTitle></DialogHeader><SelectField label="Pelanggan" value={invForm.customer_id} onChange={(v)=>setInvForm({...invForm,customer_id:v})} items={customers.map(c=>({value:c.id,label:c.name}))}/><div className="space-y-2"><Label>Item</Label>{invForm.items.map((it, idx)=><div key={idx} className="flex gap-2"><Input placeholder="Nama produk" value={it.name} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],name:e.target.value};setInvForm({...invForm,items:ns});}}/><Input className="w-20" type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Qty" value={it.quantity || ''} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],quantity:e.target.value};setInvForm({...invForm,items:ns});}}/><Input className="w-28" type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Harga" value={it.unit_price || ''} onChange={(e)=>{const ns=[...invForm.items];ns[idx]={...ns[idx],unit_price:e.target.value};setInvForm({...invForm,items:ns});}}/><button onClick={()=>{const ns=invForm.items.filter((_,i)=>i!==idx);setInvForm({...invForm,items:ns.length?ns:[{name:'',quantity:0,unit_price:0}]});}}><Trash2 className="w-4 h-4 text-red-600"/></button></div>)}<button onClick={()=>setInvForm({...invForm,items:[...invForm.items,{name:'',quantity:0,unit_price:0}]})} className="text-xs text-[#1a6b3c] font-medium">+ Tambah Item</button></div><Field label="Catatan" value={invForm.notes} onChange={(v)=>setInvForm({...invForm,notes:v})}/><DialogFooter><Button variant="outline" onClick={()=>setShowInv(false)}>Batal</Button><Button onClick={saveInv}>Buat Invoice</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }
@@ -287,5 +296,5 @@ function Summary({ title, value, icon }) { return <div className="bg-white borde
 function Empty({ text }) { return <div className="col-span-full text-center py-6 text-gray-400 text-sm">{text}</div>; }
 function List({ rows, empty, render }) { return <div className="divide-y divide-gray-100">{rows.length === 0 ? <div className="text-center py-6 text-gray-400 text-sm">{empty}</div> : rows.map(render)}</div>; }
 function Row({ icon, title, subtitle, right, badge, active }) { return <div className={`flex items-center gap-3 py-3 ${active ? "bg-emerald-50 ring-1 ring-emerald-200 rounded-lg px-2" : ""}`}><div className="p-2 bg-purple-50 rounded-lg text-purple-700">{React.cloneElement(icon,{className:'w-4 h-4'})}</div><div className="flex-1"><div className="text-sm font-semibold flex items-center gap-2">{title}{badge}</div><div className="text-xs text-gray-500">{subtitle}</div></div>{right}</div>; }
-function Field({ label, value, onChange, type='text' }) { return <div><Label>{label}</Label><Input type={type} value={value} onChange={(e)=>onChange(e.target.value)} /></div>; }
+function Field({ label, value, onChange, type='text' }) { const numeric = type === 'number'; return <div><Label>{label}</Label><Input type={numeric ? 'text' : type} inputMode={numeric ? 'numeric' : undefined} pattern={numeric ? '[0-9]*' : undefined} value={value} onChange={(e)=>onChange(e.target.value)} /></div>; }
 function SelectField({ label, value, onChange, items }) { return <div><Label>{label}</Label><Select value={value} onValueChange={onChange}><SelectTrigger><SelectValue placeholder="Pilih" /></SelectTrigger><SelectContent>{items.map((i)=><SelectItem key={i.value} value={i.value}>{i.label}</SelectItem>)}</SelectContent></Select></div>; }

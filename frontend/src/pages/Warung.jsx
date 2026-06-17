@@ -29,6 +29,8 @@ export default function Warung() {
   const [editTableName, setEditTableName] = useState("");
   const [search, setSearch] = useState("");
   const [tick, setTick] = useState(0);
+  const [draftTakeawayCart, setDraftTakeawayCart] = useState([]);
+  const [variantPicker, setVariantPicker] = useState(null);
 
   const load = async () => {
     const [t, o, i] = await Promise.all([
@@ -38,7 +40,7 @@ export default function Warung() {
     ]);
     setTables(t.data);
     setOrders(o.data);
-    setItems(i.data.filter((x) => x.sell_price > 0));
+    setItems(i.data.filter((x) => Number(x.sell_price || 0) > 0 || ((x.variants || []).some((v) => Number(v?.sell_price || 0) > 0))));
   };
   useEffect(() => { load(); }, []);
   useEffect(() => { const id = setInterval(() => { load(); setTick(t => t + 1); }, 8000); return () => clearInterval(id); }, []);
@@ -56,6 +58,18 @@ export default function Warung() {
 
   const totalForOrder = (o) => o?.items?.reduce((s, i) => s + i.quantity * i.unit_price, 0) || 0;
   const servedCount = (o) => o?.items?.filter((i) => i.served)?.length || 0;
+
+  const formatMenuPrice = (n) => `Rp ${Number(n || 0).toLocaleString("id-ID")}`;
+  const itemPriceLabel = (item) => {
+    const variants = (item?.variants || []).filter((v) => v && v.active !== false && v.name);
+    if (item?.has_variants && variants.length) {
+      const prices = [...new Set(variants.map((v) => Number(v.sell_price || item.sell_price || 0)).filter((n) => n > 0))].sort((a,b)=>a-b);
+      if (prices.length) return `Rp ${prices.map((n) => Number(n).toLocaleString("id-ID")).join("/")}`;
+    }
+    return formatRupiah(item?.sell_price || 0);
+  };
+  const lineKey = (line) => `${line.item_id || line.id}::${line.variant_id || "base"}`;
+  const totalForItems = (rows = []) => rows.reduce((s, i) => s + Number(i.quantity || 0) * Number(i.unit_price || 0), 0);
 
   const addTable = async () => {
     if (!newTableName.trim()) return;
@@ -81,25 +95,64 @@ export default function Warung() {
   // Table detail view
   if (activeTable) {
     const order = activeTable.takeaway ? orders.find((o) => o.id === activeTable.order_id) : ordersByTable[activeTable.id];
-    const cart = order?.items || [];
-    const total = totalForOrder(order);
+    const cart = order?.items || (activeTable.takeaway ? draftTakeawayCart : []);
+    const total = order ? totalForOrder(order) : totalForItems(cart);
     const elapsed = order ? elapsedMin(order.created_at) : 0;
 
-    const upsertItem = async (item, delta) => {
-      const next = [...cart];
-      const idx = next.findIndex((c) => c.item_id === item.id);
-      if (idx >= 0) {
-        next[idx] = { ...next[idx], quantity: Math.max(0, next[idx].quantity + delta) };
-        if (next[idx].quantity === 0) next.splice(idx, 1);
-      } else if (delta > 0) {
-        next.push({ item_id: item.id, name: item.name, unit_price: item.sell_price, quantity: 1, notes: "", served: false });
-      }
+    const saveItems = async (next) => {
       if (order) {
         await api.put(`/orders/${order.id}/items`, { items: next });
-      } else {
-        await api.post("/orders", { table_id: activeTable.takeaway ? null : activeTable.id, items: next });
+        await load();
+        return;
       }
-      load();
+      if (activeTable.takeaway) {
+        setDraftTakeawayCart(next);
+        return;
+      }
+      await api.post("/orders", { table_id: activeTable.id, items: next });
+      await load();
+    };
+
+    const upsertLine = async (line, delta) => {
+      const next = [...cart];
+      const key = lineKey(line);
+      const idx = next.findIndex((c) => lineKey(c) === key);
+      if (idx >= 0) {
+        next[idx] = { ...next[idx], quantity: Math.max(0, Number(next[idx].quantity || 0) + delta) };
+        if (next[idx].quantity === 0) next.splice(idx, 1);
+      } else if (delta > 0) {
+        next.push({ ...line, quantity: 1, notes: "", served: false });
+      }
+      await saveItems(next);
+    };
+
+    const addVariantLine = async (item, variant = null) => {
+      const price = Number(variant?.sell_price || item.sell_price || 0);
+      const line = {
+        line_id: `${item.id}::${variant?.id || "base"}`,
+        item_id: item.id,
+        name: variant ? `${item.name} (${variant.name})` : item.name,
+        unit_price: price,
+        variant_id: variant?.id || "",
+        variant_name: variant?.name || "",
+      };
+      await upsertLine(line, 1);
+      setVariantPicker(null);
+    };
+
+    const addMenuItem = async (item) => {
+      const variants = (item.variants || []).filter((v) => v && v.active !== false && v.name);
+      if (item.has_variants && variants.length) return setVariantPicker({ ...item, variants });
+      return addVariantLine(item, null);
+    };
+
+    const processTakeawayDraft = async () => {
+      if (cart.length === 0) return toast.error("Pilih menu dulu sebelum masuk antrian");
+      const { data } = await api.post("/orders", { table_id: null, items: cart });
+      setDraftTakeawayCart([]);
+      setActiveTable({ id: null, name: `Takeaway ${data.queue_no || ""}`.trim(), takeaway: true, order_id: data.id });
+      await load();
+      toast.success(`Masuk antrian ${data.queue_no || "takeaway"}`);
     };
 
     const toggleServed = async (idx) => {
@@ -109,6 +162,7 @@ export default function Warung() {
     };
 
     const sendToKasir = () => {
+      if (!order) return toast.error("Proses order dulu sebelum lanjut ke Kasir");
       nav(`/kasir?${activeTable.takeaway ? "" : `table=${activeTable.id}&`}order=${order.id}`);
     };
 
@@ -139,12 +193,12 @@ export default function Warung() {
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {filteredItems.map((i) => (
-                <button key={i.id} data-testid={`warung-menu-${i.id}`} onClick={() => upsertItem(i, 1)}
+                <button key={i.id} data-testid={`warung-menu-${i.id}`} onClick={() => addMenuItem(i)}
                   className="bg-white rounded-lg border border-gray-100 p-2 text-left hover:border-[#1a6b3c] transition-all">
                   {i.image_url ? <img src={resolveImageUrl(i.image_url)} alt={i.name} className="w-full h-16 object-cover rounded mb-1.5" /> :
                     <div className="w-full h-16 bg-gradient-to-br from-emerald-50 to-amber-50 rounded mb-1.5 flex items-center justify-center text-2xl">🍽️</div>}
                   <div className="text-xs font-semibold line-clamp-2">{i.name}</div>
-                  <div className="font-mono text-xs font-semibold text-[#1a6b3c]">{formatRupiah(i.sell_price)}</div>
+                  <div className="font-mono text-xs font-semibold text-[#1a6b3c]">{itemPriceLabel(i)}</div>
                 </button>
               ))}
             </div>
@@ -166,7 +220,7 @@ export default function Warung() {
                 cart.map((c, idx) => (
                   <div key={idx} className="px-3 py-2.5 border-b border-gray-50 last:border-0">
                     <div className="flex items-center gap-2">
-                      <button onClick={() => toggleServed(idx)} data-testid={`served-toggle-${idx}`}
+                      <button onClick={() => order && toggleServed(idx)} disabled={!order} data-testid={`served-toggle-${idx}`}
                         className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 ${
                           c.served ? "bg-emerald-500 border-emerald-500" : "border-gray-300 hover:border-emerald-500"
                         }`}>
@@ -176,9 +230,9 @@ export default function Warung() {
                         <div className={`text-sm font-medium ${c.served ? "line-through text-gray-400" : ""}`}>{c.name}</div>
                         <div className="font-mono text-xs text-gray-500">{formatRupiah(c.unit_price)} × {c.quantity}</div>
                       </div>
-                      <button data-testid={`item-minus-${idx}`} onClick={() => upsertItem({ id: c.item_id, name: c.name, sell_price: c.unit_price }, -1)} className="w-6 h-6 rounded border border-gray-200 hover:bg-gray-50"><Minus className="w-3 h-3 mx-auto" /></button>
+                      <button data-testid={`item-minus-${idx}`} onClick={() => upsertLine(c, -1)} className="w-6 h-6 rounded border border-gray-200 hover:bg-gray-50"><Minus className="w-3 h-3 mx-auto" /></button>
                       <span className="w-5 text-center text-sm font-semibold">{c.quantity}</span>
-                      <button data-testid={`item-plus-${idx}`} onClick={() => upsertItem({ id: c.item_id, name: c.name, sell_price: c.unit_price }, 1)} className="w-6 h-6 rounded border border-gray-200 hover:bg-gray-50"><Plus className="w-3 h-3 mx-auto" /></button>
+                      <button data-testid={`item-plus-${idx}`} onClick={() => upsertLine(c, 1)} className="w-6 h-6 rounded border border-gray-200 hover:bg-gray-50"><Plus className="w-3 h-3 mx-auto" /></button>
                     </div>
                   </div>
                 ))}
@@ -189,6 +243,12 @@ export default function Warung() {
                 <span className="text-gray-600">Total Sementara</span>
                 <span className="font-mono font-bold text-base text-[#1a6b3c]" data-testid="warung-total">{formatRupiah(total)}</span>
               </div>
+              {!order && activeTable.takeaway && (
+                <Button data-testid="process-takeaway-btn" onClick={processTakeawayDraft} disabled={cart.length === 0}
+                  className="w-full bg-[#1a6b3c] hover:bg-[#14522d] h-11 font-semibold">
+                  <Send className="w-4 h-4 mr-1.5" /> Proses ke Antrian / Dapur
+                </Button>
+              )}
               {order && (
                 <>
                   <Button data-testid="send-to-kasir-btn" onClick={sendToKasir} disabled={cart.length === 0}
@@ -203,6 +263,20 @@ export default function Warung() {
             </div>
           </div>
         </div>
+        <Dialog open={!!variantPicker} onOpenChange={(o) => { if (!o) setVariantPicker(null); }}>
+          <DialogContent className="max-w-sm">
+            <DialogHeader><DialogTitle>Pilih Varian</DialogTitle></DialogHeader>
+            {variantPicker && <div className="space-y-2">
+              <div className="text-sm font-semibold">{variantPicker.name}</div>
+              {(variantPicker.variants || []).map((v) => (
+                <button key={v.id || v.name} onClick={() => addVariantLine(variantPicker, v)} className="w-full text-left border border-gray-200 rounded-lg p-3 hover:border-[#1a6b3c] hover:bg-emerald-50">
+                  <div className="font-semibold text-sm">{v.name}</div>
+                  <div className="font-mono text-xs text-[#1a6b3c]">{formatRupiah(v.sell_price || variantPicker.sell_price)}</div>
+                </button>
+              ))}
+            </div>}
+          </DialogContent>
+        </Dialog>
       </div>
     );
   }
@@ -255,7 +329,7 @@ export default function Warung() {
               <button key={o.id} onClick={() => setActiveTable({ id: null, name: `Takeaway ${o.queue_no || ''}`.trim(), takeaway: true, order_id: o.id })} className="text-left rounded-lg border border-amber-100 bg-amber-50 p-3 hover:bg-amber-100">
                 <div className="flex justify-between gap-2"><span className="font-semibold text-sm">{o.queue_no || 'Takeaway'}</span><span className="text-xs text-amber-700">{elapsedMin(o.created_at)}m</span></div>
                 <div className="text-xs text-gray-600 mt-1">{o.items?.length || 0} item · {formatRupiah(totalForOrder(o))}</div>
-                <div className="text-[10px] text-gray-500 mt-1">Klik untuk proses/checkout</div>
+                <div className="text-[10px] text-gray-500 mt-1">Klik untuk lihat detail / lanjut ke kasir</div>
               </button>
             ))}
           </div>

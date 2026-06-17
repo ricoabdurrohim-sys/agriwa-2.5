@@ -1570,6 +1570,17 @@ class TransactionIn(BaseModel):
     points_redeemed: int = 0
 
 
+async def _next_transaction_no(unit: str = "POS") -> str:
+    """Retail-style daily transaction number.
+
+    Format: AW-DDMMYY-0001. Tanggal/jam detail tetap ada di struk,
+    sedangkan nomor ini pendek, mudah dicari, dan urut per hari.
+    """
+    day = datetime.now(timezone.utc).strftime("%d%m%y")
+    prefix = f"AW-{day}-"
+    count = await db.transactions.count_documents({"trx_no": {"$regex": f"^{prefix}"}})
+    return f"{prefix}{count + 1:04d}"
+
 @api.post("/transactions")
 async def create_transaction(body: TransactionIn, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     if not body.items:
@@ -1585,7 +1596,7 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
 
     # Cost/HPP dihitung dari inventory saat transaksi dibuat.
     cost_total = 0
-    trx_no = f"TRX-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+    trx_no = await _next_transaction_no(body.unit)
     stock_type = {"SALE": "sale", "SELF_USE": "self_use", "WASTE": "waste", "ADJUSTMENT": "adjustment"}[trx_type]
     for it in body.items:
         inv = await db.inventory_items.find_one({"id": it.item_id})
@@ -3358,6 +3369,7 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
     today_rows = [r for r in ledger if str(r.get("created_at", "")).startswith(today)]
     today_exp = [e for e in expenses if str(e.get("date") or e.get("created_at") or "").startswith(today)]
     today_inc = [i for i in incomes if str(i.get("date") or i.get("created_at") or "").startswith(today)]
+    today_cogs = sum(_money(r.get("cost_total")) for r in today_rows)
 
     weekly = []
     for delta in range(6, -1, -1):
@@ -3395,7 +3407,8 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
             "revenue_pos": sum(_money(r.get("cash_collected")) for r in today_rows),
             "other_income": sum(_money(i.get("amount")) for i in today_inc),
             "expense": sum(_money(e.get("amount")) for e in today_exp),
-            "net_profit": sum(_money(r.get("cash_collected")) for r in today_rows) + sum(_money(i.get("amount")) for i in today_inc) - sum(_money(e.get("amount")) for e in today_exp),
+            "cogs": today_cogs,
+            "net_profit": sum(_money(r.get("cash_collected")) for r in today_rows) + sum(_money(i.get("amount")) for i in today_inc) - today_cogs - sum(_money(e.get("amount")) for e in today_exp),
             "cash_position": cash_position,
             "tx_count": len(today_rows),
         },

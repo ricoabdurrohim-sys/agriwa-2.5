@@ -19,6 +19,8 @@ export default function Scan() {
   const [status, setStatus] = useState(initialCode ? "Membuka hasil scan..." : "Klik Mulai Scan untuk membuka kamera");
   const [scanning, setScanning] = useState(false);
   const [manualOnly, setManualOnly] = useState(false);
+  const [cameras, setCameras] = useState([]);
+  const [selectedCameraId, setSelectedCameraId] = useState("");
 
   const stopCamera = async () => {
     try {
@@ -50,8 +52,8 @@ export default function Scan() {
     }
   };
 
-  const startCamera = async () => {
-    if (scanning) return;
+  const startCamera = async (cameraIdOverride = "") => {
+    if (scanning && !cameraIdOverride) return;
     setManualOnly(false);
     setStatus("Menyiapkan kamera...");
     try {
@@ -61,8 +63,9 @@ export default function Scan() {
         return;
       }
       const { Html5Qrcode, Html5QrcodeSupportedFormats } = await import("html5-qrcode");
-      const cameras = await Html5Qrcode.getCameras();
-      if (!cameras?.length) {
+      const foundCameras = await Html5Qrcode.getCameras();
+      setCameras(foundCameras || []);
+      if (!foundCameras?.length) {
         setManualOnly(true);
         setStatus("Kamera tidak ditemukan. Cek izin kamera Windows/Edge/Chrome, atau input kode manual.");
         return;
@@ -77,9 +80,11 @@ export default function Scan() {
         Html5QrcodeSupportedFormats.UPC_E,
       ] });
       scannerRef.current = scanner;
-      const backCamera = cameras.find((c) => /back|rear|environment/i.test(c.label || "")) || cameras[0];
+      const preferred = foundCameras.find((c) => /back|rear|environment|belakang/i.test(c.label || "")) || foundCameras[foundCameras.length - 1] || foundCameras[0];
+      const cameraId = cameraIdOverride || selectedCameraId || preferred.id;
+      setSelectedCameraId(cameraId);
       await scanner.start(
-        backCamera.id,
+        cameraId,
         { fps: 8, qrbox: { width: 240, height: 240 }, aspectRatio: 1.333 },
         (decodedText) => resolve(decodedText),
         () => {}
@@ -93,6 +98,15 @@ export default function Scan() {
       setStatus("Kamera tidak bisa dibuka. Klik ikon gembok di address bar → Camera → Allow, lalu reload. Input manual tetap bisa dipakai.");
       toast.error("Kamera tidak bisa dibuka");
     }
+  };
+
+  const switchCamera = async () => {
+    if (!cameras.length) return startCamera();
+    const idx = cameras.findIndex((c) => c.id === selectedCameraId);
+    const next = cameras[(idx + 1 + cameras.length) % cameras.length] || cameras[0];
+    setSelectedCameraId(next.id);
+    await startCamera(next.id);
+    setStatus(`Kamera diganti: ${next.label || "kamera lain"}`);
   };
 
   useEffect(() => {
@@ -122,10 +136,14 @@ export default function Scan() {
           {!scanning && <div className="absolute inset-0 flex items-center justify-center text-center text-white/80 p-6 pointer-events-none"><div><Camera className="w-12 h-12 mx-auto mb-3 opacity-70" /><div className="text-sm">Kamera belum aktif</div><div className="text-xs text-white/55 mt-1">Klik Mulai Scan agar browser meminta izin kamera</div></div></div>}
         </div>
         <div className={`text-xs rounded-lg p-2 ${manualOnly ? "bg-amber-50 text-amber-800 border border-amber-200" : "bg-gray-50 text-gray-600"}`}>{status}</div>
-        <div className="grid grid-cols-2 gap-2">
-          <Button onClick={startCamera} className="bg-[#1a6b3c] hover:bg-[#14522d]" disabled={scanning}><Camera className="w-4 h-4 mr-1.5" /> Mulai Scan</Button>
+        <div className="grid grid-cols-3 gap-2">
+          <Button onClick={() => startCamera()} className="bg-[#1a6b3c] hover:bg-[#14522d]" disabled={scanning}><Camera className="w-4 h-4 mr-1.5" /> Mulai Scan</Button>
           <Button variant="outline" onClick={stopCamera} disabled={!scanning}><XCircle className="w-4 h-4 mr-1.5" /> Stop</Button>
+          <Button variant="outline" onClick={switchCamera} disabled={cameras.length < 2}><RefreshCcw className="w-4 h-4 mr-1.5" /> Kamera</Button>
         </div>
+        {cameras.length > 1 && <select value={selectedCameraId} onChange={async (e) => { setSelectedCameraId(e.target.value); await startCamera(e.target.value); }} className="w-full h-10 rounded-md border border-gray-200 bg-white px-3 text-sm">
+          {cameras.map((c, idx) => <option key={c.id} value={c.id}>{c.label || `Kamera ${idx + 1}`}</option>)}
+        </select>}
         {manualOnly && <Button variant="ghost" size="sm" onClick={() => window.location.reload()} className="w-full"><RefreshCcw className="w-4 h-4 mr-1" /> Reload setelah izin kamera diubah</Button>}
       </div>
 
