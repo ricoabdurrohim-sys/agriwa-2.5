@@ -1,0 +1,19 @@
+QA CHECK v2.5.30
+
+BACKEND:
+- python -m py_compile backend/server.py: OK
+- Endpoint AI ditambahkan aman:
+  GET /api/ai/status
+  POST /api/ai/operational-insights
+- Jika AI key tidak ada, endpoint tidak error dan memakai rule_based_local.
+- server_patched.py tidak dipakai.
+
+FRONTEND:
+- Warung QR URL langsung /warung?table=...&order=...
+- Scan mode warung-order tidak mencari lintas modul.
+- Struk kasir menghapus nomor transaksi di bawah QR.
+- Dialog desktop max width diperlebar.
+- Operasional Pro menampilkan AI Insight Opsional.
+
+FLOW:
+Warung → meja → order aktif → print QR → scan → order spesifik → tambah item → Kasir → transaksi selesai.

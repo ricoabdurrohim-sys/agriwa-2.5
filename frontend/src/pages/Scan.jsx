@@ -9,8 +9,10 @@ import { toast } from "sonner";
 const SCANNER_ID = "agriwarung-html5-qr-reader";
 
 function normalizeWarungOrderTarget(raw) {
-  const value = String(raw || "").trim();
+  let value = String(raw || "").trim();
   if (!value) return null;
+  // Be tolerant: some scanners return URL-encoded payload text.
+  try { if (/%[0-9A-Fa-f]{2}/.test(value)) value = decodeURIComponent(value); } catch {}
   const fromAwPayload = (text) => {
     const m = String(text || "").match(/^aw:warung-order:([^:]+):([^:]+)$/i);
     if (!m) return null;
@@ -71,11 +73,29 @@ export default function Scan() {
     resolvingRef.current = true;
     setStatus("Membuka hasil scan...");
     const directWarungTarget = normalizeWarungOrderTarget(value);
-    if (directWarungTarget) {
-      await stopCamera();
-      toast.success("QR pesanan Warung ditemukan");
-      nav(directWarungTarget);
-      return;
+    if (directWarungTarget || mode === "warung-order") {
+      if (directWarungTarget) {
+        await stopCamera();
+        toast.success("QR pesanan Warung ditemukan");
+        nav(directWarungTarget);
+        return;
+      }
+      // Mode warung-order tidak boleh mencari lintas modul; hanya validasi QR Warung di backend.
+      try {
+        const { data } = await api.get(`/scan/resolve?code=${encodeURIComponent(value)}`);
+        await stopCamera();
+        if (data?.kind === "warung_order" && data?.target) {
+          toast.success("QR pesanan Warung ditemukan");
+          nav(data.target);
+          return;
+        }
+        throw new Error("QR bukan pesanan Warung aktif");
+      } catch (e) {
+        resolvingRef.current = false;
+        setStatus("QR pesanan Warung tidak aktif / tidak cocok. Coba scan ulang.");
+        toast.error(e?.response?.data?.detail || e?.message || "QR pesanan Warung tidak valid");
+        return;
+      }
     }
     setStatus("Mencari data...");
     try {

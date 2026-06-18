@@ -1,0 +1,31 @@
+STEP BY STEP UPDATE v2.5.30
+
+1. UPDATE HF BACKEND DULU
+   - Extract ZIP HF_BACKEND_agriwarung_v2_5_30_STABLE_AI_QR_SERVER.zip
+   - Upload isi file ke root HF Space:
+     Dockerfile
+     requirements.txt
+     server.py
+     uploads/
+   - Jangan upload foldernya, upload isi file/foldernya.
+   - Hapus server_patched.py kalau masih ada.
+   - Commit HF: Fix backend QR and AI insight v2.5.30
+   - Tunggu running.
+
+2. UPDATE GITHUB / VERCEL
+   - Extract ZIP GITHUB_agriwarung_v2_5_30_QR_AI_PRINT_FULL.zip
+   - Copy semua isi ke repo GitHub.
+   - Replace file lama.
+   - Commit GitHub: Fix warung QR direct scan and add AI operational insights
+   - Push.
+   - Tunggu Vercel redeploy.
+
+3. TEST WAJIB
+   - Warung → pilih meja → tambah menu → Print QR Pesanan Meja
+   - Scan QR memakai kamera HP/native atau menu Pintasan Scan
+   - Harus langsung membuka meja + order tersebut
+   - Tambah item lagi
+   - Lanjut Kasir → konfirmasi pembayaran
+   - Setelah lunas, meja kosong/tersedia
+   - Print struk kasir: nomor transaksi hanya ada di atas, tidak muncul lagi di bawah QR
+   - Buka Operasional Pro → klik Analisis Sekarang

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChefHat, ClipboardList, CreditCard, QrCode, SplitSquareHorizontal, ArrowRightLeft, Gauge, BellRing, PackageCheck, Users, Tag, Warehouse, Calculator, UtensilsCrossed, Settings2, CheckCircle2 } from "lucide-react";
+import { ChefHat, QrCode, SplitSquareHorizontal, ArrowRightLeft, Gauge, BellRing, PackageCheck, Users, Tag, Warehouse, Calculator, UtensilsCrossed, Settings2, CheckCircle2, Sparkles, AlertTriangle } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 
@@ -32,6 +32,9 @@ export default function OperasionalPro() {
   const [orders, setOrders] = useState([]);
   const [tables, setTables] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [aiStatus, setAiStatus] = useState(null);
+  const [aiResult, setAiResult] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -47,7 +50,21 @@ export default function OperasionalPro() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  const loadAIStatus = async () => {
+    try { const { data } = await api.get("/ai/status"); setAiStatus(data); } catch { setAiStatus(null); }
+  };
+
+  const loadAIInsights = async () => {
+    setAiLoading(true);
+    try {
+      const { data } = await api.post("/ai/operational-insights", {});
+      setAiResult(data);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); loadAIStatus(); }, []);
   useEffect(() => {
     const h = (e) => {
       const type = e.detail?.type;
@@ -91,6 +108,47 @@ export default function OperasionalPro() {
           <div className="text-xs text-gray-500">Nilai order aktif</div>
           <div className="text-2xl font-bold text-gray-900 mt-1">{formatRupiah(stats.total)}</div>
           <div className="text-[11px] text-gray-500 mt-1">{stats.itemCount} item belum selesai</div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="p-4 border-b border-gray-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-start gap-2">
+            <Sparkles className="w-5 h-5 text-[#f4a228] mt-0.5" />
+            <div>
+              <div className="font-bold text-gray-900">AI Insight Operasional</div>
+              <div className="text-xs text-gray-500">Opsional. Jika AI Gateway Vercel belum diisi, sistem tetap memberi rekomendasi lokal dari data Warung/Kasir/Inventori/Keuangan.</div>
+            </div>
+          </div>
+          <Button onClick={loadAIInsights} disabled={aiLoading} className="bg-[#1a6b3c] hover:bg-[#14522d]">
+            <Sparkles className="w-4 h-4 mr-1.5" /> {aiLoading ? "Menganalisis..." : "Analisis Sekarang"}
+          </Button>
+        </div>
+        <div className="p-4 space-y-3">
+          <div className={`text-xs rounded-xl border px-3 py-2 ${aiStatus?.enabled ? "bg-emerald-50 text-emerald-800 border-emerald-100" : "bg-amber-50 text-amber-800 border-amber-100"}`}>
+            {aiStatus?.message || "Status AI belum terbaca"} {aiStatus?.model ? `· Model: ${aiStatus.model}` : ""}
+          </div>
+          {aiResult?.ai_error && (
+            <div className="text-xs rounded-xl bg-amber-50 text-amber-800 border border-amber-100 px-3 py-2 flex gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" /> AI Gateway gagal dipanggil, rekomendasi lokal tetap ditampilkan. Detail: {aiResult.ai_error}
+            </div>
+          )}
+          {aiResult?.snapshot && (
+            <div className="grid sm:grid-cols-4 gap-2 text-xs">
+              <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-500">Omzet hari ini</div><div className="font-bold text-gray-900">{formatRupiah(aiResult.snapshot.today_revenue || 0)}</div></div>
+              <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-500">Order terlama</div><div className="font-bold text-gray-900">{aiResult.snapshot.oldest_order_minutes || 0} menit</div></div>
+              <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-500">Stok menipis</div><div className="font-bold text-gray-900">{aiResult.snapshot.low_stock_count || 0} item</div></div>
+              <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-500">Bon aktif</div><div className="font-bold text-gray-900">{aiResult.snapshot.unpaid_debt_count || 0}</div></div>
+            </div>
+          )}
+          <div className="space-y-2">
+            {(aiResult?.insights || [
+              "Klik Analisis Sekarang untuk melihat rekomendasi efisiensi dari data aktif aplikasi.",
+              "Prioritas saat ini: QR order meja, kecepatan Warung/Kasir, stok menipis, bon/piutang, dan flow dapur/KDS.",
+            ]).map((x, idx) => (
+              <div key={idx} className="rounded-xl border border-gray-100 bg-gray-50/70 px-3 py-2 text-sm text-gray-700 leading-relaxed">{x}</div>
+            ))}
+          </div>
         </div>
       </div>
 

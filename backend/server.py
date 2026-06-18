@@ -6809,6 +6809,117 @@ from fastapi.staticfiles import StaticFiles
 app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
+
+# ---------- Optional AI Gateway Insights ----------
+def _ai_gateway_key() -> str:
+    return (os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("VERCEL_AI_GATEWAY_API_KEY") or "").strip()
+
+
+def _ai_gateway_model() -> str:
+    return (os.environ.get("AI_GATEWAY_MODEL") or "openai/gpt-5.4").strip()
+
+
+async def _collect_ai_operational_snapshot() -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
+    active_orders = await db.orders.find({"status": {"$in": ["open", "sent", "bill_requested"]}}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    tables = await db.tables.find({}, {"_id": 0}).to_list(300)
+    today_trx = await db.transactions.find({"created_at": {"$regex": f"^{today}"}, "cancelled": {"$ne": True}}, {"_id": 0}).sort("created_at", -1).to_list(300)
+    expenses = await db.expenses.find({"$or": [{"date": {"$regex": f"^{today}"}}, {"created_at": {"$regex": f"^{today}"}}]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    low_stock = await db.inventory_items.find({"$expr": {"$lte": [{"$ifNull": ["$stock", 0]}, {"$ifNull": ["$min_stock", 0]}]}}, {"_id": 0}).limit(25).to_list(25)
+    unpaid_debts = await db.customer_debts.find({"status": {"$ne": "paid"}}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(50)
+
+    revenue = sum(_money(x.get("total")) for x in today_trx if str(x.get("payment_status", "")).upper() != "CANCELLED")
+    expense_total = sum(_money(x.get("amount")) for x in expenses)
+    active_value = sum(sum(_money(i.get("quantity")) * _money(i.get("unit_price")) for i in (o.get("items") or [])) for o in active_orders)
+    occupied_tables = len({o.get("table_id") for o in active_orders if o.get("table_id")})
+    oldest_minutes = 0
+    for o in active_orders:
+        try:
+            created = datetime.fromisoformat(str(o.get("created_at", "")).replace("Z", "+00:00"))
+            oldest_minutes = max(oldest_minutes, int((datetime.now(timezone.utc) - created).total_seconds() // 60))
+        except Exception:
+            pass
+    return {
+        "today": today,
+        "active_orders": len(active_orders),
+        "active_order_value": active_value,
+        "occupied_tables": occupied_tables,
+        "total_tables": len(tables),
+        "oldest_order_minutes": oldest_minutes,
+        "today_transactions": len(today_trx),
+        "today_revenue": revenue,
+        "today_expense": expense_total,
+        "estimated_profit": revenue - expense_total,
+        "low_stock_count": len(low_stock),
+        "low_stock_items": [{"name": x.get("name"), "stock": x.get("stock"), "min_stock": x.get("min_stock")} for x in low_stock[:10]],
+        "unpaid_debt_count": len(unpaid_debts),
+        "unpaid_debt_total": sum(_money(x.get("remaining_amount") or x.get("amount")) for x in unpaid_debts),
+    }
+
+
+def _rule_based_insights(snapshot: dict) -> list:
+    tips = []
+    if snapshot.get("oldest_order_minutes", 0) >= 25:
+        tips.append("Ada order aktif yang sudah lama. Prioritaskan cek meja/KDS agar pelanggan tidak menunggu terlalu lama.")
+    if snapshot.get("active_orders", 0) >= 5:
+        tips.append("Order aktif cukup banyak. Gunakan Warung + KDS untuk memantau item belum dilayani dan kurangi bolak-balik ke Kasir.")
+    if snapshot.get("low_stock_count", 0) > 0:
+        tips.append("Ada item stok menipis. Segera cek Inventori agar menu yang habis tidak terus dijual atau tampil di self-order.")
+    if snapshot.get("unpaid_debt_count", 0) > 0:
+        tips.append("Ada bon/piutang belum lunas. Gunakan Kasir/Riwayat bon untuk follow-up pelanggan dan menjaga arus kas.")
+    if snapshot.get("today_transactions", 0) > 0 and snapshot.get("estimated_profit", 0) < 0:
+        tips.append("Estimasi profit hari ini negatif. Cek pengeluaran hari ini dan harga jual item dengan margin kecil.")
+    tips.append("Fitur yang paling aman ditambah berikutnya: split bill, transfer meja, panggil pelayan/minta bill, item habis otomatis, dan approval diskon besar.")
+    return tips[:6]
+
+
+@api.get("/ai/status")
+async def ai_gateway_status(user: dict = Depends(get_current_user)):
+    key = _ai_gateway_key()
+    return {
+        "enabled": bool(key),
+        "provider": "vercel_ai_gateway" if key else "rule_based_local",
+        "model": _ai_gateway_model() if key else "local_rules",
+        "message": "AI Gateway aktif" if key else "AI Gateway belum diatur; rekomendasi lokal tetap aktif tanpa API key.",
+    }
+
+
+@api.post("/ai/operational-insights")
+async def ai_operational_insights(user: dict = Depends(get_current_user)):
+    snapshot = await _collect_ai_operational_snapshot()
+    key = _ai_gateway_key()
+    local_tips = _rule_based_insights(snapshot)
+    if not key:
+        return {"source": "rule_based_local", "snapshot": snapshot, "insights": local_tips, "raw_text": ""}
+    prompt = (
+        "Kamu adalah konsultan ERP/POS untuk warung makan, ritel kecil, kebun, dan peternakan. "
+        "Beri rekomendasi singkat, praktis, aman terhadap integrasi sistem, dan prioritas bug/efisiensi. "
+        "Jawab dalam Bahasa Indonesia. Maksimal 7 poin. Data aplikasi:\n" + str(snapshot)
+    )
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as http:
+            res = await http.post(
+                "https://ai-gateway.vercel.sh/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "model": _ai_gateway_model(),
+                    "messages": [
+                        {"role": "system", "content": "Berikan insight operasional yang konkret, hindari teori panjang."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                },
+            )
+        if res.status_code >= 400:
+            return {"source": "rule_based_local", "snapshot": snapshot, "insights": local_tips, "raw_text": "", "ai_error": res.text[:500]}
+        data = res.json()
+        text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        insights = [x.strip(" -•\t") for x in text.split("\n") if x.strip()]
+        return {"source": "vercel_ai_gateway", "snapshot": snapshot, "insights": insights or local_tips, "raw_text": text}
+    except Exception as e:
+        return {"source": "rule_based_local", "snapshot": snapshot, "insights": local_tips, "raw_text": "", "ai_error": str(e)[:500]}
+
 app.include_router(api)
 
 

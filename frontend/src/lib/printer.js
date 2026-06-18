@@ -284,7 +284,6 @@ export async function printReceipt(receipt, opts = {}) {
     cmds.push(strBytes("-".repeat(width) + "\n"));
     cmds.push(align("center"));
     cmds.push(escposQr(String(receipt.trx_no), 3)); // kecil dan rapi untuk 80mm
-    cmds.push(strBytes(String(receipt.trx_no) + "\n"));
   }
   cmds.push(strBytes("-".repeat(width) + "\n"));
   pushCenteredLines(cmds, note, width, { uppercase: false, boldText: false, size: 0x00 });

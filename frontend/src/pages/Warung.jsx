@@ -17,13 +17,10 @@ function elapsedMin(iso) {
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
 }
 
-function buildWarungOrderScanPayload(tableId, orderId) {
-  return `aw:warung-order:${encodeURIComponent(tableId || "")}:${encodeURIComponent(orderId || "")}`;
-}
-
 function buildWarungOrderScanUrl(tableId, orderId) {
-  const payload = buildWarungOrderScanPayload(tableId, orderId);
-  return `${window.location.origin}/scan?mode=warung-order&code=${encodeURIComponent(payload)}`;
+  // QR pesanan Warung langsung membuka order aktif meja.
+  // Tidak lewat /scan?code agar tidak jatuh ke pencarian global lintas menu/lini bisnis.
+  return `${window.location.origin}/warung?table=${encodeURIComponent(tableId || "")}&order=${encodeURIComponent(orderId || "")}&from=qr`;
 }
 
 export default function Warung() {
@@ -166,15 +163,27 @@ export default function Warung() {
   useEffect(() => {
     const tableParam = selectedTableId;
     const orderParam = selectedOrderId;
-    if (!tableParam || activeTable || tables.length === 0) return;
+    if (!tableParam || tables.length === 0) return;
     const row = tables.find((t) => String(t.id) === String(tableParam));
-    if (row) setActiveTable(row);
+    if (row && String(activeTable?.id || "") !== String(tableParam)) setActiveTable(row);
 
     // QR pesanan Warung wajib membuka order aktif yang spesifik, bukan scan global lintas menu.
     // Jika orders/active belum sempat memuat order tersebut, ambil langsung by order_id.
     if (orderParam && !orders.some((o) => String(o.id) === String(orderParam))) {
       api.get(`/orders/${encodeURIComponent(orderParam)}`)
-        .then(({ data }) => { if (data?.id) replaceOrderLocal(data); })
+        .then(({ data }) => {
+          if (!data?.id) return;
+          const st = String(data.status || "").toLowerCase();
+          if (["paid", "cancelled", "closed"].includes(st)) {
+            toast.error("QR pesanan sudah tidak aktif karena transaksi sudah selesai");
+            return;
+          }
+          if (String(data.table_id || "") !== String(tableParam)) {
+            toast.error("QR tidak cocok dengan meja ini");
+            return;
+          }
+          replaceOrderLocal(data);
+        })
         .catch(() => toast.error("QR pesanan tidak ditemukan atau transaksi sudah selesai"));
     }
   }, [selectedTableId, selectedOrderId, tables, orders, activeTable]);
