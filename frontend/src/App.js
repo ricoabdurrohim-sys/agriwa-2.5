@@ -34,7 +34,6 @@ import PublicOrder from "@/pages/PublicOrder";
 import AuthCallback from "@/pages/AuthCallback";
 import Scan from "@/pages/Scan";
 import OperasionalPro from "@/pages/OperasionalPro";
-import SplitBill from "@/pages/SplitBill";
 
 function AppRouter() {
   // Synchronously route to AuthCallback if URL hash contains a session_id from Emergent OAuth
@@ -52,7 +51,6 @@ function AppRouter() {
         <Route path="/kasir" element={<Kasir />} />
         <Route path="/scan" element={<Scan />} />
         <Route path="/operasional-pro" element={<OperasionalPro />} />
-        <Route path="/split-bill" element={<SplitBill />} />
         <Route path="/inventori" element={<Inventori />} />
         <Route path="/bom" element={<BOM />} />
         <Route path="/keuangan" element={<Keuangan />} />

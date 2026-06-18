@@ -6,7 +6,7 @@ import {
   HelpCircle, Menu, LogOut, Bell, ChefHat, Beaker, Truck,
   Briefcase, ClipboardCheck, Building2, Tag, Layers,
   Shield, MessageCircle, Activity, Crown, Building, Eye, EyeOff, Sliders, Check,
-  Package, ScanLine, Workflow, Scissors,
+  Package, ScanLine, Workflow,
 } from "lucide-react";
 import { useWebSocket } from "@/lib/useWebSocket";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
@@ -30,7 +30,6 @@ const allModules = [
   { to: "/operasional-pro", label: "Operasional Pro", icon: Workflow, group: "Ringkasan" },
   { to: "/warung", label: "Warung & Meja", icon: UtensilsCrossed, group: "Operasional", essential: true },
   { to: "/kasir", label: "Kasir POS", icon: Calculator, group: "Operasional", essential: true },
-  { to: "/split-bill", label: "Split Bill", icon: Scissors, group: "Operasional" },
   { to: "/kds", label: "Dapur / KDS", icon: ChefHat, group: "Operasional" },
   { to: "/members", label: "Member & Loyalty", icon: Crown, group: "Operasional" },
   { to: "/promo", label: "Promo & Diskon", icon: Tag, group: "Operasional" },

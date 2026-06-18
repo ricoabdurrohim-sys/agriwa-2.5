@@ -1,0 +1,12 @@
+QA CHECK v2.5.35
+
+- backend/server.py py_compile: OK
+- App.js split-bill route removed
+- Layout.jsx split-bill drawer menu removed
+- Kasir.jsx direct split bill button added
+- Split logic keeps source order id and sends split_source_order_id to backend
+- Existing backend transaction split subtraction retained
+- No server_patched.py dependency
+
+Known design decision:
+SplitBill.jsx file may remain in src/pages but it is not routed or shown in drawer. It is kept only as harmless legacy fallback.

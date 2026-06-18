@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine } from "lucide-react";
+import { Search, Plus, Minus, Trash2, Receipt as ReceiptIcon, CreditCard, Banknote, QrCode, Smartphone, MessageCircle, Printer, Bluetooth, Crown, X, ScanLine, Scissors } from "lucide-react";
 import api, { formatRupiah } from "@/lib/api";
 import { printReceipt, isPrinterAvailable } from "@/lib/printer";
 import { printViaIframe, thermal80Css } from "@/lib/safePrint";
@@ -64,6 +64,9 @@ export default function Kasir() {
   const [showProductScan, setShowProductScan] = useState(false);
   const [productScan, setProductScan] = useState("");
   const [splitDraft, setSplitDraft] = useState(null);
+  const [splitPickerOpen, setSplitPickerOpen] = useState(false);
+  const [splitQty, setSplitQty] = useState({});
+  const [sourceOrderCart, setSourceOrderCart] = useState([]);
 
   const getBonRemaining = (d) => {
     if (!d) return 0;
@@ -211,11 +214,15 @@ export default function Kasir() {
     if (orderId) {
       api.get(`/orders/${orderId}`).then(({ data: o }) => {
         if (o && o.items) {
-          setCart(o.items.map((it, idx) => ({
+          const rows = o.items.map((it, idx) => ({
             line_id: it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`,
             item_id: it.item_id, name: it.name, unit_price: it.unit_price, quantity: it.quantity, notes: it.notes || "",
             variant_id: it.variant_id || "", variant_name: it.variant_name || "",
-          })));
+          }));
+          setCart(rows);
+          setSourceOrderCart(rows);
+          setSplitDraft(null);
+          setSplitQty({});
           if (o.queue_no) setCustomerName(`Takeaway ${o.queue_no}`);
         }
       }).catch(() => {});
@@ -462,6 +469,70 @@ export default function Kasir() {
 
   const removeItem = (lineId) => setCart((c) => c.filter((x) => x.line_id !== lineId));
 
+  const sourceItemsForSplit = sourceOrderCart.length ? sourceOrderCart : cart;
+  const selectedSplitItems = sourceItemsForSplit.map((it, idx) => {
+    const key = it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`;
+    const qty = Math.min(Number(splitQty[key] || 0), Number(it.quantity || 0));
+    return qty > 0 ? { ...it, line_id: key, quantity: qty } : null;
+  }).filter(Boolean);
+  const selectedSplitTotal = selectedSplitItems.reduce((s, it) => s + Number(it.quantity || 0) * Number(it.unit_price || 0), 0);
+  const canSplitBill = !!orderId && !bonInfo && !splitDraft && sourceItemsForSplit.length > 0 && transactionType === "SALE";
+
+  const openDirectSplitBill = () => {
+    if (!orderId) return toast.error("Split Bill hanya untuk order meja aktif");
+    if (!sourceItemsForSplit.length) return toast.error("Order meja masih kosong");
+    setSplitQty({});
+    setSplitPickerOpen(true);
+  };
+
+  const setSplitLineQty = (line, qty) => {
+    const key = line.line_id || `${line.item_id || ""}::${line.variant_id || "base"}`;
+    const max = Number(line.quantity || 0);
+    setSplitQty((prev) => ({ ...prev, [key]: Math.max(0, Math.min(max, Number(qty || 0))) }));
+  };
+
+  const selectAllSplitLines = () => {
+    const next = {};
+    sourceItemsForSplit.forEach((it, idx) => {
+      const key = it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`;
+      next[key] = Number(it.quantity || 0);
+    });
+    setSplitQty(next);
+  };
+
+  const applyDirectSplitBill = () => {
+    if (!orderId) return toast.error("Order sumber tidak ditemukan");
+    if (!selectedSplitItems.length) return toast.error("Pilih minimal 1 item untuk split bill");
+    const draft = {
+      source_order_id: orderId,
+      table_id: tableId || null,
+      table_name: tableId ? `Meja ${tableId}` : "Meja",
+      items: selectedSplitItems,
+      total: selectedSplitTotal,
+      created_at: new Date().toISOString(),
+      mode: "kasir_direct",
+    };
+    setSplitDraft(draft);
+    setCart(selectedSplitItems);
+    setDiscount(0);
+    setRedeemDiscount(0);
+    setAppliedPromo(null);
+    setPromoCode("");
+    setCustomerName(`Split Bill ${draft.table_name}`);
+    setPayment("cash");
+    setCashReceived("");
+    setSplitPickerOpen(false);
+    toast.success("Item split bill siap dibayar di Kasir");
+  };
+
+  const cancelDirectSplitBill = () => {
+    if (sourceOrderCart.length) setCart(sourceOrderCart);
+    setSplitDraft(null);
+    setSplitQty({});
+    setCustomerName("");
+    toast.info("Mode split bill dibatalkan");
+  };
+
   const subtotal = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const total = Math.max(0, subtotal - discount - redeemDiscount);
   const taxRate = Number(settings.tax_rate || 0);
@@ -705,7 +776,7 @@ export default function Kasir() {
       <div className="lg:sticky lg:top-20 lg:self-start bg-white rounded-xl border border-gray-100 shadow-sm" data-testid="cart-panel">
         <div className="p-4 border-b border-gray-100">
           <h2 className="font-semibold text-gray-900 flex items-center gap-2" style={{ fontFamily: 'Poppins' }}>
-            <ReceiptIcon className="w-5 h-5 text-[#1a6b3c]" /> Keranjang ({cart.length})
+            <ReceiptIcon className="w-5 h-5 text-[#1a6b3c]" /> {splitDraft ? "Keranjang Split" : "Keranjang"} ({cart.length})
           </h2>
         </div>
 
@@ -803,6 +874,25 @@ export default function Kasir() {
             <span className="font-mono text-[#1a6b3c]" data-testid="cart-total">{formatRupiah(paymentDue)}</span>
           </div>
 
+          {splitDraft && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="font-semibold text-emerald-900 flex items-center gap-1.5"><Scissors className="w-3.5 h-3.5" /> Split Bill aktif</div>
+                  <div className="text-emerald-800 mt-0.5">Yang dibayar hanya item terpilih. Sisa item tetap aktif di meja sampai dibayar berikutnya.</div>
+                </div>
+                <button type="button" onClick={cancelDirectSplitBill} className="text-red-600 font-semibold hover:underline">Batal</button>
+              </div>
+            </div>
+          )}
+
+          {canSplitBill && (
+            <Button type="button" data-testid="kasir-split-bill-btn" onClick={openDirectSplitBill}
+              variant="outline" className="w-full h-10 border-[#1a6b3c] text-[#1a6b3c] hover:bg-emerald-50 font-semibold">
+              <Scissors className="w-4 h-4 mr-1.5" /> Split Bill dari Order Meja
+            </Button>
+          )}
+
           {/* Transaction Type */}
           {!bonInfo && <div className="space-y-1.5">
             <label className="text-xs font-medium text-gray-600">Jenis Transaksi</label>
@@ -899,6 +989,52 @@ export default function Kasir() {
           </Button>
         </div>
       </div>
+
+      {/* Direct Split Bill Picker */}
+      <Dialog open={splitPickerOpen} onOpenChange={setSplitPickerOpen}>
+        <DialogContent className="w-[96vw] sm:max-w-2xl lg:max-w-3xl max-h-[92vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Scissors className="w-5 h-5 text-[#1a6b3c]" /> Split Bill Order Meja</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="text-sm text-gray-600 bg-emerald-50 border border-emerald-100 rounded-lg p-3">
+              Pilih item yang mau dibayar sekarang. Setelah pembayaran berhasil, item terpilih keluar dari order meja. Sisa item tetap aktif di Warung.
+            </div>
+            <div className="max-h-[52vh] overflow-y-auto rounded-xl border border-gray-100 divide-y divide-gray-100">
+              {sourceItemsForSplit.map((it, idx) => {
+                const key = it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`;
+                const qty = Number(splitQty[key] || 0);
+                const max = Number(it.quantity || 0);
+                return (
+                  <div key={key} className="p-3 flex items-center gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-semibold text-sm text-gray-900 truncate">{it.name}</div>
+                      <div className="font-mono text-xs text-gray-500">{formatRupiah(it.unit_price)} × tersedia {max}</div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button type="button" onClick={() => setSplitLineQty(it, qty - 1)} className="w-9 h-9 rounded-lg border border-gray-200 hover:bg-gray-50"><Minus className="w-4 h-4 mx-auto" /></button>
+                      <Input value={qty || ""} inputMode="numeric" pattern="[0-9]*" onChange={(e) => setSplitLineQty(it, parseInt(e.target.value) || 0)} className="w-14 h-9 text-center font-mono" />
+                      <button type="button" onClick={() => setSplitLineQty(it, qty + 1)} className="w-9 h-9 rounded-lg border border-gray-200 hover:bg-gray-50"><Plus className="w-4 h-4 mx-auto" /></button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex items-center justify-between gap-3 flex-wrap rounded-xl bg-gray-50 border border-gray-100 p-3">
+              <div>
+                <div className="text-xs text-gray-500">Total item terpilih</div>
+                <div className="font-mono text-lg font-bold text-[#1a6b3c]">{formatRupiah(selectedSplitTotal)}</div>
+              </div>
+              <div className="flex gap-2">
+                <Button type="button" variant="outline" onClick={selectAllSplitLines}>Pilih Semua</Button>
+                <Button type="button" onClick={applyDirectSplitBill} disabled={!selectedSplitItems.length} className="bg-[#1a6b3c] hover:bg-[#14522d]">
+                  Bayar Item Terpilih
+                </Button>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Variant Picker */}
       <Dialog open={!!variantPicker} onOpenChange={(o) => { if (!o) setVariantPicker(null); }}>
