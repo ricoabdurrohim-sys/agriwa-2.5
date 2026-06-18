@@ -274,8 +274,7 @@ async function centeredTextToEscposRaster(text, widthDots = 384, { fontSize = 20
       align("center"),
       bytes(GS, 0x76, 0x30, 0x00, bytesPerRow & 0xff, (bytesPerRow >> 8) & 0xff, canvas.height & 0xff, (canvas.height >> 8) & 0xff),
       raster,
-      strBytes("
-")
+      strBytes("\n")
     );
   } catch (e) {
     console.warn("Gagal rasterize teks unicode untuk thermal", e);
