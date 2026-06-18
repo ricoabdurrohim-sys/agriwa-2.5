@@ -18,6 +18,15 @@ const PAYMENT_METHODS = [
   { key: "ewallet", label: "E-Wallet", icon: Smartphone },
 ];
 
+const receiptBool = (value, fallback = true) => {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const s = String(value).trim().toLowerCase();
+  if (["false", "0", "no", "off", "mati", "tidak", "nonaktif"].includes(s)) return false;
+  if (["true", "1", "yes", "on", "aktif", "ya"].includes(s)) return true;
+  return fallback;
+};
+
 export default function Kasir() {
   const nav = useNavigate();
   const [params] = useSearchParams();
@@ -377,7 +386,11 @@ export default function Kasir() {
       footer: snap.footer ?? trxUnit.receipt_footer ?? "",
       note: snap.note || trxUnit.receipt_note || "",
       logo_url: snap.logo_url || snap.receipt_logo || trxUnit.receipt_logo || trxUnit.receipt_logo_url || "",
-      show_qr: snap.show_qr ?? snap.receipt_show_qr ?? trxUnit.receipt_show_qr ?? true,
+      // QR struk harus mengikuti setting Lini Bisnis terbaru. Jika unit mematikan QR,
+      // thermal, preview, dan fallback browser wajib ikut mati meski snapshot transaksi lama masih true.
+      show_qr: receiptBool(trxUnit.receipt_show_qr, true) === false
+        ? false
+        : receiptBool(snap.show_qr ?? snap.receipt_show_qr, true),
     };
   };
 
@@ -888,7 +901,7 @@ export default function Kasir() {
 
           {canSplitBill && (
             <Button type="button" data-testid="kasir-split-bill-btn" onClick={openDirectSplitBill}
-              variant="outline" className="w-full h-10 border-[#1a6b3c] text-[#1a6b3c] hover:bg-emerald-50 font-semibold">
+              variant="outline" className="w-full h-10 border-[#1a6b3c] bg-white text-[#1a6b3c] hover:bg-emerald-50 hover:text-[#1a6b3c] active:text-[#1a6b3c] focus:text-[#1a6b3c] font-semibold">
               <Scissors className="w-4 h-4 mr-1.5" /> Split Bill dari Order Meja
             </Button>
           )}
@@ -1026,8 +1039,8 @@ export default function Kasir() {
                 <div className="font-mono text-lg font-bold text-[#1a6b3c]">{formatRupiah(selectedSplitTotal)}</div>
               </div>
               <div className="flex gap-2">
-                <Button type="button" variant="outline" onClick={selectAllSplitLines}>Pilih Semua</Button>
-                <Button type="button" onClick={applyDirectSplitBill} disabled={!selectedSplitItems.length} className="bg-[#1a6b3c] hover:bg-[#14522d]">
+                <Button type="button" variant="outline" onClick={selectAllSplitLines} className="bg-white text-[#1a6b3c] border-[#1a6b3c] hover:bg-emerald-50 hover:text-[#1a6b3c] active:text-[#1a6b3c] focus:text-[#1a6b3c]">Pilih Semua</Button>
+                <Button type="button" onClick={applyDirectSplitBill} disabled={!selectedSplitItems.length} className="bg-[#1a6b3c] text-white hover:bg-[#14522d] hover:text-white active:text-white focus:text-white">
                   Bayar Item Terpilih
                 </Button>
               </div>

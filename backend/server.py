@@ -131,6 +131,19 @@ def payment_account(payment_method: str) -> str:
     return "Kas"
 
 
+def as_receipt_bool(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    s = str(value).strip().lower()
+    if s in ("false", "0", "no", "off", "mati", "tidak", "nonaktif"):
+        return False
+    if s in ("true", "1", "yes", "on", "aktif", "ya"):
+        return True
+    return default
+
+
 async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
     # v2.5.7: struk harus mengikuti Lini Bisnis, bukan Pengaturan global.
     # Pengaturan global tidak lagi dijadikan fallback alamat/telepon/footer agar struk antar unit tidak bentrok.
@@ -144,7 +157,7 @@ async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
         "footer": unit.get("receipt_footer") or "",
         "note": unit.get("receipt_note") or "",
         "logo_url": unit.get("receipt_logo") or unit.get("receipt_logo_url") or "",
-        "show_qr": unit.get("receipt_show_qr", True),
+        "show_qr": as_receipt_bool(unit.get("receipt_show_qr"), True),
     }
 
 
@@ -163,7 +176,7 @@ def receipt_cfg_from_trx(trx: dict) -> dict:
         "footer": snap.get("footer") or "",
         "note": snap.get("note", ""),
         "logo_url": snap.get("logo_url") or snap.get("receipt_logo") or "",
-        "show_qr": snap.get("show_qr", True),
+        "show_qr": as_receipt_bool(snap.get("show_qr"), True),
     }
 
 

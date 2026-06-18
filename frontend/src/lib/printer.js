@@ -336,7 +336,7 @@ export async function printReceipt(receipt, opts = {}) {
   } else if (receipt.payment_method) {
     cmds.push(strBytes(`Metode: ${String(receipt.payment_method).toUpperCase()}\n`));
   }
-  if (receipt.trx_no) {
+  if (showQr && receipt.trx_no) {
     cmds.push(strBytes("-".repeat(width) + "\n"));
     cmds.push(align("center"));
     cmds.push(escposQr(String(receipt.trx_no), 3)); // kecil dan rapi untuk 80mm

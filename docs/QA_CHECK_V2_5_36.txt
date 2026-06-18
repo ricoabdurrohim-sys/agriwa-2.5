@@ -1,0 +1,11 @@
+QA CHECK v2.5.36
+
+1. Lini Bisnis > Warung Makan > matikan Tampilkan QR code di struk transaksi.
+2. Simpan.
+3. Buat transaksi baru di Kasir.
+4. Preview struk tidak boleh menampilkan QR.
+5. Klik Thermal / 80mm: print thermal tidak boleh mencetak QR.
+6. Aktifkan lagi toggle QR, transaksi baru harus menampilkan QR lagi.
+7. Warung > meja > lanjut Kasir > arahkan kursor ke tombol Split Bill dari Order Meja.
+8. Teks tombol harus tetap terlihat saat hover/fokus/klik.
+9. Pilih item split bill, tombol Pilih Semua dan Bayar Item Terpilih tetap terbaca.
