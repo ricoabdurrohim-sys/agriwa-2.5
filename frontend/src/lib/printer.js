@@ -300,6 +300,7 @@ export async function printReceipt(receipt, opts = {}) {
   const footer = opts.footer == null ? "" : String(opts.footer || "");
   const note = opts.note == null ? "" : String(opts.note || "");
   const logoUrl = opts.logoUrl || opts.logo_url || "";
+  const showQr = opts.showQr !== false;
   const cmds = [];
 
   cmds.push(bytes(ESC, 0x40));

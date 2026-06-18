@@ -13,7 +13,7 @@ import { toast } from "sonner";
 const DEFAULT_CODES = ["warung", "anggur", "pupuk", "pembibitan", "gudang"];
 const COLORS = ["#1a6b3c", "#ea580c", "#6b46c1", "#b45309", "#059669", "#2563eb", "#dc2626", "#0891b2", "#7c3aed", "#db2777"];
 
-const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", receipt_logo: "", description: "", color: "#1a6b3c", active: true, auto_batch_enabled: true, batch_on_purchase: true, batch_on_production: false, batch_on_harvest: true, batch_on_farm: true };
+const init = { code: "", name: "", receipt_name: "", receipt_address: "", receipt_phone: "", receipt_footer: "", receipt_note: "", receipt_logo: "", receipt_show_qr: true, description: "", color: "#1a6b3c", active: true, auto_batch_enabled: true, batch_on_purchase: true, batch_on_production: false, batch_on_harvest: true, batch_on_farm: true };
 
 export default function BusinessUnits() {
   const [units, setUnits] = useState([]);
@@ -75,7 +75,7 @@ export default function BusinessUnits() {
               </div>
             </div>
             {u.description && <div className="text-xs text-gray-600 mt-2">{u.description}</div>}
-            {(u.receipt_address || u.receipt_footer || u.receipt_note) && <div className="text-[11px] text-gray-500 mt-2 border-t border-gray-100 pt-2">Struk: {u.receipt_address || "alamat kosong"} · {u.receipt_footer ? "footer custom" : "footer default"}</div>}
+            {(u.receipt_address || u.receipt_footer || u.receipt_note || u.receipt_show_qr === false) && <div className="text-[11px] text-gray-500 mt-2 border-t border-gray-100 pt-2">Struk: {u.receipt_address || "alamat kosong"} · QR struk {u.receipt_show_qr === false ? "mati" : "aktif"}</div>}
             {!u.active && <Badge variant="secondary" className="mt-2">Nonaktif</Badge>}
           </div>
         ))}
@@ -97,6 +97,21 @@ export default function BusinessUnits() {
             <div><Label>Footer Struk</Label><Textarea data-testid="unit-receipt-footer-input" value={form.receipt_footer || ""} onChange={(e) => setForm({ ...form, receipt_footer: e.target.value })} placeholder="Terima kasih\nBarang yang sudah dibeli tidak dapat dikembalikan" className="min-h-[86px]" /></div>
             <div><Label>Catatan Struk</Label><Textarea data-testid="unit-receipt-note-input" value={form.receipt_note || ""} onChange={(e) => setForm({ ...form, receipt_note: e.target.value })} placeholder="Catatan tambahan di bawah struk" className="min-h-[72px]" /></div>
             <ImageUpload value={form.receipt_logo || ""} onChange={(v) => setForm({ ...form, receipt_logo: v })} label="Logo/Gambar di Struk (opsional)" testid="unit-receipt-logo" />
+            <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+              <label className="flex items-start gap-3 text-sm text-gray-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.receipt_show_qr !== false}
+                  onChange={(e) => setForm({ ...form, receipt_show_qr: e.target.checked })}
+                  className="mt-1 accent-[#1a6b3c]"
+                  data-testid="unit-receipt-show-qr-input"
+                />
+                <span>
+                  <span className="font-semibold block">Tampilkan QR code di struk transaksi</span>
+                  <span className="text-xs text-gray-500">Default aktif. Matikan jika lini bisnis ini tidak ingin mencetak QR/scan nota di struk pembayaran.</span>
+                </span>
+              </label>
+            </div>
             <div><Label>Deskripsi</Label><Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
             <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 space-y-2">
               <div className="text-sm font-semibold text-emerald-900">Pengaturan Batch Otomatis</div>

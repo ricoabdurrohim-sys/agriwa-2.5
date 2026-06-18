@@ -370,6 +370,7 @@ export default function Kasir() {
       footer: snap.footer ?? trxUnit.receipt_footer ?? "",
       note: snap.note || trxUnit.receipt_note || "",
       logo_url: snap.logo_url || snap.receipt_logo || trxUnit.receipt_logo || trxUnit.receipt_logo_url || "",
+      show_qr: snap.show_qr ?? snap.receipt_show_qr ?? trxUnit.receipt_show_qr ?? true,
     };
   };
 
@@ -1093,7 +1094,7 @@ export default function Kasir() {
               {showReceipt.transaction_type && showReceipt.transaction_type !== "SALE" && <div className="flex justify-between text-xs"><span>HPP</span><span>{formatRupiah(showReceipt.cost_total || 0)}</span></div>}
               {showReceipt.payment_status && <div className="flex justify-between text-xs"><span>Status</span><span>{showReceipt.payment_status}</span></div>}
               <div className="border-t border-dashed border-gray-400 my-2" />
-              {showReceipt.trx_no && (
+              {cfg.show_qr !== false && showReceipt.trx_no && (
                 <div className="text-center my-2">
                   <QRCodeBox value={showReceipt.trx_no} size={88} label="" />
                 </div>
@@ -1117,9 +1118,9 @@ export default function Kasir() {
                         const wrap = doc.createElement('div');
                         wrap.className = 'thermal-print';
                         const rows = (showReceipt.items || []).map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
-                        const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(showReceipt.trx_no || '')}`;
+                        const qr = cfg.show_qr !== false ? `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(showReceipt.trx_no || '')}` : ''; 
                         const logo = cfg.logo_url ? `<div class="center"><img class="logo" src="${resolveImageUrl(cfg.logo_url)}"/></div>` : '';
-                        wrap.innerHTML = `${logo}<div class="center title">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small multiline">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row total"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/></div><div class="line"></div>${cfg.note ? `<div class="center small multiline">${cfg.note}</div>` : ''}${cfg.footer ? `<div class="center small multiline">${cfg.footer}</div>` : ''}`;
+                        wrap.innerHTML = `${logo}<div class="center title">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small multiline">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row total"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div>${cfg.show_qr !== false && qr ? `<div class="line"></div><div class="center"><img class="qr" src="${qr}"/></div>` : ``}<div class="line"></div>${cfg.note ? `<div class="center small multiline">${cfg.note}</div>` : ''}${cfg.footer ? `<div class="center small multiline">${cfg.footer}</div>` : ''}`;
                         doc.body.appendChild(wrap);
                       }
                     });
@@ -1137,6 +1138,7 @@ export default function Kasir() {
                       footer: cfg.footer || "",
                       note: cfg.note || "",
                       logoUrl: cfg.logo_url ? resolveImageUrl(cfg.logo_url) : "",
+                      showQr: cfg.show_qr !== false,
                     });
                     toast.success("Struk dikirim ke printer thermal");
                   } catch (e) {

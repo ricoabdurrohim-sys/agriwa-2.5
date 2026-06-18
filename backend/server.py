@@ -144,6 +144,7 @@ async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
         "footer": unit.get("receipt_footer") or "",
         "note": unit.get("receipt_note") or "",
         "logo_url": unit.get("receipt_logo") or unit.get("receipt_logo_url") or "",
+        "show_qr": unit.get("receipt_show_qr", True),
     }
 
 
@@ -162,6 +163,7 @@ def receipt_cfg_from_trx(trx: dict) -> dict:
         "footer": snap.get("footer") or "",
         "note": snap.get("note", ""),
         "logo_url": snap.get("logo_url") or snap.get("receipt_logo") or "",
+        "show_qr": snap.get("show_qr", True),
     }
 
 
@@ -5764,6 +5766,7 @@ class BizUnitIn(BaseModel):
     receipt_footer: Optional[str] = ""
     receipt_note: Optional[str] = ""
     receipt_logo: Optional[str] = ""
+    receipt_show_qr: bool = True
     description: Optional[str] = ""
     icon: Optional[str] = ""
     color: Optional[str] = "#1a6b3c"

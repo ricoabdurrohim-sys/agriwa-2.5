@@ -1,0 +1,12 @@
+QA CHECK V2.5.32
+
+[ ] HF /docs tetap jalan.
+[ ] Vercel login tetap jalan.
+[ ] Lini Bisnis punya checkbox Tampilkan QR code di struk transaksi.
+[ ] Default QR aktif untuk lini bisnis lama.
+[ ] Jika QR dimatikan, preview struk pembayaran tidak menampilkan QR.
+[ ] Jika QR dimatikan, thermal print tidak mencetak QR nota.
+[ ] Jika QR diaktifkan, QR muncul seperti v2.5.31.
+[ ] QR pesanan meja Warung tetap tidak berubah.
+[ ] Split Bill tetap muncul.
+[ ] Panggil Pelayan tetap muncul.
