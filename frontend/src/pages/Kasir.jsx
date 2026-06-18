@@ -63,6 +63,7 @@ export default function Kasir() {
   const [posCategoryItems, setPosCategoryItems] = useState([]);
   const [showProductScan, setShowProductScan] = useState(false);
   const [productScan, setProductScan] = useState("");
+  const [splitDraft, setSplitDraft] = useState(null);
 
   const getBonRemaining = (d) => {
     if (!d) return 0;
@@ -221,6 +222,37 @@ export default function Kasir() {
     }
   }, [orderId]);
 
+  // Pre-fill split bill draft from Split Bill page. Source order remains active until all remaining items are paid.
+  useEffect(() => {
+    if (params.get("split") !== "1") return;
+    try {
+      const raw = localStorage.getItem("aw_split_bill_draft");
+      if (!raw) return toast.error("Draft split bill tidak ditemukan");
+      const draft = JSON.parse(raw);
+      if (params.get("source_order") && String(draft.source_order_id) !== String(params.get("source_order"))) return;
+      const rows = (draft.items || []).map((it, idx) => ({
+        line_id: it.line_id || `${it.item_id || idx}::${it.variant_id || "base"}`,
+        item_id: it.item_id,
+        name: it.name,
+        unit_price: Number(it.unit_price || 0),
+        quantity: Number(it.quantity || 1),
+        notes: it.notes || "",
+        variant_id: it.variant_id || "",
+        variant_name: it.variant_name || "",
+      })).filter((it) => it.item_id && it.quantity > 0);
+      if (!rows.length) return toast.error("Item split bill kosong");
+      setSplitDraft(draft);
+      setCart(rows);
+      setUnit("warung");
+      setTransactionType("SALE");
+      setCustomerName(draft.customer_name || `Split Bill ${draft.table_name || "Meja"}`);
+      setPayment("cash");
+      toast.success("Split bill dimuat ke Kasir");
+    } catch (e) {
+      toast.error("Gagal membaca draft split bill");
+    }
+  }, [params]);
+
   // Pre-fill from bon (Bayar from Keuangan)
   useEffect(() => {
     if (bonId) {
@@ -335,7 +367,7 @@ export default function Kasir() {
       business_name: snap.business_name || snap.name || (trxUnit.receipt_name && trxUnit.receipt_name.trim()) || trxUnit.name || "AGRIWARUNG",
       address: snap.address || trxUnit.receipt_address || "",
       phone: snap.phone || trxUnit.receipt_phone || "",
-      footer: snap.footer || trxUnit.receipt_footer || "Terima kasih! 🙏",
+      footer: snap.footer ?? trxUnit.receipt_footer ?? "",
       note: snap.note || trxUnit.receipt_note || "",
       logo_url: snap.logo_url || snap.receipt_logo || trxUnit.receipt_logo || trxUnit.receipt_logo_url || "",
     };
@@ -468,14 +500,18 @@ export default function Kasir() {
         const resp = await api.post("/transactions", {
           items: cart, discount: discount + redeemDiscount, payment_method: payment,
           cash_received: transactionType === "SALE" ? cashReceivedNum : 0, customer_name: customerName, customer_phone: customerPhone,
-          is_bon: transactionType === "SALE" ? isBon : false, transaction_type: transactionType, unit: unit, table_id: tableId, order_id: orderId,
+          is_bon: transactionType === "SALE" ? isBon : false, transaction_type: transactionType, unit: unit,
+          table_id: tableId || splitDraft?.table_id || null,
+          order_id: splitDraft ? null : orderId,
+          split_source_order_id: splitDraft?.source_order_id || null,
           member_id: member?.id || null, points_redeemed: pointsToRedeem || 0,
         });
         data = resp.data;
         toast.success("Transaksi berhasil!");
       }
       setShowReceipt({ ...data, customer_phone: customerPhone });
-      if ((orderId || tableId) && !bonInfo) setRedirectAfterReceipt(true);
+      if ((orderId || tableId || splitDraft) && !bonInfo) setRedirectAfterReceipt(true);
+      if (splitDraft) { try { localStorage.removeItem("aw_split_bill_draft"); } catch {} setSplitDraft(null); }
       setCart([]); setCashReceived(""); setDiscount(0); setIsBon(false); setTransactionType("SALE"); setCustomerName(""); setCustomerPhone("");
       setBonInfo(null);
       clearPromo(); clearMember();
@@ -500,7 +536,7 @@ export default function Kasir() {
         <div className="flex items-end justify-between gap-3 flex-wrap">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-gray-900" style={{ fontFamily: 'Poppins' }}>Kasir POS</h1>
-            <p className="text-sm text-gray-500 mt-0.5">{tableId ? "Pesanan untuk meja terpilih" : bonInfo ? `Pelunasan bon — ${bonInfo.customer_name}` : `Penjualan ${currentUnitInfo.name}`}</p>
+            <p className="text-sm text-gray-500 mt-0.5">{splitDraft ? `Split bill — ${splitDraft.table_name || "Meja"}` : tableId ? "Pesanan untuk meja terpilih" : bonInfo ? `Pelunasan bon — ${bonInfo.customer_name}` : `Penjualan ${currentUnitInfo.name}`}</p>
           </div>
           <div className="flex gap-2 flex-wrap">
             <Button data-testid="open-product-scan-btn" onClick={() => setShowProductScan(true)} variant="outline" className="border-emerald-300 text-emerald-800 hover:bg-emerald-50">
@@ -865,7 +901,7 @@ export default function Kasir() {
 
       {/* Variant Picker */}
       <Dialog open={!!variantPicker} onOpenChange={(o) => { if (!o) setVariantPicker(null); }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="w-[96vw] sm:max-w-xl lg:max-w-2xl max-h-[92vh] overflow-y-auto">
           <DialogHeader><DialogTitle>Pilih Varian</DialogTitle></DialogHeader>
           {variantPicker && <div className="space-y-2">
             <div className="text-sm font-semibold">{variantPicker.name}</div>
@@ -996,7 +1032,7 @@ export default function Kasir() {
 
       {/* Receipt Dialog */}
       <Dialog open={!!showReceipt} onOpenChange={(o) => { if (!o) closeReceipt(); }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="w-[96vw] sm:max-w-xl lg:max-w-2xl max-h-[92vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Struk Transaksi</DialogTitle>
           </DialogHeader>
@@ -1063,7 +1099,7 @@ export default function Kasir() {
                 </div>
               )}
               {cfg.note && <div className="text-center text-xs whitespace-pre-line">{cfg.note}</div>}
-              <div className="text-center text-xs whitespace-pre-line">{cfg.footer || "Terima kasih! 🙏"}</div>
+              {cfg.footer && <div className="text-center text-xs whitespace-pre-line">{cfg.footer}</div>}
             </div>
             );
           })()}
@@ -1083,7 +1119,7 @@ export default function Kasir() {
                         const rows = (showReceipt.items || []).map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(it.quantity * it.unit_price)}</b></div>`).join('');
                         const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(showReceipt.trx_no || '')}`;
                         const logo = cfg.logo_url ? `<div class="center"><img class="logo" src="${resolveImageUrl(cfg.logo_url)}"/></div>` : '';
-                        wrap.innerHTML = `${logo}<div class="center title">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small multiline">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row total"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/></div><div class="line"></div>${cfg.note ? `<div class="center small multiline">${cfg.note}</div>` : ''}<div class="center small multiline">${cfg.footer || 'Terima kasih!'}</div>`;
+                        wrap.innerHTML = `${logo}<div class="center title">${cfg.business_name || 'AGRIWARUNG'}</div>${cfg.address ? `<div class="center small multiline">${cfg.address}</div>` : ''}<div class="line"></div><div>No: ${showReceipt.trx_no}</div>${showReceipt.queue_no ? `<div>Antrian: ${showReceipt.queue_no}</div>` : ''}<div>${new Date(showReceipt.created_at).toLocaleString('id-ID')}</div><div class="line"></div>${rows}<div class="line"></div><div class="row"><span>Subtotal</span><b>${formatRupiah(showReceipt.subtotal || 0)}</b></div>${showReceipt.discount ? `<div class="row"><span>Diskon</span><b>-${formatRupiah(showReceipt.discount)}</b></div>` : ''}<div class="row total"><span>Total</span><b>${formatRupiah(showReceipt.total || 0)}</b></div><div>Metode: ${String(showReceipt.payment_method || '').toUpperCase()}</div><div class="line"></div><div class="center"><img class="qr" src="${qr}"/></div><div class="line"></div>${cfg.note ? `<div class="center small multiline">${cfg.note}</div>` : ''}${cfg.footer ? `<div class="center small multiline">${cfg.footer}</div>` : ''}`;
                         doc.body.appendChild(wrap);
                       }
                     });
@@ -1098,7 +1134,7 @@ export default function Kasir() {
                       headerName: cfg.business_name,
                       subLine: cfg.address || "",
                       phone: cfg.phone || "",
-                      footer: cfg.footer || "Terima kasih!",
+                      footer: cfg.footer || "",
                       note: cfg.note || "",
                       logoUrl: cfg.logo_url ? resolveImageUrl(cfg.logo_url) : "",
                     });

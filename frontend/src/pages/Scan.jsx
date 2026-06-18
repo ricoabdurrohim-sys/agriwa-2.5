@@ -14,12 +14,17 @@ function normalizeWarungOrderTarget(raw) {
   // Be tolerant: some scanners return URL-encoded payload text.
   try { if (/%[0-9A-Fa-f]{2}/.test(value)) value = decodeURIComponent(value); } catch {}
   const fromAwPayload = (text) => {
-    const m = String(text || "").match(/^aw:warung-order:([^:]+):([^:]+)$/i);
-    if (!m) return null;
-    const tableId = decodeURIComponent(m[1] || "");
-    const orderId = decodeURIComponent(m[2] || "");
-    if (!tableId || !orderId) return null;
-    return `/warung?table=${encodeURIComponent(tableId)}&order=${encodeURIComponent(orderId)}&from=scan`;
+    const parts = String(text || "").split(":");
+    if (parts[0]?.toLowerCase() !== "aw" || parts[1]?.toLowerCase() !== "warung-order") return null;
+    // Format panjang lama: aw:warung-order:TABLE_ID:ORDER_ID bisa langsung diarahkan.
+    if (parts.length >= 4) {
+      const tableId = decodeURIComponent(parts[2] || "");
+      const orderId = decodeURIComponent(parts[3] || "");
+      if (!tableId || !orderId) return null;
+      return `/warung?table=${encodeURIComponent(tableId)}&order=${encodeURIComponent(orderId)}&from=scan`;
+    }
+    // Format pendek baru: aw:warung-order:ORDER_ID wajib resolve backend agar tidak mencari lintas modul.
+    return null;
   };
   const aw = fromAwPayload(value);
   if (aw) return aw;
@@ -206,7 +211,7 @@ export default function Scan() {
           <Input value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && resolve(code)} placeholder="Nomor nota / batch / kode QR" className="font-mono" />
           <Button variant="outline" onClick={() => resolve(code)}><Search className="w-4 h-4 mr-1" /> Cari</Button>
         </div>
-        <div className="text-[11px] text-gray-500">Contoh input manual: AW-170626-0001, GP160626001, aw:batch:GP160626001, atau aw:warung-order:MEJA_ID:ORDER_ID.</div>
+        <div className="text-[11px] text-gray-500">Contoh input manual: AW-170626-0001, GP160626001, aw:batch:GP160626001, atau aw:warung-order:ORDER_ID atau aw:warung-order:MEJA_ID:ORDER_ID.</div>
       </div>
     </div>
   );

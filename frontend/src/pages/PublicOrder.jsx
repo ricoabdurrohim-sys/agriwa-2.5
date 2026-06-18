@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { Search, Plus, Minus, Send, UtensilsCrossed, Check, X } from "lucide-react";
+import { Search, Plus, Minus, Send, UtensilsCrossed, Check, X, Bell, Receipt } from "lucide-react";
 import axios from "axios";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -98,6 +98,15 @@ export default function PublicOrder() {
   const total = cart.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const cartCount = cart.reduce((s, i) => s + i.quantity, 0);
 
+  const callWaiter = async (action = "call_waiter") => {
+    try {
+      const { data } = await axios.post(`${API}/public/waiter-call`, { table_id: tableId, action, note: notes });
+      toast.success(data?.message || "Permintaan dikirim");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Gagal memanggil pelayan");
+    }
+  };
+
   const submit = async () => {
     if (cart.length === 0) return toast.error("Tambahkan menu dulu");
     setSubmitting(true);
@@ -179,6 +188,10 @@ export default function PublicOrder() {
                 {c === "all" ? "Semua" : c}
               </button>
             ))}
+          </div>
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <button type="button" onClick={() => callWaiter("call_waiter")} className="h-9 rounded-xl bg-amber-50 text-amber-700 border border-amber-200 text-xs font-semibold flex items-center justify-center gap-1.5"><Bell className="w-3.5 h-3.5" /> Panggil Pelayan</button>
+            <button type="button" onClick={() => callWaiter("request_bill")} className="h-9 rounded-xl bg-emerald-50 text-[#1a6b3c] border border-emerald-200 text-xs font-semibold flex items-center justify-center gap-1.5"><Receipt className="w-3.5 h-3.5" /> Minta Bill</button>
           </div>
         </div>
       </div>

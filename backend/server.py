@@ -141,7 +141,7 @@ async def get_unit_receipt_config(unit_code: str = "warung") -> dict:
         "business_name": name,
         "address": unit.get("receipt_address") or "",
         "phone": unit.get("receipt_phone") or "",
-        "footer": unit.get("receipt_footer") or "Terima kasih! 🙏",
+        "footer": unit.get("receipt_footer") or "",
         "note": unit.get("receipt_note") or "",
         "logo_url": unit.get("receipt_logo") or unit.get("receipt_logo_url") or "",
     }
@@ -159,7 +159,7 @@ def receipt_cfg_from_trx(trx: dict) -> dict:
         "business_name": snap.get("business_name") or snap.get("name") or "AgriWarung",
         "address": snap.get("address", ""),
         "phone": snap.get("phone", ""),
-        "footer": snap.get("footer") or "Terima kasih! 🙏",
+        "footer": snap.get("footer") or "",
         "note": snap.get("note", ""),
         "logo_url": snap.get("logo_url") or snap.get("receipt_logo") or "",
     }
@@ -364,13 +364,25 @@ async def resolve_scan_code(code: str, user: dict = Depends(get_current_user)):
         if trx:
             return payload("transaction", f"/kasir?lookup={quote(trx.get('trx_no') or trx.get('id'))}", trx)
     if low.startswith("aw:warung-order:"):
-        parts = decoded.split(":", 3)
-        if len(parts) == 4:
+        # Format baru thermal sengaja pendek agar printer tidak error QR:
+        #   aw:warung-order:ORDER_ID
+        # Format lama tetap didukung:
+        #   aw:warung-order:TABLE_ID:ORDER_ID
+        parts = decoded.split(":")
+        table_id = ""
+        order_id = ""
+        if len(parts) >= 4:
             table_id, order_id = parts[2].strip(), parts[3].strip()
             order = await db.orders.find_one({"id": order_id, "table_id": table_id}, {"_id": 0})
-            if order and str(order.get("status", "")).lower() not in ("paid", "cancelled", "closed"):
-                return payload("warung_order", f"/warung?table={quote(table_id)}&order={quote(order_id)}&from=scan", order)
-            raise HTTPException(404, "QR pesanan Warung tidak aktif atau sudah selesai dibayar")
+        elif len(parts) == 3:
+            order_id = parts[2].strip()
+            order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+            table_id = str((order or {}).get("table_id") or "")
+        else:
+            order = None
+        if order and table_id and str(order.get("status", "")).lower() not in ("paid", "cancelled", "closed"):
+            return payload("warung_order", f"/warung?table={quote(table_id)}&order={quote(order_id)}&from=scan", order)
+        raise HTTPException(404, "QR pesanan Warung tidak aktif atau sudah selesai dibayar")
 
     if low.startswith("aw:batch:"):
         q = decoded.split(":", 2)[2]
@@ -1537,6 +1549,42 @@ async def get_order(order_id: str, user: dict = Depends(get_current_user)):
     return doc
 
 
+def _order_line_key(line: dict) -> tuple:
+    return (
+        str(line.get("item_id") or ""),
+        str(line.get("variant_id") or ""),
+        str(line.get("name") or ""),
+        int(line.get("unit_price") or 0),
+    )
+
+
+def _subtract_split_items_from_order(source_items: list, paid_items: list) -> list:
+    remaining = []
+    to_pay = {}
+    for it in paid_items:
+        d = it.model_dump() if hasattr(it, "model_dump") else dict(it)
+        key = _order_line_key(d)
+        to_pay[key] = to_pay.get(key, 0) + int(d.get("quantity") or 0)
+    for raw in source_items or []:
+        line = dict(raw)
+        key = _order_line_key(line)
+        qty = int(line.get("quantity") or 0)
+        pay_qty = int(to_pay.get(key, 0) or 0)
+        if pay_qty < 0:
+            pay_qty = 0
+        if pay_qty > qty:
+            raise HTTPException(400, f"Qty split melebihi pesanan untuk {line.get('name')}")
+        left = qty - pay_qty
+        if left > 0:
+            line["quantity"] = left
+            remaining.append(line)
+        to_pay[key] = max(0, pay_qty - qty)
+    leftovers = sum(max(0, int(v or 0)) for v in to_pay.values())
+    if leftovers > 0:
+        raise HTTPException(400, "Item split tidak cocok dengan order aktif")
+    return remaining
+
+
 async def _next_takeaway_queue_no() -> str:
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"TA-{today}-"
@@ -1589,6 +1637,7 @@ class TransactionIn(BaseModel):
     branch_id: Optional[str] = None
     member_id: Optional[str] = None
     points_redeemed: int = 0
+    split_source_order_id: Optional[str] = None
 
 
 async def _next_transaction_no(unit: str = "POS") -> str:
@@ -1614,6 +1663,16 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
     discount = max(0, int(body.discount or 0))
     sale_total = max(0, retail_subtotal - discount)
     cash_received = max(0, int(body.cash_received or 0))
+
+    split_source_order = None
+    split_remaining_items = None
+    if body.split_source_order_id:
+        split_source_order = await db.orders.find_one({"id": body.split_source_order_id}, {"_id": 0})
+        if not split_source_order:
+            raise HTTPException(404, "Order sumber split bill tidak ditemukan")
+        if str(split_source_order.get("status", "")).lower() in ("paid", "cancelled", "closed"):
+            raise HTTPException(400, "Order sumber split bill sudah selesai")
+        split_remaining_items = _subtract_split_items_from_order(split_source_order.get("items") or [], body.items)
 
     # Cost/HPP dihitung dari inventory saat transaksi dibuat.
     cost_total = 0
@@ -1657,7 +1716,7 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
     )
     change = (cash_received - sale_total) if (is_sale and body.payment_method == "cash") else 0
     receipt_snapshot = await build_receipt_snapshot(body.unit)
-    source_order = await db.orders.find_one({"id": body.order_id}, {"_id": 0}) if body.order_id else None
+    source_order = split_source_order or (await db.orders.find_one({"id": body.order_id}, {"_id": 0}) if body.order_id else None)
     settings_doc = await db.settings.find_one({}, {"_id": 0}) or {}
     tax_rate = float(settings_doc.get("tax_rate") or 0)
     tax_receipt_enabled = bool(settings_doc.get("tax_receipt_enabled", True))
@@ -1677,7 +1736,8 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
         "trx_no": trx_no,
         "lookup_key": trx_no,
         "order_id": body.order_id,
-        "table_id": body.table_id,
+        "split_source_order_id": body.split_source_order_id,
+        "table_id": body.table_id or ((split_source_order or {}).get("table_id") if split_source_order else None),
         "queue_no": (source_order or {}).get("queue_no", ""),
         "order_type": (source_order or {}).get("order_type", ""),
         "branch_id": body.branch_id,
@@ -1731,8 +1791,15 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
     if is_sale and body.member_id and body.points_redeemed:
         await db.members.update_one({"$or": [{"id": body.member_id}, {"member_id": body.member_id}]}, {"$inc": {"points": -body.points_redeemed}})
 
-    # Close order setelah pembayaran.
-    if body.order_id:
+    # Close order setelah pembayaran penuh, atau kurangi order sumber untuk split bill.
+    if body.split_source_order_id and split_source_order is not None and split_remaining_items is not None:
+        if split_remaining_items:
+            await db.orders.update_one({"id": body.split_source_order_id}, {"$set": {"items": split_remaining_items, "updated_at": now_iso(), "last_split_trx_id": doc["id"]}})
+            await broadcast_event("order_updated", {"id": body.split_source_order_id, "status": "sent", "table_id": (split_source_order or {}).get("table_id")})
+        else:
+            await db.orders.update_one({"id": body.split_source_order_id}, {"$set": {"status": "paid" if is_sale else "closed", "last_split_trx_id": doc["id"], "updated_at": now_iso()}})
+            await broadcast_event("order_updated", {"id": body.split_source_order_id, "status": "paid", "table_id": (split_source_order or {}).get("table_id")})
+    elif body.order_id:
         await db.orders.update_one({"id": body.order_id}, {"$set": {"status": "paid" if is_sale else "closed"}})
         await broadcast_event("order_updated", {"id": body.order_id, "status": "paid", "table_id": body.table_id})
 
@@ -2714,6 +2781,31 @@ async def public_create_order(body: PublicOrderIn):
     await broadcast_event("notification_created", {"id": notif.get("id"), "type": "NEW_ORDER", "ref_type": "order", "ref_id": doc["id"], "priority": "high", "source": "self_order"})
     await broadcast_event("order_created", {"id": doc["id"], "table_id": doc["table_id"], "source": "self_order"})
     return {"ok": True, "order_id": doc["id"], "table_name": t["name"], "items_count": len(validated_items)}
+
+
+class PublicWaiterCallIn(BaseModel):
+    table_id: str
+    action: Literal["call_waiter", "request_bill", "need_help"] = "call_waiter"
+    note: Optional[str] = ""
+
+
+@api.post("/public/waiter-call")
+async def public_waiter_call(body: PublicWaiterCallIn):
+    t = await db.tables.find_one({"id": body.table_id}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Meja tidak ditemukan")
+    action_label = {
+        "call_waiter": "Panggil Pelayan",
+        "request_bill": "Minta Bill",
+        "need_help": "Butuh Bantuan",
+    }.get(body.action, "Panggil Pelayan")
+    active = await db.orders.find_one({"table_id": body.table_id, "status": {"$in": ["open", "sent", "bill_requested"]}}, {"_id": 0})
+    if body.action == "request_bill" and active:
+        await db.orders.update_one({"id": active["id"]}, {"$set": {"status": "bill_requested", "bill_requested_at": now_iso(), "waiter_note": body.note or ""}})
+    notif = await write_notification("WAITER_CALL", f"{action_label} - {t.get('name')}", body.note or f"{t.get('name')} meminta bantuan", ref_type="table", ref_id=body.table_id, priority="high")
+    await broadcast_event("notification_created", {"id": notif.get("id"), "type": "WAITER_CALL", "ref_type": "table", "ref_id": body.table_id, "priority": "high", "action": body.action})
+    await broadcast_event("waiter_call", {"table_id": body.table_id, "table_name": t.get("name"), "action": body.action})
+    return {"ok": True, "message": f"{action_label} dikirim", "table_name": t.get("name")}
 
 
 # ---------- Expenses (manual) ----------

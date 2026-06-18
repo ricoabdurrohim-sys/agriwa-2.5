@@ -1,0 +1,19 @@
+QA CHECK v2.5.31
+
+1. HF /docs dan /api/health jalan.
+2. Vercel login berhasil.
+3. Warung -> meja -> tambah menu -> Print QR Pesanan Meja thermal.
+4. Kertas tidak menampilkan "QR creat err".
+5. Scan QR lewat Pintasan Scan AgriWarung.
+6. Hasil scan harus buka /warung?table=...&order=... dan menampilkan order aktif meja.
+7. Setelah order belum dibayar, meja tetap aktif.
+8. Lanjut Kasir -> bayar -> meja kosong/paid.
+9. Struk preview desktop tidak terpotong; dialog bisa scroll.
+10. QR struk tidak menampilkan nomor transaksi di bawah QR jika label kosong.
+11. Footer kosong di Lini Bisnis berarti struk tidak memaksa footer default.
+12. Header/footer dengan emoji dicoba print thermal; jika printer support raster, emoji tampil sebagai bitmap.
+13. Menu Split Bill muncul di drawer.
+14. Split Bill -> pilih order -> pilih sebagian item -> Bayar Split di Kasir.
+15. Setelah bayar split, sisa item masih ada di meja.
+16. Self-order /order/{tableId} -> tombol Panggil Pelayan dan Minta Bill muncul.
+17. Panggil Pelayan masuk notifikasi aplikasi.

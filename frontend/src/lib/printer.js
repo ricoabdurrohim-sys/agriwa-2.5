@@ -236,13 +236,69 @@ async function imageUrlToEscposRaster(url, maxWidth = 256) {
   }
 }
 
+function hasThermalUnsupportedChars(text = "") {
+  // Thermal printer codepages usually cannot print emoji/Unicode. Rasterize them so emoticon/footer tetap terlihat.
+  return /[^ -]/.test(String(text || ""));
+}
+
+async function centeredTextToEscposRaster(text, widthDots = 384, { fontSize = 20, boldText = false } = {}) {
+  if (!text || typeof document === "undefined") return new Uint8Array([]);
+  try {
+    const lines = normalizeLines(text).flatMap((l) => wrapText(l, 28));
+    if (!lines.length) return new Uint8Array([]);
+    const lineHeight = Math.ceil(fontSize * 1.45);
+    const paddingY = 4;
+    const canvas = document.createElement("canvas");
+    canvas.width = widthDots;
+    canvas.height = Math.max(12, lines.length * lineHeight + paddingY * 2);
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#000";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = `${boldText ? "700" : "400"} ${fontSize}px Arial, Helvetica, "Noto Color Emoji", "Apple Color Emoji", sans-serif`;
+    lines.forEach((line, idx) => ctx.fillText(line, widthDots / 2, paddingY + lineHeight * idx + lineHeight / 2));
+    const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const bytesPerRow = Math.ceil(canvas.width / 8);
+    const raster = new Uint8Array(bytesPerRow * canvas.height);
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const i = (y * canvas.width + x) * 4;
+        const alpha = rgba[i + 3];
+        const lum = 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
+        if (alpha > 40 && lum < 170) raster[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
+      }
+    }
+    return concat(
+      align("center"),
+      bytes(GS, 0x76, 0x30, 0x00, bytesPerRow & 0xff, (bytesPerRow >> 8) & 0xff, canvas.height & 0xff, (canvas.height >> 8) & 0xff),
+      raster,
+      strBytes("
+")
+    );
+  } catch (e) {
+    console.warn("Gagal rasterize teks unicode untuk thermal", e);
+    return new Uint8Array([]);
+  }
+}
+
+async function pushCenteredLinesSmart(cmds, text, width = 48, opts = {}) {
+  if (!String(text || "").trim()) return;
+  if (hasThermalUnsupportedChars(text)) {
+    const raster = await centeredTextToEscposRaster(text, 384, { fontSize: opts.size === 0x10 ? 24 : 19, boldText: !!opts.boldText });
+    if (raster.length) { cmds.push(raster); return; }
+  }
+  pushCenteredLines(cmds, text, width, opts);
+}
+
 export async function printReceipt(receipt, opts = {}) {
   const width = Number(opts.width || 48); // 80mm = ±48 chars in normal font
   const headerName = (opts.headerName || opts.businessName || "AGRIWARUNG");
   const subLine = opts.subLine || opts.address || "";
   const phoneLine = opts.phone || "";
-  const footer = opts.footer || "Terima kasih!";
-  const note = opts.note || "";
+  const footer = opts.footer == null ? "" : String(opts.footer || "");
+  const note = opts.note == null ? "" : String(opts.note || "");
   const logoUrl = opts.logoUrl || opts.logo_url || "";
   const cmds = [];
 
@@ -252,9 +308,9 @@ export async function printReceipt(receipt, opts = {}) {
   if (logo.length) cmds.push(logo);
 
   // Nama lini bisnis: lebih besar dan bold, tapi tidak double-width agar tetap muat 80mm.
-  pushCenteredLines(cmds, headerName, width, { uppercase: true, boldText: true, size: 0x10 });
-  pushCenteredLines(cmds, subLine, width, { uppercase: false, boldText: false, size: 0x00 });
-  if (phoneLine) pushCenteredLines(cmds, "Telp: " + phoneLine, width, { uppercase: false, boldText: false, size: 0x00 });
+  await pushCenteredLinesSmart(cmds, headerName, width, { uppercase: true, boldText: true, size: 0x10 });
+  await pushCenteredLinesSmart(cmds, subLine, width, { uppercase: false, boldText: false, size: 0x00 });
+  if (phoneLine) await pushCenteredLinesSmart(cmds, "Telp: " + phoneLine, width, { uppercase: false, boldText: false, size: 0x00 });
 
   cmds.push(align("left"));
   cmds.push(strBytes("-".repeat(width) + "\n"));
@@ -286,8 +342,8 @@ export async function printReceipt(receipt, opts = {}) {
     cmds.push(escposQr(String(receipt.trx_no), 3)); // kecil dan rapi untuk 80mm
   }
   cmds.push(strBytes("-".repeat(width) + "\n"));
-  pushCenteredLines(cmds, note, width, { uppercase: false, boldText: false, size: 0x00 });
-  pushCenteredLines(cmds, footer, width, { uppercase: false, boldText: false, size: 0x00 });
+  await pushCenteredLinesSmart(cmds, note, width, { uppercase: false, boldText: false, size: 0x00 });
+  await pushCenteredLinesSmart(cmds, footer, width, { uppercase: false, boldText: false, size: 0x00 });
   cmds.push(strBytes("\n\n\n"));
   cmds.push(bytes(GS, 0x56, 0x00));
 
@@ -344,7 +400,7 @@ export async function printThermalLabel({ title = "LABEL", subtitle = "", lines 
   await writeEscPos(concat(...cmds), { chunkSize: 128, delay: 8 });
 }
 
-export async function printThermalOrderQr({ tableName = "Meja", orderCode = "", items = [], total = 0, qrData = "", footer = "AgriWarung" } = {}) {
+export async function printThermalOrderQr({ tableName = "Meja", orderCode = "", items = [], total = 0, qrData = "", footer = "" } = {}) {
   const cmds = [];
   cmds.push(bytes(ESC, 0x40));
   pushCenteredLines(cmds, "QR PESANAN", 48, { uppercase: true, boldText: true, size: 0x10 });

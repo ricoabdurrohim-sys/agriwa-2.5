@@ -18,9 +18,14 @@ function elapsedMin(iso) {
 }
 
 function buildWarungOrderScanUrl(tableId, orderId) {
-  // QR pesanan Warung langsung membuka order aktif meja.
-  // Tidak lewat /scan?code agar tidak jatuh ke pencarian global lintas menu/lini bisnis.
+  // URL panjang dipakai untuk fallback browser/external camera.
   return `${window.location.origin}/warung?table=${encodeURIComponent(tableId || "")}&order=${encodeURIComponent(orderId || "")}&from=qr`;
+}
+
+function buildWarungOrderQrPayload(orderId) {
+  // Payload thermal sengaja pendek. Banyak printer murah error "QR creat err" jika data terlalu panjang.
+  // Scanner AgriWarung akan resolve ORDER_ID ini ke meja + order aktif di backend.
+  return `aw:warung-order:${encodeURIComponent(orderId || "")}`;
 }
 
 export default function Warung() {
@@ -367,6 +372,7 @@ export default function Warung() {
         savedOrder = await ensureCurrentOrderSaved();
         if (!savedOrder?.id) return toast.error("Order belum siap untuk QR");
         const url = buildWarungOrderScanUrl(activeTable.id, savedOrder.id);
+        const qrPayload = buildWarungOrderQrPayload(savedOrder.id);
         const orderCode = savedOrder.queue_no || savedOrder.id;
         if (isPrinterAvailable()) {
           await printThermalOrderQr({
@@ -374,7 +380,7 @@ export default function Warung() {
             orderCode,
             items: latestCart,
             total: totalForItems(latestCart),
-            qrData: url,
+            qrData: qrPayload,
             footer: "",
           });
           toast.success("QR pesanan dikirim ke printer thermal");
@@ -387,13 +393,14 @@ export default function Warung() {
           if (!savedOrder?.id) savedOrder = await ensureCurrentOrderSaved();
           if (!savedOrder?.id) throw e;
           const url = buildWarungOrderScanUrl(activeTable.id, savedOrder.id);
-          const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(url)}`;
+          const qrPayload = buildWarungOrderQrPayload(savedOrder.id);
+          const qr = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(qrPayload)}`;
           const rows = latestCart.map((it) => `<div class="item-name">${it.name}</div><div class="row"><span>${it.quantity} x ${formatRupiah(it.unit_price)}</span><b>${formatRupiah(Number(it.quantity || 0) * Number(it.unit_price || 0))}</b></div>`).join("");
           printViaIframe({
             title: `QR Pesanan ${activeTable.name}`,
             preferWindow: true,
             css: "@page{size:80mm auto;margin:1.5mm}html,body{margin:0;padding:0}.thermal-print{font-family:'Courier New',monospace;font-size:11px;line-height:1.25;width:74mm;margin:0 auto;color:#111}.center{text-align:center!important}.title{font-weight:800;font-size:15px;text-align:center!important}.small{font-size:9.5px}.line{border-top:1px dashed #555;margin:5px 0}.row{display:flex;justify-content:space-between;gap:8px}.item-name{font-weight:600;word-break:break-word}.qr{width:82px;height:82px;display:block;margin:5px auto}.total{font-weight:700;font-size:13px}@media print{body>*:not(.thermal-print):not(main){display:none!important}}",
-            bodyHtml: `<div class="thermal-print"><div class="center title">QR PESANAN</div><div class="center"><b>${activeTable.name}</b></div><div class="center small">${savedOrder.queue_no || savedOrder.id}</div><div class="line"></div>${rows}<div class="line"></div><div class="row total"><span>Total</span><b>${formatRupiah(totalForItems(latestCart))}</b></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${activeTable.name}</div></div></div>`,
+            bodyHtml: `<div class="thermal-print"><div class="center title">QR PESANAN</div><div class="center"><b>${activeTable.name}</b></div><div class="center small">${savedOrder.queue_no || savedOrder.id}</div><div class="line"></div>${rows}<div class="line"></div><div class="row total"><span>Total</span><b>${formatRupiah(totalForItems(latestCart))}</b></div><div class="center"><img class="qr" src="${qr}"/><div class="small">${activeTable.name}</div></div><div class="small center" style="word-break:break-all">${url}</div></div>`,
           });
           toast.info("Thermal gagal/Belum connect, dibuka fallback print browser 80mm");
         } catch (err) {
@@ -517,7 +524,7 @@ export default function Warung() {
           </div>
         </div>
         <Dialog open={!!variantPicker} onOpenChange={(o) => { if (!o) setVariantPicker(null); }}>
-          <DialogContent className="max-w-sm">
+          <DialogContent className="w-[96vw] sm:max-w-lg lg:max-w-2xl max-h-[90vh] overflow-y-auto">
             <DialogHeader><DialogTitle>Pilih Varian</DialogTitle></DialogHeader>
             {variantPicker && <div className="space-y-2">
               <div className="text-sm font-semibold">{variantPicker.name}</div>
@@ -671,7 +678,7 @@ export default function Warung() {
 
       {/* QR Self-Order Dialog */}
       <Dialog open={!!qrTable} onOpenChange={() => setQrTable(null)}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="w-[96vw] sm:max-w-lg lg:max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2"><QrCode className="w-5 h-5 text-[#1a6b3c]" /> QR Self-Order</DialogTitle>
           </DialogHeader>
