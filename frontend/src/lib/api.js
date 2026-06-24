@@ -1,6 +1,28 @@
 import axios from "axios";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const FALLBACK_BACKEND_URL = "https://rikoabd-agriwarung-2-5.hf.space";
+
+function normalizeBackendUrl(rawValue) {
+  let value = (rawValue || "").trim();
+
+  // Vercel env can be missing on a deployment preview, or accidentally set to /api.
+  // Keep the app usable by falling back to the active HF Space, then normalize it.
+  if (!value || value === "undefined" || value === "null") {
+    value = FALLBACK_BACKEND_URL;
+  }
+
+  value = value.replace(/\/+$/, "");
+
+  // REACT_APP_BACKEND_URL must be the backend origin only.
+  // If it was set to https://...hf.space/api, remove the duplicate /api suffix.
+  if (value.endsWith("/api")) {
+    value = value.slice(0, -4);
+  }
+
+  return value || FALLBACK_BACKEND_URL;
+}
+
+export const BACKEND_URL = normalizeBackendUrl(process.env.REACT_APP_BACKEND_URL);
 export const API_URL = `${BACKEND_URL}/api`;
 
 const api = axios.create({
