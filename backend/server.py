@@ -22,6 +22,7 @@ from typing import List, Optional, Literal, Dict
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, BackgroundTasks
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
 
@@ -1242,6 +1243,13 @@ async def list_inventory(user: dict = Depends(get_current_user), include_batches
     """
     safe_limit = max(100, min(int(limit or 3000), 5000))
     items = await db.inventory_items.find({}, {"_id": 0}).sort([("name_key", 1), ("name", 1), ("created_at", -1)]).to_list(safe_limit)
+    for item in items:
+        variants = _sanitize_pos_variants(item.get("variants") or [])
+        item["variants"] = variants
+        # Data lama kadang sudah punya variants tetapi flag has_variants masih False.
+        # Untuk POS/Warung/self-order, varian yang valid harus tetap muncul.
+        if variants:
+            item["has_variants"] = True
     if not include_batches:
         for item in items:
             item["recent_batches"] = []
@@ -1690,33 +1698,68 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
         split_remaining_items = _subtract_split_items_from_order(split_source_order.get("items") or [], body.items)
 
     # Cost/HPP dihitung dari inventory saat transaksi dibuat.
+    # v2.5.37: transaksi kasir sebelumnya lambat karena tiap item melakukan find + update + find + insert
+    # secara beruntun. Sekarang inventory diambil sekali, stok di-update bulk, movement di-insert bulk.
     cost_total = 0
     trx_no = await _next_transaction_no(body.unit)
     stock_type = {"SALE": "sale", "SELF_USE": "self_use", "WASTE": "waste", "ADJUSTMENT": "adjustment"}[trx_type]
+    item_ids = list({str(it.item_id) for it in body.items if it.item_id})
+    inv_rows = await db.inventory_items.find({"id": {"$in": item_ids}}, {"_id": 0}).to_list(len(item_ids) or 1)
+    inv_by_id = {str(inv.get("id")): inv for inv in inv_rows}
+
+    qty_by_item: Dict[str, int] = {}
     for it in body.items:
-        inv = await db.inventory_items.find_one({"id": it.item_id})
-        unit_cost = 0
-        if inv:
-            unit_cost = int(inv.get("cost_price") or inv.get("hpp") or 0)
-            cost_total += unit_cost * it.quantity
-            await db.inventory_items.update_one({"id": it.item_id}, {"$inc": {"current_stock": -it.quantity}})
-            consumed_batches = await _consume_inventory_batches(it.item_id, it.quantity, reference=trx_no)
-            after = await db.inventory_items.find_one({"id": it.item_id}, {"_id": 0})
-            await db.stock_movements.insert_one({
-                "id": gen_id(),
-                "item_id": it.item_id,
-                "business_unit": inv.get("business_unit", body.unit),
-                "type": stock_type,
-                "quantity": -it.quantity,
-                "qty_out": it.quantity,
-                "qty_in": 0,
-                "balance_after": (after or {}).get("current_stock"),
-                "reason": f"{stock_type.upper()} {trx_no}",
-                "reference_id": trx_no,
-                "consumed_batches": consumed_batches if 'consumed_batches' in locals() else [],
-                "created_at": now_iso(),
-            })
-            background_tasks.add_task(check_low_stock_and_notify, it.item_id)
+        item_id = str(it.item_id)
+        inv = inv_by_id.get(item_id)
+        if not inv:
+            continue
+        qty = int(it.quantity or 0)
+        unit_cost = int(inv.get("cost_price") or inv.get("hpp") or 0)
+        cost_total += unit_cost * qty
+        qty_by_item[item_id] = qty_by_item.get(item_id, 0) + qty
+
+    stock_updates = [
+        UpdateOne({"id": item_id}, {"$inc": {"current_stock": -qty}})
+        for item_id, qty in qty_by_item.items()
+        if qty > 0
+    ]
+    if stock_updates:
+        await db.inventory_items.bulk_write(stock_updates, ordered=False)
+
+    consumed_by_line = {}
+    for idx, it in enumerate(body.items):
+        if str(it.item_id) in inv_by_id and int(it.quantity or 0) > 0:
+            consumed_by_line[idx] = await _consume_inventory_batches(it.item_id, it.quantity, reference=trx_no)
+
+    after_rows = await db.inventory_items.find({"id": {"$in": list(qty_by_item.keys())}}, {"_id": 0, "id": 1, "current_stock": 1}).to_list(len(qty_by_item) or 1)
+    after_by_id = {str(row.get("id")): row for row in after_rows}
+    movement_docs = []
+    created_at_for_movements = now_iso()
+    for idx, it in enumerate(body.items):
+        inv = inv_by_id.get(str(it.item_id))
+        if not inv:
+            continue
+        qty = int(it.quantity or 0)
+        if qty <= 0:
+            continue
+        movement_docs.append({
+            "id": gen_id(),
+            "item_id": it.item_id,
+            "business_unit": inv.get("business_unit", body.unit),
+            "type": stock_type,
+            "quantity": -qty,
+            "qty_out": qty,
+            "qty_in": 0,
+            "balance_after": (after_by_id.get(str(it.item_id)) or {}).get("current_stock"),
+            "reason": f"{stock_type.upper()} {trx_no}",
+            "reference_id": trx_no,
+            "consumed_batches": consumed_by_line.get(idx, []),
+            "created_at": created_at_for_movements,
+        })
+    if movement_docs:
+        await db.stock_movements.insert_many(movement_docs)
+    for item_id in qty_by_item.keys():
+        background_tasks.add_task(check_low_stock_and_notify, item_id)
 
     is_sale = trx_type == "SALE"
     auto_debt = is_sale and body.payment_method == "cash" and cash_received < sale_total
@@ -1730,9 +1773,15 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
         "DEBT"
     )
     change = (cash_received - sale_total) if (is_sale and body.payment_method == "cash") else 0
-    receipt_snapshot = await build_receipt_snapshot(body.unit)
-    source_order = split_source_order or (await db.orders.find_one({"id": body.order_id}, {"_id": 0}) if body.order_id else None)
-    settings_doc = await db.settings.find_one({}, {"_id": 0}) or {}
+    source_order_task = None if split_source_order or not body.order_id else db.orders.find_one({"id": body.order_id}, {"_id": 0})
+    receipt_snapshot_task = build_receipt_snapshot(body.unit)
+    settings_task = db.settings.find_one({}, {"_id": 0})
+    if source_order_task:
+        receipt_snapshot, source_order, settings_doc = await asyncio.gather(receipt_snapshot_task, source_order_task, settings_task)
+    else:
+        receipt_snapshot, settings_doc = await asyncio.gather(receipt_snapshot_task, settings_task)
+        source_order = split_source_order
+    settings_doc = settings_doc or {}
     tax_rate = float(settings_doc.get("tax_rate") or 0)
     tax_receipt_enabled = bool(settings_doc.get("tax_receipt_enabled", True))
     tax_inclusive = bool(settings_doc.get("tax_inclusive", True))
@@ -1879,7 +1928,8 @@ async def create_transaction(body: TransactionIn, background_tasks: BackgroundTa
                 "reference": trx_type.lower(), "reference_id": doc["id"], "unit": body.unit, "created_at": now_iso(),
             })
 
-    invalidate_finance_summary_cache()
+    mark_finance_summary_dirty()
+    background_tasks.add_task(refresh_finance_summary_cache_background)
     background_tasks.add_task(broadcast_event, "transaction_created", {"id": doc["id"], "total": doc["total"], "unit": body.unit, "transaction_type": trx_type})
     background_tasks.add_task(write_notification, "TRANSACTION", "Transaksi baru", f"{trx_no} · {format_rp_short(doc['total'])} · {payment_status}", business_id=body.unit, ref_type="transaction", ref_id=doc["id"])
     background_tasks.add_task(write_audit, user, "create", "transaction", doc["id"], {"trx_no": trx_no, "total": doc["total"], "type": trx_type, "payment_status": payment_status})
@@ -2208,7 +2258,7 @@ class SettleBonIn(BaseModel):
 
 
 @api.post("/customer-debts/{debt_id}/settle-via-kasir")
-async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends(get_current_user)):
+async def settle_via_kasir(debt_id: str, body: SettleBonIn, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     """Pelunasan bon dari Kasir.
 
     Fix penting:
@@ -2343,6 +2393,8 @@ async def settle_via_kasir(debt_id: str, body: SettleBonIn, user: dict = Depends
         "cashier_name": user.get("name", user.get("email")),
     })
 
+    mark_finance_summary_dirty()
+    background_tasks.add_task(refresh_finance_summary_cache_background)
     await write_audit(user, "update", "customer_debt", debt_id, {"paid": payment_amount, "via": "kasir"})
     await broadcast_event("transaction_updated", {"id": original_trx.get("id") if original_trx else debt_id, "debt_paid": True})
     return receipt_doc
@@ -2720,7 +2772,7 @@ async def public_menu():
             "category": category,
             "sell_price": base_price,
             "image_url": i.get("image_url"),
-            "has_variants": bool(i.get("has_variants") and active_variants),
+            "has_variants": bool(active_variants),
             "variants": active_variants,
         })
     out.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
@@ -3076,6 +3128,8 @@ async def _load_debt_financial_context() -> dict:
         "debt_by_id": debt_by_id,
         "payments_by_trx": payments_by_trx,
         "payments_by_debt": payments_by_debt,
+        "debts_raw": debts,
+        "payments_raw": payments,
     }
 
 
@@ -3341,8 +3395,11 @@ def _compute_debt_payment_state(debt: dict, original_trx: Optional[dict] = None)
 # Cache singkat untuk ringkasan finance.
 # Tujuannya: Dashboard, Keuangan, dan Laporan sering dibuka berurutan; tanpa cache backend
 # menghitung ulang seluruh transaksi beberapa kali sehingga terasa lambat di HuggingFace free.
+# v2.5.37: setelah transaksi kasir, cache lama masih boleh dilayani sebentar (stale-while-revalidate)
+# sambil refresh berjalan di background. Ini membuat checkout/Warung tidak menunggu hitung ulang laporan penuh.
 FINANCE_CACHE_TTL_SECONDS = int(os.environ.get("FINANCE_CACHE_TTL_SECONDS", "120"))
-_finance_summary_cache = {"expires_at": None, "summary": None}
+FINANCE_STALE_GRACE_SECONDS = int(os.environ.get("FINANCE_STALE_GRACE_SECONDS", "25"))
+_finance_summary_cache = {"expires_at": None, "summary": None, "dirty": False, "dirty_at": None, "refreshing": False}
 _finance_summary_lock = asyncio.Lock()
 _finance_repair_done = False
 FINANCE_MAX_DOCS = int(os.environ.get("FINANCE_MAX_DOCS", "3000"))
@@ -3360,7 +3417,10 @@ def _slice_finance_summary(summary: dict, limit: int = 1000) -> dict:
     sliced["cache"] = {
         "enabled": True,
         "ttl_seconds": FINANCE_CACHE_TTL_SECONDS,
+        "stale_grace_seconds": FINANCE_STALE_GRACE_SECONDS,
         "generated_at": sliced.get("generated_at"),
+        "dirty": bool(_finance_summary_cache.get("dirty")),
+        "refreshing": bool(_finance_summary_cache.get("refreshing")),
     }
     return sliced
 
@@ -3368,12 +3428,60 @@ def _slice_finance_summary(summary: dict, limit: int = 1000) -> dict:
 def invalidate_finance_summary_cache():
     _finance_summary_cache["expires_at"] = None
     _finance_summary_cache["summary"] = None
+    _finance_summary_cache["dirty"] = False
+    _finance_summary_cache["dirty_at"] = None
+
+
+def mark_finance_summary_dirty():
+    """Tandai ringkasan perlu refresh tanpa membuang cache lama langsung.
+
+    Halaman Warung/Kasir terasa lambat kalau setiap transaksi langsung membuat request
+    Dashboard/Keuangan menghitung ulang semua koleksi. Dengan stale-while-revalidate,
+    respon checkout selesai dulu, lalu ringkasan disegarkan di background.
+    """
+    now_ts = datetime.now(timezone.utc)
+    if _finance_summary_cache.get("summary"):
+        _finance_summary_cache["dirty"] = True
+        _finance_summary_cache["dirty_at"] = now_ts
+        _finance_summary_cache["expires_at"] = now_ts + timedelta(seconds=FINANCE_STALE_GRACE_SECONDS)
+    else:
+        _finance_summary_cache["expires_at"] = None
+        _finance_summary_cache["dirty"] = True
+        _finance_summary_cache["dirty_at"] = now_ts
+
+
+async def _store_finance_summary_cache(summary: dict, now_ts: Optional[datetime] = None):
+    now_ts = now_ts or datetime.now(timezone.utc)
+    _finance_summary_cache["summary"] = summary
+    _finance_summary_cache["expires_at"] = now_ts + timedelta(seconds=FINANCE_CACHE_TTL_SECONDS)
+    _finance_summary_cache["dirty"] = False
+    _finance_summary_cache["dirty_at"] = None
+
+
+async def refresh_finance_summary_cache_background():
+    """Refresh cache finance setelah response transaksi dikirim ke user."""
+    if _finance_summary_cache.get("refreshing"):
+        return
+    async with _finance_summary_lock:
+        if _finance_summary_cache.get("refreshing"):
+            return
+        _finance_summary_cache["refreshing"] = True
+        try:
+            summary = await _build_unified_finance_summary_uncached(limit=5000)
+            await _store_finance_summary_cache(summary)
+        except Exception:
+            # Refresh background tidak boleh menjatuhkan checkout/kasir.
+            logger.exception("finance background refresh failed")
+        finally:
+            _finance_summary_cache["refreshing"] = False
 
 
 async def _build_unified_finance_summary(limit: int = 1000, force_refresh: bool = False) -> dict:
     now_ts = datetime.now(timezone.utc)
     cached = _finance_summary_cache.get("summary")
     expires_at = _finance_summary_cache.get("expires_at")
+    # Jika cache masih valid, tetap layani cepat. Kalau dirty, frontend mendapat flag cache.dirty
+    # dan background refresh akan mengisi data baru tanpa blocking.
     if not force_refresh and cached and expires_at and expires_at > now_ts:
         return _slice_finance_summary(cached, limit)
 
@@ -3385,9 +3493,12 @@ async def _build_unified_finance_summary(limit: int = 1000, force_refresh: bool 
             return _slice_finance_summary(cached, limit)
 
         # Hitung sekali dengan limit terbesar, lalu endpoint lain cukup slicing.
-        summary = await _build_unified_finance_summary_uncached(limit=5000)
-        _finance_summary_cache["summary"] = summary
-        _finance_summary_cache["expires_at"] = now_ts + timedelta(seconds=FINANCE_CACHE_TTL_SECONDS)
+        _finance_summary_cache["refreshing"] = True
+        try:
+            summary = await _build_unified_finance_summary_uncached(limit=5000)
+            await _store_finance_summary_cache(summary, now_ts)
+        finally:
+            _finance_summary_cache["refreshing"] = False
         return _slice_finance_summary(summary, limit)
 
 
@@ -3412,12 +3523,16 @@ async def _build_unified_finance_summary_uncached(limit: int = 1000) -> dict:
 
     max_docs = max(500, min(FINANCE_MAX_DOCS, 10000))
     debt_ctx = await _load_debt_financial_context()
-    raw_transactions = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(max_docs)
-    expenses = await db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs)
-    incomes = await db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs)
-    capital = await db.capital_injections.find({}, {"_id": 0}).to_list(max_docs)
-    debts_raw = await db.customer_debts.find({}, {"_id": 0}).sort("created_at", -1).to_list(max_docs)
-    inventory = await db.inventory_items.find({}, {"_id": 0}).to_list(max_docs)
+    trx_projection = {"_id": 0, "receipt_snapshot": 0, "receipt_image": 0, "receipt_html": 0}
+    inv_projection = {"_id": 0, "id": 1, "name": 1, "current_stock": 1, "min_stock": 1, "cost_price": 1, "hpp": 1, "unit": 1, "category": 1, "business_unit": 1}
+    raw_transactions, expenses, incomes, capital, inventory = await asyncio.gather(
+        db.transactions.find({}, trx_projection).sort("created_at", -1).to_list(max_docs),
+        db.expenses.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs),
+        db.incomes.find({}, {"_id": 0}).sort("date", -1).to_list(max_docs),
+        db.capital_injections.find({}, {"_id": 0}).to_list(max_docs),
+        db.inventory_items.find({}, inv_projection).to_list(max_docs),
+    )
+    debts_raw = sorted(debt_ctx.get("debts_raw") or [], key=lambda d: str(d.get("created_at") or ""), reverse=True)[:max_docs]
 
     inv_items = {i.get("id"): i for i in inventory}
 
@@ -3712,14 +3827,25 @@ async def finance_summary(user: dict = Depends(get_current_user), limit: int = 1
 @api.get("/dashboard/summary")
 async def dashboard_summary(user: dict = Depends(get_current_user)):
     summary = await _build_unified_finance_summary(limit=500)
-    inv = await db.inventory_items.find({}, {"_id": 0}).to_list(2000)
-    low = [i for i in inv if _money(i.get("current_stock")) <= _money(i.get("min_stock")) and _money(i.get("min_stock")) > 0]
+    # Ambil hanya item yang benar-benar low-stock agar Dashboard tidak menarik seluruh inventori.
+    low = await db.inventory_items.find(
+        {
+            "$expr": {
+                "$and": [
+                    {"$gt": [{"$ifNull": ["$min_stock", 0]}, 0]},
+                    {"$lte": [{"$ifNull": ["$current_stock", 0]}, {"$ifNull": ["$min_stock", 0]}]},
+                ]
+            }
+        },
+        {"_id": 0, "id": 1, "name": 1, "category": 1, "unit": 1, "current_stock": 1, "min_stock": 1, "business_unit": 1},
+    ).sort("name", 1).to_list(100)
     return {
         "today": summary["today"],
         "revenue_by_unit": summary["by_unit"],
         "weekly_trend": summary["weekly_trend"],
         "low_stock": low,
         "recent_transactions": summary["recent_transactions"],
+        "cache": summary.get("cache", {}),
     }
 
 
@@ -3917,9 +4043,14 @@ async def startup():
     await db.users.create_index("phone", sparse=True)
     await db.otp_codes.create_index("expires_at", expireAfterSeconds=0)
     await db.transactions.create_index([("unit", 1), ("created_at", -1)])
+    await db.transactions.create_index([("created_at", -1), ("transaction_type", 1), ("cancelled", 1)])
     await db.transactions.create_index("payment_status")
+    await db.orders.create_index([("status", 1), ("created_at", 1)])
+    await db.orders.create_index([("table_id", 1), ("status", 1)])
+    await db.tables.create_index([("name", 1)])
     await db.stock_movements.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_items.create_index([("name_key", 1), ("unit", 1), ("business_unit", 1)])
+    await db.inventory_items.create_index([("business_unit", 1), ("category", 1), ("name", 1)])
     await db.inventory_batches.create_index([("item_id", 1), ("created_at", -1)])
     await db.inventory_batches.create_index([("item_id", 1), ("batch_no", 1)])
     await db.inventory_batches.create_index([("batch_no", 1)])

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus, ArrowUpRight, ArrowDownRight, Wallet, Trash2, RefreshCw, AlertTriangle, Pencil } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
@@ -30,6 +30,7 @@ export default function Keuangan() {
   const [error, setError] = useState("");
   const [form, setForm] = useState({ amount: 0, category: CATEGORIES[0], unit: "warung", notes: "", payment_method: "cash" });
   const [incForm, setIncForm] = useState({ amount: 0, category: INCOME_CATEGORIES[0], unit: "umum", source: "", notes: "", payment_method: "cash" });
+  const refreshTimerRef = useRef(null);
 
   const load = async ({ force = false } = {}) => {
     setError("");
@@ -42,7 +43,14 @@ export default function Keuangan() {
     setLoading(true);
     try {
       const { data } = await api.get("/finance/system-summary?limit=500");
-      window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
+      const cacheMeta = data?.cache || {};
+      // Kalau backend mengirim data stale sambil refresh background berjalan, tampilkan dulu
+      // tetapi jangan disimpan di cache frontend agar fetch berikutnya mengambil data segar.
+      if (cacheMeta.dirty || cacheMeta.refreshing) {
+        window.__awFinanceSummaryCache = null;
+      } else {
+        window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
+      }
       setSummary(data || {});
     } catch (err) {
       console.error("finance/system-summary failed", err);
@@ -62,15 +70,27 @@ export default function Keuangan() {
 
   useEffect(() => { load(); loadBizUnits(); }, []);
   useEffect(() => {
+    const debouncedFinanceLoad = () => {
+      window.__awFinanceSummaryCache = null;
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => {
+        load({ force: false });
+        // Ambil ulang sekali lagi setelah background cache backend kemungkinan sudah selesai.
+        refreshTimerRef.current = setTimeout(() => load({ force: false }), 3500);
+      }, 1200);
+    };
     const h = (e) => {
       const k = e.detail?.type;
       if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) {
-        window.__awFinanceSummaryCache = null;
-        load({ force: true }); loadBizUnits();
+        debouncedFinanceLoad();
+        if (k === "bizunit_updated") loadBizUnits();
       }
     };
     window.addEventListener("aw:ws", h);
-    return () => window.removeEventListener("aw:ws", h);
+    return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      window.removeEventListener("aw:ws", h);
+    };
   }, []);
 
   const invalidateFinanceCache = () => {

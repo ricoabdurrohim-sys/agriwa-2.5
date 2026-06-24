@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { HelpCircle, Download, Printer, FileSpreadsheet, FileText, Banknote, CreditCard, Smartphone, AlertTriangle, Brain, TrendingUp, CalendarDays } from "lucide-react";
 import api, { formatRupiah, formatDate } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -46,6 +46,7 @@ export default function Laporan() {
   const [analytics, setAnalytics] = useState({ weekly: {}, monthly: {}, yearly: {} });
   const [ai, setAi] = useState(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const refreshTimerRef = useRef(null);
 
   const load = async ({ force = false } = {}) => {
     setError("");
@@ -62,7 +63,14 @@ export default function Laporan() {
         api.get("/finance/system-summary?limit=500"),
         api.get("/reports/sales-analytics").catch(() => ({ data: { weekly: {}, monthly: {}, yearly: {} } })),
       ]);
-      window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
+      const cacheMeta = data?.cache || {};
+      // Kalau backend mengirim data stale sambil refresh background berjalan, tampilkan dulu
+      // tetapi jangan disimpan di cache frontend agar fetch berikutnya mengambil data segar.
+      if (cacheMeta.dirty || cacheMeta.refreshing) {
+        window.__awFinanceSummaryCache = null;
+      } else {
+        window.__awFinanceSummaryCache = { data: data || {}, ts: Date.now() };
+      }
       setSummary(data || {});
       setAnalytics(analyticsRes.data || { weekly: {}, monthly: {}, yearly: {} });
     } catch (e) {
@@ -84,11 +92,24 @@ export default function Laporan() {
 
   useEffect(() => { load(); }, []);
   useEffect(() => {
-    const h = (e) => { const k = e.detail?.type; if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) { window.__awFinanceSummaryCache = null; load({ force: true }); } };
-    const financeH = () => { window.__awFinanceSummaryCache = null; load({ force: true }); };
+    const debouncedFinanceLoad = () => {
+      window.__awFinanceSummaryCache = null;
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => {
+        load({ force: false });
+        // Ambil ulang sekali lagi setelah background cache backend kemungkinan sudah selesai.
+        refreshTimerRef.current = setTimeout(() => load({ force: false }), 3500);
+      }, 1200);
+    };
+    const h = (e) => {
+      const k = e.detail?.type;
+      if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) debouncedFinanceLoad();
+    };
+    const financeH = () => debouncedFinanceLoad();
     window.addEventListener("aw:ws", h);
     window.addEventListener("aw:finance-mutated", financeH);
     return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       window.removeEventListener("aw:ws", h);
       window.removeEventListener("aw:finance-mutated", financeH);
     };

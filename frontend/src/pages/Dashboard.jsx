@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowUpRight, ArrowDownRight, TrendingUp, Wallet, Receipt, AlertTriangle,
@@ -53,6 +53,7 @@ export default function Dashboard() {
   const [bizUnits, setBizUnits] = useState([]);
   const [seeding, setSeeding] = useState(false);
   const [error, setError] = useState("");
+  const refreshTimerRef = useRef(null);
 
   const load = async () => {
     try {
@@ -77,16 +78,23 @@ export default function Dashboard() {
   useEffect(() => { load(); }, []);
 
   useEffect(() => {
+    const debouncedLoad = () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => load(), 1200);
+    };
     const h = (e) => {
       const k = e.detail?.type;
-      if (["transaction_created", "transaction_cancelled", "transaction_updated", "order_created", "order_updated"].includes(k)) {
-        load();
+      // Order update/self-order jangan memaksa Dashboard hitung ulang laporan penuh.
+      // Dashboard baru refresh untuk transaksi/finance yang memang mengubah angka.
+      if (["transaction_created", "transaction_cancelled", "transaction_updated", "bizunit_updated"].includes(k)) {
+        debouncedLoad();
       }
     };
-    const financeH = () => load();
+    const financeH = () => debouncedLoad();
     window.addEventListener("aw:ws", h);
     window.addEventListener("aw:finance-mutated", financeH);
     return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       window.removeEventListener("aw:ws", h);
       window.removeEventListener("aw:finance-mutated", financeH);
     };
