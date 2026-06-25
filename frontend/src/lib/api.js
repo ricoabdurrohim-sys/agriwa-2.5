@@ -1,20 +1,20 @@
 import axios from "axios";
 
+// HF backend AgriWarung yang sedang aktif. Vercel env tetap boleh override ini.
 const FALLBACK_BACKEND_URL = "https://rikoabd-agriwarung-2-5.hf.space";
 
-function normalizeBackendUrl(rawValue) {
+export function normalizeBackendUrl(rawValue) {
   let value = (rawValue || "").trim();
 
-  // Vercel env can be missing on a deployment preview, or accidentally set to /api.
-  // Keep the app usable by falling back to the active HF Space, then normalize it.
+  // Vercel env kadang kosong di preview/deployment tertentu.
   if (!value || value === "undefined" || value === "null") {
     value = FALLBACK_BACKEND_URL;
   }
 
   value = value.replace(/\/+$/, "");
 
-  // REACT_APP_BACKEND_URL must be the backend origin only.
-  // If it was set to https://...hf.space/api, remove the duplicate /api suffix.
+  // REACT_APP_BACKEND_URL harus origin backend saja, tanpa /api.
+  // Kalau terlanjur diisi ...hf.space/api, hapus suffix /api agar tidak jadi /api/api.
   if (value.endsWith("/api")) {
     value = value.slice(0, -4);
   }
@@ -27,7 +27,11 @@ export const API_URL = `${BACKEND_URL}/api`;
 
 const api = axios.create({
   baseURL: API_URL,
-  withCredentials: true,  // send httpOnly session_token cookie for Google Auth
+  // Login manual AgriWarung memakai Bearer token di localStorage, bukan cookie.
+  // Jangan kirim credentials lintas domain Vercel -> HuggingFace; ini yang bisa membuat
+  // browser memblokir request login walaupun backend HF dan MongoDB sebenarnya sehat.
+  withCredentials: false,
+  timeout: 30000,
 });
 
 api.interceptors.request.use((config) => {
@@ -35,6 +39,32 @@ api.interceptors.request.use((config) => {
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status;
+    const url = error?.config?.url || "";
+
+    // Token lama/rusak jangan bikin user stuck di halaman loading.
+    if (status === 401 && !url.includes("/auth/login")) {
+      localStorage.removeItem("aw_token");
+    }
+
+    // Debug ringan untuk DevTools tanpa mengganggu user.
+    if (typeof window !== "undefined") {
+      console.warn("AgriWarung API error", {
+        baseURL: API_URL,
+        url,
+        method: error?.config?.method,
+        status,
+        detail: error?.response?.data?.detail,
+        message: error?.message,
+      });
+    }
+    return Promise.reject(error);
+  },
+);
 
 export default api;
 

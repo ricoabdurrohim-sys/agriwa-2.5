@@ -1,6 +1,6 @@
 import React, { useState, useRef } from "react";
-import { Upload, X, Image as ImageIcon, Loader2 } from "lucide-react";
-import api, { API_URL } from "@/lib/api";
+import { X, Image as ImageIcon, Loader2 } from "lucide-react";
+import { API_URL, BACKEND_URL } from "@/lib/api";
 import { toast } from "sonner";
 
 // Returns absolute URL for /api/uploads/* paths
@@ -8,8 +8,7 @@ export function resolveImageUrl(url) {
   if (!url) return "";
   if (url.startsWith("http") || url.startsWith("data:")) return url;
   if (url.startsWith("/api/uploads/")) {
-    const backend = process.env.REACT_APP_BACKEND_URL;
-    return `${backend}${url}`;
+    return `${BACKEND_URL}${url}`;
   }
   return url;
 }

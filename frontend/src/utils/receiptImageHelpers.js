@@ -21,7 +21,7 @@ export async function preloadImage(src) {
 export async function imageUrlToDataUrl(url) {
   if (!url) return null;
   try {
-    const response = await fetch(url, { mode: 'cors', credentials: 'include' });
+    const response = await fetch(url, { mode: 'cors', credentials: 'omit' });
     const blob = await response.blob();
     return await blobToDataUrl(blob);
   } catch (error) {

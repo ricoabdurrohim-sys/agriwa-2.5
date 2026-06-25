@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
+import { API_URL } from '@/lib/api';
 
-const API_BASE = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
+const API_BASE = API_URL.replace(/\/api$/, '');
 
 function tokenHeaders() {
-  const token = localStorage.getItem('token') || localStorage.getItem('access_token') || '';
+  const token = localStorage.getItem('aw_token') || localStorage.getItem('token') || localStorage.getItem('access_token') || '';
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
@@ -20,7 +21,6 @@ export default function ReceiptSettingsFields({ form, setForm }) {
       const res = await fetch(`${API_BASE}/api/upload`, {
         method: 'POST',
         headers: tokenHeaders(),
-        credentials: 'include',
         body: fd,
       });
       const data = await res.json();

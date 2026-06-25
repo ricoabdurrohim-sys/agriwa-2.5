@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { rupiah, resolveAssetUrl } from '../utils/receiptPrint80mm';
+import { API_URL } from '@/lib/api';
 
-const API_BASE = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
+const API_BASE = API_URL.replace(/\/api$/, '');
 
 function getTableIdFromPath() {
   const parts = window.location.pathname.split('/').filter(Boolean);

@@ -1,7 +1,8 @@
 /* AgriWarung v2.5.19 - stable 80mm receipt + QR print helper.
    Backend tetap pakai server.py asli. Tidak membutuhkan server_patched.py. */
+import { BACKEND_URL } from '@/lib/api';
 
-const BACKEND_BASE = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
+const BACKEND_BASE = BACKEND_URL.replace(/\/$/, '');
 
 export function rupiah(value) {
   try {

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { BACKEND_URL } from "@/lib/api";
 
 // Custom hook: subscribe to WebSocket events. Auto-reconnects.
 // callback(event) receives {type, payload, ts}
@@ -12,7 +13,6 @@ export function useWebSocket(callback) {
     let pingTimer = null;
     let closed = false;
 
-    const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
     const wsUrl = BACKEND_URL.replace(/^http/, "ws") + "/api/ws";
 
     const connect = () => {

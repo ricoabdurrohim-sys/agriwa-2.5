@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import api from "@/lib/api";
+import api, { API_URL } from "@/lib/api";
 
 export default function Login() {
   const { user, login } = useAuth();
@@ -33,7 +33,8 @@ export default function Login() {
       toast.success("Selamat datang!");
       nav("/");
     } catch (err) {
-      toast.error(err?.response?.data?.detail || "Gagal masuk");
+      toast.error(err?.response?.data?.detail || err?.message || "Gagal masuk");
+      console.warn("Login gagal", { apiBase: API_URL, status: err?.response?.status, detail: err?.response?.data?.detail, message: err?.message });
     } finally { setLoading(false); }
   };
 

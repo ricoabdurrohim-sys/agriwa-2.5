@@ -3758,10 +3758,27 @@ async def finance_refresh_summary(user: dict = Depends(get_current_user)):
 
 @api.get("/reports/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):
-    rows = await db.transactions.find({"cancelled": {"$ne": True}, "transaction_type": "SALE"}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    # Ambil field minimum saja agar Laporan tidak menarik receipt/items besar dari MongoDB.
+    projection = {
+        "_id": 0,
+        "created_at": 1,
+        "cash_collected": 1,
+        "paid_amount": 1,
+        "is_bon": 1,
+        "total": 1,
+    }
+    max_docs = max(500, min(FINANCE_MAX_DOCS, 10000))
+    rows = await db.transactions.find(
+        {"cancelled": {"$ne": True}, "transaction_type": "SALE"},
+        projection,
+    ).sort("created_at", -1).to_list(max_docs)
+
     def bucket(dt, fmt):
-        try: return datetime.fromisoformat(str(dt).replace('Z','+00:00')).strftime(fmt)
-        except Exception: return "Tanpa tanggal"
+        try:
+            return datetime.fromisoformat(str(dt).replace('Z', '+00:00')).strftime(fmt)
+        except Exception:
+            return "Tanpa tanggal"
+
     weekly, monthly, yearly = {}, {}, {}
     for r in rows:
         paid = int(r.get("cash_collected") or r.get("paid_amount") or (0 if r.get("is_bon") else r.get("total") or 0))
@@ -3770,7 +3787,7 @@ async def sales_analytics(user: dict = Depends(get_current_user)):
             target.setdefault(key, {"revenue": 0, "count": 0})
             target[key]["revenue"] += paid
             target[key]["count"] += 1
-    return {"weekly": weekly, "monthly": monthly, "yearly": yearly}
+    return {"weekly": weekly, "monthly": monthly, "yearly": yearly, "limited_to": max_docs}
 
 @api.get("/reports/profit-loss")
 async def profit_loss(user: dict = Depends(get_current_user)):
@@ -7210,10 +7227,23 @@ async def broadcast_event(event_type: str, payload: dict = None):
     except Exception:
         pass
 
+def _cors_origins_from_env() -> list[str]:
+    raw = os.environ.get("CORS_ORIGINS", "*")
+    origins = [x.strip().rstrip("/") for x in raw.split(",") if x.strip()]
+    return origins or ["*"]
+
+
+def _cors_allow_credentials(origins: list[str]) -> bool:
+    # Browser login manual memakai Bearer token, bukan cookie.
+    # Kalau origin masih wildcard, credentials harus False agar request Vercel -> HF tidak diblokir CORS.
+    return "*" not in origins
+
+
+_cors_origins = _cors_origins_from_env()
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=_cors_allow_credentials(_cors_origins),
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
